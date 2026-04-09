@@ -1,0 +1,5 @@
+.env
+__pycache__/
+models/
+features_master.csv
+files/
