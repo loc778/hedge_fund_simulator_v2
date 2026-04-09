@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════
+# requirements.txt — hedge_v2
+# Install all: pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════
+
+# ── Database ──────────────────────────────────────────────
+sqlalchemy
+mysql-connector-python
+
+# ── Data Collection ───────────────────────────────────────
+yfinance
+fredapi
+newsapi-python
+feedparser
+requests
+python-dateutil
+
+# ── Data Processing ───────────────────────────────────────
+pandas
+numpy
+
+# ── Technical Indicators ──────────────────────────────────
+ta
+
+# ── Sentiment & NLP ───────────────────────────────────────
+vaderSentiment
+
+# ── Environment & Config ──────────────────────────────────
+python-dotenv
+
+# ── ML Models ─────────────────────────────────────────────
+scikit-learn
+xgboost
+lightgbm
+hmmlearn
+
+# ── Deep Learning ─────────────────────────────────────────
+tensorflow
+keras
+
+# ── Portfolio Optimization ────────────────────────────────
+scipy
+# cvxpy        ← uncomment when portfolio optimizer is built
+
+# ── Dashboard ─────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.20.0
+joblib
+
+# ── ADD NEW LIBRARIES BELOW THIS LINE ─────────────────────

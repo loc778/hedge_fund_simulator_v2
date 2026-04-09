@@ -3,3 +3,4 @@ __pycache__/
 models/
 features_master.csv
 files/
+.venv/
