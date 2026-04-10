@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Path to the Nifty 500 CSV downloaded from NSE
 # Re-download every quarter when SEBI rebalances and replace this file
-NIFTY500_CSV = os.path.join(PROJECT_ROOT, "nifty500_tickers.csv")
+NIFTY500_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_tickers.csv")
 
 # ── Load Tickers from CSV ─────────────────────────────────────────────
 # Reads the NSE watchlist CSV and appends .NS suffix for yfinance

@@ -171,109 +171,130 @@ def get_already_ingested_dates() -> set:
 # SECTION 2 — BHAVCOPY DOWNLOAD AND PARSE
 # ═══════════════════════════════════════════════════════════
 
-def build_bhavcopy_url(d: date) -> str:
+def build_bhavcopy_urls(d: date) -> list:
     """
-    Build the NSE bhavcopy URL for a given date.
-    NSE URL format: cm{DD}{MMM}{YYYY}bhav.csv.zip
-    Example: cm01JAN2024bhav.csv.zip
+    Returns list of URLs to try for a given date, in priority order.
+
+    NSE changed their bhavcopy URL format in July 2024:
+    - Old format (pre-Jul 2024): /content/historical/EQUITIES/{YEAR}/{MON}/cm{DD}{MON}{YYYY}bhav.csv.zip
+    - New format (post-Jul 2024): /content/equities/bhav/cm_bhavcopy_{YYYY-MM-DD}.csv.zip
+
+    We try the new format first for recent dates, old format as fallback.
+    For dates before Jul 2024 we try old format first.
+    Both formats are always tried — NSE sometimes serves old format files
+    on the new endpoint for historical backfill.
     """
-    year  = d.strftime("%Y")
-    month = d.strftime("%b").upper()   # JAN, FEB, MAR etc
-    date_str = d.strftime("%d%b%Y").upper()   # 01JAN2024
-    return BHAVCOPY_URL.format(year=year, month=month, date=date_str)
+    year     = d.strftime("%Y")
+    month    = d.strftime("%b").upper()
+    date_old = d.strftime("%d%b%Y").upper()   # 05JUL2024
+    date_new = d.strftime("%Y-%m-%d")          # 2024-07-05
+
+    old_url = (f"https://nsearchives.nseindia.com/content/historical/EQUITIES"
+               f"/{year}/{month}/cm{date_old}bhav.csv.zip")
+    new_url = (f"https://nsearchives.nseindia.com/content/equities/bhav"
+               f"/cm_bhavcopy_{date_new}.csv.zip")
+
+    # For dates from Jul 2024 onwards, try new format first
+    cutoff = date(2024, 7, 1)
+    if d >= cutoff:
+        return [new_url, old_url]
+    else:
+        return [old_url, new_url]
+
+
+def parse_bhavcopy_df(raw_df: pd.DataFrame, d: date) -> pd.DataFrame | None:
+    """
+    Standardizes a raw bhavcopy DataFrame regardless of which URL format it came from.
+    NSE has used different column names across years — this handles all variants.
+    Returns clean DataFrame filtered to our TICKER_SET, or None if empty.
+    """
+    raw_df.columns = raw_df.columns.str.strip().str.upper()
+
+    # Column name mapping across all NSE format versions (old + new)
+    col_map = {
+        'SYMBOL'        : 'SYMBOL',
+        'OPEN'          : 'OPEN',
+        'HIGH'          : 'HIGH',
+        'LOW'           : 'LOW',
+        'CLOSE'         : 'CLOSE',
+        'TOTTRDQTY'     : 'VOLUME',   # old format
+        'TTL_TRD_QNTY'  : 'VOLUME',   # mid format
+        'TOTAL_TRADED_QTY': 'VOLUME', # new format
+        'SERIES'        : 'SERIES',
+    }
+    raw_df.rename(columns={k: v for k, v in col_map.items()
+                            if k in raw_df.columns}, inplace=True)
+
+    # Keep only EQ series
+    if 'SERIES' in raw_df.columns:
+        raw_df = raw_df[raw_df['SERIES'].str.strip() == 'EQ']
+
+    keep_cols = ['SYMBOL', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
+    available = [c for c in keep_cols if c in raw_df.columns]
+    raw_df = raw_df[available].copy()
+
+    # Filter to our tickers
+    raw_df = raw_df[raw_df['SYMBOL'].str.strip().isin(TICKER_SET)]
+    if raw_df.empty:
+        return None
+
+    raw_df['Date']   = d
+    raw_df['SYMBOL'] = raw_df['SYMBOL'].str.strip() + '.NS'
+    raw_df.rename(columns={'SYMBOL': 'Ticker'}, inplace=True)
+
+    for col in ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']:
+        if col in raw_df.columns:
+            raw_df[col] = pd.to_numeric(raw_df[col], errors='coerce')
+
+    return raw_df
 
 
 def download_bhavcopy(d: date, retries: int = 3) -> pd.DataFrame | None:
     """
     Download and parse NSE bhavcopy for a given date.
-    Returns DataFrame with columns: SYMBOL, OPEN, HIGH, LOW, CLOSE, TOTTRDQTY
-    Returns None if the file doesn't exist (holiday, weekend, future date).
-
-    NSE requires a session cookie — we refresh it periodically.
+    Tries multiple URL formats automatically (handles pre/post Jul 2024 NSE changes).
+    Returns None if no file found (holiday, weekend, future date).
     """
-    url = build_bhavcopy_url(d)
+    urls = build_bhavcopy_urls(d)
 
-    for attempt in range(1, retries + 1):
-        try:
-            # Refresh NSE session cookie periodically
-            if attempt == 1:
-                try:
-                    session.get("https://www.nseindia.com", timeout=10)
-                except Exception:
-                    pass   # Cookie refresh best-effort only
+    for url in urls:
+        for attempt in range(1, retries + 1):
+            try:
+                # Refresh NSE session cookie on first attempt
+                if attempt == 1:
+                    try:
+                        session.get("https://www.nseindia.com", timeout=10)
+                    except Exception:
+                        pass
 
-            response = session.get(url, timeout=30)
+                response = session.get(url, timeout=30)
 
-            # 404 = holiday or future date — not an error, just skip
-            if response.status_code == 404:
-                return None
+                if response.status_code == 404:
+                    break   # This URL doesn't have this date — try next URL
 
-            if response.status_code != 200:
+                if response.status_code != 200:
+                    if attempt < retries:
+                        time.sleep(5 * attempt)
+                        continue
+                    break   # All retries exhausted for this URL
+
+                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                    csv_filename = z.namelist()[0]
+                    with z.open(csv_filename) as f:
+                        raw_df = pd.read_csv(f)
+
+                result = parse_bhavcopy_df(raw_df, d)
+                return result   # Success — return immediately
+
+            except zipfile.BadZipFile:
+                break   # Bad file for this URL — try next URL
+            except Exception as e:
                 if attempt < retries:
                     time.sleep(5 * attempt)
-                    continue
-                return None
+                else:
+                    break   # Move to next URL
 
-            # Parse ZIP in memory — no disk write needed
-            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-                csv_filename = z.namelist()[0]
-                with z.open(csv_filename) as f:
-                    df = pd.read_csv(f)
-
-            # Standardize column names (NSE uses different names across years)
-            df.columns = df.columns.str.strip().str.upper()
-
-            # Column name mapping across NSE format versions
-            col_map = {
-                'SYMBOL'    : 'SYMBOL',
-                'OPEN'      : 'OPEN',
-                'HIGH'      : 'HIGH',
-                'LOW'       : 'LOW',
-                'CLOSE'     : 'CLOSE',
-                'TOTTRDQTY' : 'VOLUME',   # older format
-                'TTL_TRD_QNTY': 'VOLUME', # newer format
-                'LAST'      : 'LAST',
-                'SERIES'    : 'SERIES',
-            }
-            df.rename(columns={k: v for k, v in col_map.items()
-                                if k in df.columns}, inplace=True)
-
-            # Keep only EQ series (equity — exclude BE, BL, derivatives etc)
-            if 'SERIES' in df.columns:
-                df = df[df['SERIES'].str.strip() == 'EQ']
-
-            # Keep only columns we need
-            keep_cols = ['SYMBOL', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
-            available = [c for c in keep_cols if c in df.columns]
-            df = df[available].copy()
-
-            # Filter to only our Nifty 500 tickers
-            df = df[df['SYMBOL'].str.strip().isin(TICKER_SET)]
-
-            if df.empty:
-                return None
-
-            df['Date'] = d
-            df['SYMBOL'] = df['SYMBOL'].str.strip() + '.NS'
-            df.rename(columns={'SYMBOL': 'Ticker'}, inplace=True)
-
-            # Convert numeric columns
-            for col in ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            return df
-
-        except zipfile.BadZipFile:
-            return None   # Corrupted file — treat as missing
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(5 * attempt)
-            else:
-                print(f"    ⚠️  {d} failed after {retries} attempts: {e}")
-                return None
-
-    return None
+    return None   # All URLs exhausted — holiday or genuine missing date
 
 
 # ═══════════════════════════════════════════════════════════
@@ -429,6 +450,85 @@ def save_corporate_actions(tickers: list):
 # SECTION 5 — MAIN INGESTION LOOP
 # ═══════════════════════════════════════════════════════════
 
+def verify_ingestion(all_days: list):
+    """
+    Runs after ingestion completes. Queries the DB and prints a verification
+    report so you can confirm data quality before running the next script.
+    Pauses and asks for confirmation before proceeding.
+    """
+    print("\n" + "=" * 60)
+    print("VERIFICATION — Checking ingested data quality")
+    print("=" * 60)
+
+    try:
+        # Overall summary
+        summary = pd.read_sql("""
+            SELECT MIN(Date) as Min_Date, MAX(Date) as Max_Date,
+                   COUNT(DISTINCT Ticker) as Tickers,
+                   COUNT(*) as Total_Rows
+            FROM nifty500_ohlcv
+        """, con=engine)
+        print(f"\n  Min Date      : {summary['Min_Date'].iloc[0]}")
+        print(f"  Max Date      : {summary['Max_Date'].iloc[0]}")
+        print(f"  Distinct Tickers: {summary['Tickers'].iloc[0]} (expected ~500)")
+        print(f"  Total Rows    : {summary['Total_Rows'].iloc[0]:,}")
+
+        # Check for expected date range coverage
+        expected_days = len(all_days)
+        ingested_days = len(get_already_ingested_dates())
+        coverage_pct  = ingested_days / expected_days * 100 if expected_days > 0 else 0
+        print(f"\n  Trading days expected : {expected_days:,}")
+        print(f"  Trading days ingested : {ingested_days:,}")
+        print(f"  Coverage              : {coverage_pct:.1f}%")
+
+        # Tickers with very few days (recent listings or download failures)
+        thin = pd.read_sql("""
+            SELECT Ticker, COUNT(*) as days
+            FROM nifty500_ohlcv
+            GROUP BY Ticker
+            HAVING days < 100
+            ORDER BY days ASC
+            LIMIT 15
+        """, con=engine)
+        if not thin.empty:
+            print(f"\n  ⚠️  Tickers with < 100 days (likely recent listings):")
+            for _, row in thin.iterrows():
+                print(f"      {row['Ticker']}: {row['days']} days")
+
+    except Exception as e:
+        print(f"  ❌ Verification query failed: {e}")
+        return
+
+    # Checks
+    issues = []
+    max_date = pd.to_datetime(summary['Max_Date'].iloc[0]).date()
+    today    = date.today()
+    days_gap = (today - max_date).days
+
+    if days_gap > 5:
+        issues.append(f"Max date is {max_date} — {days_gap} days behind today. "
+                      f"Recent data may be missing (URL format issue or holidays).")
+    if int(summary['Tickers'].iloc[0]) < 450:
+        issues.append(f"Only {summary['Tickers'].iloc[0]} tickers found — expected ~500. "
+                      f"Some tickers may be recent IPOs (acceptable) or symbol mismatches.")
+
+    if issues:
+        print(f"\n  ⚠️  ISSUES DETECTED:")
+        for i, issue in enumerate(issues, 1):
+            print(f"     {i}. {issue}")
+    else:
+        print(f"\n  ✅ All checks passed.")
+
+    print("\n" + "=" * 60)
+    confirm = input("Verification complete. Type 'yes' to proceed to next step, "
+                    "or 'no' to stop and investigate: ").strip().lower()
+    if confirm != 'yes':
+        print("\n⛔ Stopped at your request. Fix any issues then rerun the script.")
+        print("   The script has resume support — already-ingested dates are skipped.")
+        raise SystemExit(0)
+    print("✅ Confirmed. Proceeding.\n")
+
+
 def main():
     print("=" * 60)
     print("NSE BHAVCOPY INGESTION — hedge_v2")
@@ -447,7 +547,8 @@ def main():
     print(f"  Remaining to download       : {len(pending_days):,}")
 
     if not pending_days:
-        print("\n✅ All dates already ingested — nothing to do.")
+        print("\n✅ All dates already ingested.")
+        verify_ingestion(all_days)
         return
 
     # ── Step 2: Load or fetch adjustment factors ──────────────────────
@@ -458,7 +559,7 @@ def main():
     os.makedirs(os.path.dirname(adj_factors_path), exist_ok=True)
 
     if os.path.exists(adj_factors_path):
-        print(f"\n📂 Loading cached adjustment factors from {adj_factors_path}")
+        print(f"\n📂 Loading cached adjustment factors...")
         with open(adj_factors_path, 'rb') as f:
             adj_factors = pickle.load(f)
         print(f"  ✅ Loaded factors for {len(adj_factors)} tickers")
@@ -474,20 +575,19 @@ def main():
     )
     if not os.path.exists(corp_actions_done):
         save_corporate_actions(TICKERS)
-        open(corp_actions_done, 'w').close()   # create flag file
+        open(corp_actions_done, 'w').close()
 
     # ── Step 4: Download bhavcopy day by day ─────────────────────────
     print(f"\n📥 Downloading {len(pending_days):,} bhavcopy files...\n")
 
-    batch_buffer = []   # accumulate rows, save in batches of 50 days
-    SAVE_EVERY   = 50   # save to DB every 50 days to avoid memory buildup
+    batch_buffer = []
+    SAVE_EVERY   = 50
 
     success_count = 0
     skip_count    = 0
     fail_count    = 0
 
     for idx, d in enumerate(pending_days, 1):
-        # Progress indicator every 100 days
         if idx % 100 == 0 or idx == 1:
             pct = idx / len(pending_days) * 100
             print(f"  Progress: {idx:,}/{len(pending_days):,} ({pct:.1f}%) "
@@ -495,28 +595,20 @@ def main():
 
         raw_df = download_bhavcopy(d)
 
-        if raw_df is None:
+        if raw_df is None or raw_df.empty:
             skip_count += 1
             continue
 
-        if raw_df.empty:
-            skip_count += 1
-            continue
-
-        # Apply adjustment factors
         rows = []
         for _, row in raw_df.iterrows():
             ticker    = row['Ticker']
             raw_close = float(row['CLOSE']) if pd.notna(row['CLOSE']) else None
-
             if raw_close is None:
                 continue
 
-            adj_close = get_adj_close(ticker, raw_close, d, adj_factors)
-
-            # Typical price = (H + L + C) / 3, used as VWAP proxy
-            high = float(row['HIGH']) if pd.notna(row.get('HIGH')) else raw_close
-            low  = float(row['LOW'])  if pd.notna(row.get('LOW'))  else raw_close
+            adj_close     = get_adj_close(ticker, raw_close, d, adj_factors)
+            high          = float(row['HIGH']) if pd.notna(row.get('HIGH')) else raw_close
+            low           = float(row['LOW'])  if pd.notna(row.get('LOW'))  else raw_close
             typical_price = round((high + low + raw_close) / 3, 4)
 
             rows.append({
@@ -529,24 +621,21 @@ def main():
                 'Adj_Close'     : adj_close,
                 'Volume'        : int(row['VOLUME']) if pd.notna(row.get('VOLUME')) else None,
                 'Typical_Price' : typical_price,
-                'VWAP_Daily'    : typical_price,   # daily VWAP proxy
+                'VWAP_Daily'    : typical_price,
             })
 
         if rows:
             batch_buffer.extend(rows)
             success_count += 1
 
-        # Save batch to DB
         if len(batch_buffer) >= SAVE_EVERY * len(TICKERS) or idx == len(pending_days):
             if batch_buffer:
                 batch_df = pd.DataFrame(batch_buffer)
                 save_to_db(batch_df, TABLES['ohlcv'], engine)
                 batch_buffer = []
 
-        # Polite delay — NSE rate limits aggressive scrapers
         time.sleep(0.5)
 
-        # Longer pause every 200 requests to avoid triggering bot detection
         if idx % 200 == 0:
             print(f"  ⏸️  Pausing 15s to avoid NSE rate limiting...")
             time.sleep(15)
@@ -561,18 +650,14 @@ def main():
 {'='*60}
 BHAVCOPY INGESTION COMPLETE
 {'='*60}
-  Days downloaded successfully : {success_count:,}
+  Days downloaded successfully  : {success_count:,}
   Days skipped (holiday/missing): {skip_count:,}
-  Days failed                  : {fail_count:,}
-  Total trading days in range  : {len(all_days):,}
-{'='*60}
+  Days failed                   : {fail_count:,}
+  Total trading days in range   : {len(all_days):,}
+{'='*60}""")
 
-⚠️  NEXT STEPS:
-  1. Run: python data/indicators.py
-  2. Run: python data/fundamentals.py
-  3. Check adj_factors.pkl — refresh quarterly after SEBI rebalancing
-     by deleting models/adj_factors.pkl and rerunning this script
-""")
+    # ── Verification ──────────────────────────────────────────────────
+    verify_ingestion(all_days)
 
 
 if __name__ == "__main__":
