@@ -170,4 +170,32 @@ hedge_fund_ensemble.ipynb   ← Ensemble combiner + backtest
 
 ---
 
+---
+
+### 10 Apr 2026 — Bhavcopy ingestion verified, config fixed, indicators built
+
+**Status:** Data pipeline Layer 1 complete and verified. Layer 4 (indicators) built.
+
+**Bhavcopy Data Quality (from total_days.csv audit):**
+
+- 500 tickers ingested. Max observed coverage_ratio = 0.9454 (hard ceiling from
+  NSE holidays not in the holidays list — data is correct, threshold was wrong).
+- Tier A threshold corrected from 0.95 → 0.93 in config.py.
+- Verified tier distribution:
+  - Tier A: 275 stocks (8+ years, ≥93% coverage) — full model suite
+  - Tier B: 107 stocks (4+ years, ≥75% coverage) — reduced model suite
+  - Tier C: 85 stocks (below thresholds) — signal inheritance from sector
+  - Tier X: 33 stocks (<252 days, all recent IPOs) — excluded from all training
+- No stock has coverage below 0.776. Zero data corruption found.
+- TIER_X_EXCLUDED list added to config.py — all 33 tickers hardcoded.
+
+**Changes made:**
+
+- `config.py` — DATA_QUALITY thresholds fixed (0.95→0.93), max_gap_pct replaced
+  by min_coverage, TIER_X_EXCLUDED list added
+- `data/indicators.py` — built for hedge_v2 (nifty500_ohlcv → nifty500_indicators),
+  skips Tier X tickers, uses `ta` library
+
+**Next session:** Run `python data/indicators.py`, then build `data/screener_fundamentals.py`
+
 _End of session log. Add your next entry above this line._
