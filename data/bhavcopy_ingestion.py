@@ -175,31 +175,31 @@ def build_bhavcopy_urls(d: date) -> list:
     """
     Returns list of URLs to try for a given date, in priority order.
 
-    NSE changed their bhavcopy URL format in July 2024:
-    - Old format (pre-Jul 2024): /content/historical/EQUITIES/{YEAR}/{MON}/cm{DD}{MON}{YYYY}bhav.csv.zip
-    - New format (post-Jul 2024): /content/equities/bhav/cm_bhavcopy_{YYYY-MM-DD}.csv.zip
-
-    We try the new format first for recent dates, old format as fallback.
-    For dates before Jul 2024 we try old format first.
-    Both formats are always tried — NSE sometimes serves old format files
-    on the new endpoint for historical backfill.
+    NSE changed bhavcopy format on July 8, 2024 (NSE Circular 62424):
+    - Old format (pre Jul 8 2024):
+        /content/historical/EQUITIES/{YEAR}/{MON}/cm{DD}{MON}{YYYY}bhav.csv.zip
+        Columns: SYMBOL, SERIES, OPEN, HIGH, LOW, CLOSE, TOTTRDQTY
+    - New UDiFF format (Jul 8 2024 onwards):
+        /content/cm/BhavCopy_NSE_CM_0_0_0_{YYYYMMDD}_F_0000.csv.zip
+        Columns: TckrSymb, SctySrs, OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol
     """
     year     = d.strftime("%Y")
     month    = d.strftime("%b").upper()
     date_old = d.strftime("%d%b%Y").upper()   # 05JUL2024
-    date_new = d.strftime("%Y-%m-%d")          # 2024-07-05
+    date_new = d.strftime("%Y%m%d")            # 20240708
 
     old_url = (f"https://nsearchives.nseindia.com/content/historical/EQUITIES"
                f"/{year}/{month}/cm{date_old}bhav.csv.zip")
-    new_url = (f"https://nsearchives.nseindia.com/content/equities/bhav"
-               f"/cm_bhavcopy_{date_new}.csv.zip")
+    new_url = (f"https://nsearchives.nseindia.com/content/cm"
+               f"/BhavCopy_NSE_CM_0_0_0_{date_new}_F_0000.csv.zip")
 
-    # For dates from Jul 2024 onwards, try new format first
-    cutoff = date(2024, 7, 1)
-    if d >= cutoff:
+    # Jul 8 2024 onwards: try UDiFF first, old as fallback
+    # Before Jul 8 2024: old format only (UDiFF didn't exist yet)
+    udiff_cutoff = date(2024, 7, 8)
+    if d >= udiff_cutoff:
         return [new_url, old_url]
     else:
-        return [old_url, new_url]
+        return [old_url]
 
 
 def parse_bhavcopy_df(raw_df: pd.DataFrame, d: date) -> pd.DataFrame | None:
@@ -210,17 +210,26 @@ def parse_bhavcopy_df(raw_df: pd.DataFrame, d: date) -> pd.DataFrame | None:
     """
     raw_df.columns = raw_df.columns.str.strip().str.upper()
 
-    # Column name mapping across all NSE format versions (old + new)
+    # Column name mapping across all NSE format versions
+    # Old format (pre Jul 8 2024): SYMBOL, SERIES, OPEN, HIGH, LOW, CLOSE, TOTTRDQTY
+    # UDiFF format (Jul 8 2024+):  TckrSymb, SctySrs, OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol
     col_map = {
-        'SYMBOL'        : 'SYMBOL',
-        'OPEN'          : 'OPEN',
-        'HIGH'          : 'HIGH',
-        'LOW'           : 'LOW',
-        'CLOSE'         : 'CLOSE',
-        'TOTTRDQTY'     : 'VOLUME',   # old format
-        'TTL_TRD_QNTY'  : 'VOLUME',   # mid format
-        'TOTAL_TRADED_QTY': 'VOLUME', # new format
-        'SERIES'        : 'SERIES',
+        'SYMBOL'          : 'SYMBOL',
+        'TCKRSYMB'        : 'SYMBOL',
+        'SERIES'          : 'SERIES',
+        'SCTYSRS'         : 'SERIES',
+        'OPEN'            : 'OPEN',
+        'OPNPRIC'         : 'OPEN',
+        'HIGH'            : 'HIGH',
+        'HGHPRIC'         : 'HIGH',
+        'LOW'             : 'LOW',
+        'LWPRIC'          : 'LOW',
+        'CLOSE'           : 'CLOSE',
+        'CLSPRIC'         : 'CLOSE',
+        'TOTTRDQTY'       : 'VOLUME',
+        'TTL_TRD_QNTY'    : 'VOLUME',
+        'TOTAL_TRADED_QTY': 'VOLUME',
+        'TTLTRADGVOL'     : 'VOLUME',
     }
     raw_df.rename(columns={k: v for k, v in col_map.items()
                             if k in raw_df.columns}, inplace=True)
@@ -260,13 +269,6 @@ def download_bhavcopy(d: date, retries: int = 3) -> pd.DataFrame | None:
     for url in urls:
         for attempt in range(1, retries + 1):
             try:
-                # Refresh NSE session cookie on first attempt
-                if attempt == 1:
-                    try:
-                        session.get("https://www.nseindia.com", timeout=10)
-                    except Exception:
-                        pass
-
                 response = session.get(url, timeout=30)
 
                 if response.status_code == 404:
@@ -454,7 +456,7 @@ def verify_ingestion(all_days: list):
     """
     Runs after ingestion completes. Queries the DB and prints a verification
     report so you can confirm data quality before running the next script.
-    Pauses and asks for confirmation before proceeding.
+    Prints a verification report — review before running the next script.
     """
     print("\n" + "=" * 60)
     print("VERIFICATION — Checking ingested data quality")
@@ -520,13 +522,8 @@ def verify_ingestion(all_days: list):
         print(f"\n  ✅ All checks passed.")
 
     print("\n" + "=" * 60)
-    confirm = input("Verification complete. Type 'yes' to proceed to next step, "
-                    "or 'no' to stop and investigate: ").strip().lower()
-    if confirm != 'yes':
-        print("\n⛔ Stopped at your request. Fix any issues then rerun the script.")
-        print("   The script has resume support — already-ingested dates are skipped.")
-        raise SystemExit(0)
-    print("✅ Confirmed. Proceeding.\n")
+    print("✅ Verification complete. Review the numbers above before running the next script.")
+    print("   Next step: python data/indicators.py")
 
 
 def main():
@@ -587,11 +584,27 @@ def main():
     skip_count    = 0
     fail_count    = 0
 
+    # Refresh NSE session cookie upfront
+    try:
+        session.get("https://www.nseindia.com", timeout=15)
+        time.sleep(2)
+    except Exception:
+        pass
+
     for idx, d in enumerate(pending_days, 1):
         if idx % 100 == 0 or idx == 1:
             pct = idx / len(pending_days) * 100
             print(f"  Progress: {idx:,}/{len(pending_days):,} ({pct:.1f}%) "
                   f"| ✅ {success_count} | ⏭️  {skip_count} | ❌ {fail_count}")
+
+        # Refresh NSE session cookie every 20 requests
+        # NSE cookies expire quickly — without this, requests return empty/blocked
+        if idx % 20 == 0:
+            try:
+                session.get("https://www.nseindia.com", timeout=15)
+                time.sleep(1)
+            except Exception:
+                pass
 
         raw_df = download_bhavcopy(d)
 
@@ -628,11 +641,10 @@ def main():
             batch_buffer.extend(rows)
             success_count += 1
 
-        if len(batch_buffer) >= SAVE_EVERY * len(TICKERS) or idx == len(pending_days):
-            if batch_buffer:
-                batch_df = pd.DataFrame(batch_buffer)
-                save_to_db(batch_df, TABLES['ohlcv'], engine)
-                batch_buffer = []
+        if len(batch_buffer) >= SAVE_EVERY * len(TICKERS):
+            batch_df = pd.DataFrame(batch_buffer)
+            save_to_db(batch_df, TABLES['ohlcv'], engine)
+            batch_buffer = []
 
         time.sleep(0.5)
 
@@ -640,7 +652,7 @@ def main():
             print(f"  ⏸️  Pausing 15s to avoid NSE rate limiting...")
             time.sleep(15)
 
-    # Save any remaining rows
+    # Save any remaining rows after loop ends
     if batch_buffer:
         batch_df = pd.DataFrame(batch_buffer)
         save_to_db(batch_df, TABLES['ohlcv'], engine)
