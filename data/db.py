@@ -34,7 +34,7 @@ def save_to_db(df, table_name, engine, chunk_size=5000):
     Chunked to prevent memory issues on large datasets (500 stocks x 15 years).
     """
     total = len(df)
-    print(f"💾 Saving {total:,} rows to {table_name}...")
+    print(f"Saving {total:,} rows to {table_name}...")
 
     df.to_sql(
         name      = table_name,
@@ -45,4 +45,4 @@ def save_to_db(df, table_name, engine, chunk_size=5000):
         chunksize = chunk_size,
     )
 
-    print(f"✅ Saved {total:,} rows to {table_name}")
+    print(f"Saved {total:,} rows to {table_name}")
