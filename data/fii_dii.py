@@ -20,7 +20,7 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from sqlalchemy import text
 import requests
 import pandas as pd
 from datetime import date, timedelta, datetime
@@ -144,22 +144,17 @@ def get_dates_missing_fii() -> set:
     except Exception:
         return set()
 
-
 def update_macro_table(df: pd.DataFrame):
-    """
-    Updates FII_Net_Buy_Cr and DII_Net_Buy_Cr in macro_indicators
-    for dates where the values are currently NULL.
-    Uses UPDATE not INSERT — rows already exist from macro.py.
-    """
     updated = 0
     with engine.connect() as conn:
         for _, row in df.iterrows():
             result = conn.execute(
-                f"UPDATE {TABLES['macro']} "
-                f"SET FII_Net_Buy_Cr = %s, DII_Net_Buy_Cr = %s "
-                f"WHERE Date = %s",
-                (row["FII_Net_Buy_Cr"], row["DII_Net_Buy_Cr"],
-                 row["Date"].strftime("%Y-%m-%d"))
+                text(f"UPDATE {TABLES['macro']} "
+                     f"SET FII_Net_Buy_Cr = :fii, DII_Net_Buy_Cr = :dii "
+                     f"WHERE Date = :date"),
+                {"fii": row["FII_Net_Buy_Cr"],
+                 "dii": row["DII_Net_Buy_Cr"],
+                 "date": row["Date"].strftime("%Y-%m-%d")}
             )
             updated += result.rowcount
         conn.commit()
