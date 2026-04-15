@@ -1,19 +1,38 @@
-# data/screener_fundamentals.py — hedge_v2 (v5)
+# data/screener_fundamentals.py — hedge_v2 (v6)
 # ═══════════════════════════════════════════════════════════
 # WHAT THIS SCRIPT DOES:
 #   Scrapes annual fundamental data from Screener.in for all
 #   Nifty 500 tickers and saves to nifty500_fundamentals table.
 #
-# C2 FIX (look-ahead leak):
-#   Snapshot ratios (PE_Ratio, ROE, ROCE, Dividend_Yield,
-#   Book_Value_PS) are current-snapshot values from screener.
+# COLUMNS POPULATED HERE:
+#   Revenue, Gross_Profit, EBITDA, Net_Income, EPS_Basic,
+#   EPS_Diluted, Total_Assets, Total_Liabilities, Total_Equity,
+#   Cash, Total_Debt, Book_Value_PS, Operating_CF, Capex,
+#   Free_Cash_Flow, Debt_to_Equity, ROCE, PE_Ratio,
+#   Dividend_Yield, ROE, ROA
+#
+# COLUMNS LEFT NULL HERE (populated elsewhere):
+#   FCF_Yield   → features.py  (needs Close price from OHLCV)
+#   PB_Ratio    → features.py  (needs Close price from OHLCV)
+#   EV_EBITDA   → not computed (needs live market cap)
+#   FII_Holding → fii_dii.py
+#   DII_Holding → fii_dii.py
+#
+# C2 FIX (audit — look-ahead leak):
+#   PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS are
+#   current-snapshot values from screener's .company-ratios box.
 #   Writing them onto every historical year row encodes future
 #   information into historical training data.
-#   FIX: these columns are set to NULL for all periods except
-#   the LATEST period per ticker. The latest period gets the
-#   snapshot value as a "current state" indicator only.
+#   FIX: these columns are NULL for all periods except the LATEST
+#   period per ticker. The latest period gets the snapshot value.
 #
-# BANKING_TICKERS: now imported from config.py (not hardcoded here).
+# CHANGES FROM v4:
+#   - C2 fix applied to records dict (snapshot cols NULL except latest)
+#   - BANKING_TICKERS imported from config.py (single source of truth)
+#   - fetch_company_page: v4 page-validity check restored (profit-loss
+#     section exists is sufficient — v5 added table check which broke
+#     pages where screener renders the table outside the section)
+#   - All other logic identical to v4 (page fetch, parsing, resume)
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -52,8 +71,8 @@ HEADERS = {
     "Referer":         BASE_URL,
 }
 
-# Snapshot-only columns — valid only for the latest period.
-# All prior periods get NULL for these to prevent look-ahead leakage.
+# Snapshot-only columns — valid only for the latest period per ticker.
+# All prior periods get NULL for these to prevent look-ahead leakage (C2 fix).
 SNAPSHOT_COLUMNS = ["PE_Ratio", "ROE", "ROCE", "Dividend_Yield", "Book_Value_PS"]
 
 
@@ -95,7 +114,11 @@ def create_session() -> requests.Session:
 
 def fetch_company_page(session: requests.Session, symbol: str,
                        retries: int = 3) -> BeautifulSoup | None:
-    sym  = symbol.replace(".NS", "").replace(".BO", "")
+    """
+    Tries consolidated page first, then standalone.
+    Returns parsed BeautifulSoup if profit-loss section found, else None.
+    """
+    sym = symbol.replace(".NS", "").replace(".BO", "")
     urls = [
         f"{BASE_URL}/company/{sym}/consolidated/",
         f"{BASE_URL}/company/{sym}/",
@@ -113,8 +136,7 @@ def fetch_company_page(session: requests.Session, symbol: str,
                     time.sleep(5 * attempt)
                     continue
                 soup = BeautifulSoup(resp.text, "html.parser")
-                pl = soup.find("section", {"id": "profit-loss"})
-                if pl and pl.find("table"):
+                if soup.find("section", {"id": "profit-loss"}):
                     return soup
                 break
             except Exception:
@@ -128,6 +150,7 @@ def fetch_company_page(session: requests.Session, symbol: str,
 # ═══════════════════════════════════════════════════════════
 
 def clean_number(val) -> float | None:
+    """Strips currency/percent symbols and converts to float."""
     if val is None:
         return None
     s = str(val).strip()
@@ -142,6 +165,11 @@ def clean_number(val) -> float | None:
 
 
 def parse_section_table(soup: BeautifulSoup, section_id: str) -> dict:
+    """
+    Parses a screener financial table section.
+    Returns { row_name_clean: { year_str: float } }
+    Strips trailing '+' from expandable row names.
+    """
     section = soup.find("section", {"id": section_id})
     if not section:
         return {}
@@ -149,8 +177,8 @@ def parse_section_table(soup: BeautifulSoup, section_id: str) -> dict:
     if not table:
         return {}
 
-    thead    = table.find("thead")
-    headers  = []
+    thead = table.find("thead")
+    headers = []
     if thead:
         for th in thead.find_all("th"):
             headers.append(th.get_text(strip=True))
@@ -164,7 +192,7 @@ def parse_section_table(soup: BeautifulSoup, section_id: str) -> dict:
         return {}
 
     for tr in tbody.find_all("tr"):
-        cells    = tr.find_all(["td", "th"])
+        cells = tr.find_all(["td", "th"])
         if not cells:
             continue
         row_name = cells[0].get_text(strip=True).rstrip("+").strip()
@@ -183,6 +211,10 @@ def parse_section_table(soup: BeautifulSoup, section_id: str) -> dict:
 
 
 def parse_company_ratios(soup: BeautifulSoup) -> dict:
+    """
+    Parses the .company-ratios box — current snapshot values.
+    Returns { metric_name: float }
+    """
     ratios    = {}
     container = soup.find(class_="company-ratios")
     if not container:
@@ -205,6 +237,12 @@ def parse_company_ratios(soup: BeautifulSoup) -> dict:
 
 
 def get_val(table_data: dict, keywords: list, year: str) -> float | None:
+    """
+    Finds first row matching any keyword, returns value for that year.
+    Pass 1: exact match. Pass 2: substring match.
+    Two-pass prevents 'Interest' from matching 'Net Interest Income'
+    before 'Interest Expenses'.
+    """
     for row_name, values in table_data.items():
         if any(kw.lower() == row_name.lower() for kw in keywords):
             v = values.get(year)
@@ -219,6 +257,17 @@ def get_val(table_data: dict, keywords: list, year: str) -> float | None:
 
 
 def get_years(tables: list) -> list:
+    """
+    Returns sorted list of clean 'Mon YYYY' year strings across all tables.
+
+    Handles screener quirks:
+      'Mar 20169m'  -> 'Mar 2016'  (9-month transition period label)
+      'Mar 202415m' -> 'Mar 2024'  (15-month period label)
+      'TTM'         -> skipped     (trailing twelve months = duplicate)
+
+    Without this, HCLTECH (Jun year-end) and NESTLEIND (Dec year-end)
+    lose 1-2 years of data silently.
+    """
     years    = set()
     pattern  = re.compile(
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$"
@@ -277,14 +326,14 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
     if not years:
         return []
 
-    # Current snapshot ratios — only written to the LATEST period row
+    # Current snapshot ratios
     pe        = rat.get("Stock P/E")
     book_val  = rat.get("Book Value")
     div_yield = rat.get("Dividend Yield")
     roe_snap  = rat.get("ROE")
     roce_snap = rat.get("ROCE")
 
-    latest_year = years[-1]   # last element after ascending sort = most recent
+    latest_year = years[-1]   # ascending sort → last element = most recent
 
     records = []
     for year_str in years:
@@ -314,7 +363,7 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
         eps        = get_val(pl, ["EPS in Rs", "EPS",
                                   "Earnings Per Share"], year_str)
 
-        # ── Gross Profit ──────────────────────────────────────────────
+        # ── Gross Profit (non-banks only) ─────────────────────────────
         gross_profit = None
         if not is_bank and revenue is not None:
             expenses = get_val(pl, ["Expenses"], year_str)
@@ -335,7 +384,10 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
         cwip         = get_val(bs, ["CWIP"], year_str) or 0
         investments  = get_val(bs, ["Investments"], year_str) or 0
 
-        # ── Cash ──────────────────────────────────────────────────────
+        # ── Cash (derived) ────────────────────────────────────────────
+        # Banks: use Investments as liquid asset proxy (SLR securities)
+        # Non-banks: Total Assets - Fixed Assets - CWIP - Investments
+        #            clamped to (0, 95% of total assets)
         cash = None
         if is_bank:
             if investments > 0:
@@ -354,10 +406,14 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
                               "Investing Activity"], year_str)
         fcf    = get_val(cf, ["Free Cash Flow"], year_str)
 
+        # ── Capex and FCF ─────────────────────────────────────────────
+        # Case 1: FCF row exists → use directly. Capex = op_cf - fcf.
+        # Case 2: FCF missing → FCF = op_cf + inv_cf. Capex = abs(inv_cf).
+        # Case 3: Only op_cf → FCF = op_cf (conservative lower bound).
         capex = None
         if fcf is not None:
             if op_cf is not None:
-                capex = round(op_cf - fcf, 2)
+                capex = round(op_cf - fcf, 2)   # negative ok in asset-sale years
         else:
             if op_cf is not None and inv_cf is not None:
                 fcf   = round(op_cf + inv_cf, 2)
@@ -375,20 +431,20 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
             roa = round(net_income / total_assets, 4)
 
         # ── Scale to absolute INR ─────────────────────────────────────
+        # Screener values are in Crores. DB BIGINT needs absolute INR.
         def cr(val):
             return int(val * 1e7) if val is not None else None
 
-        # ── C2 FIX: snapshot columns — NULL for all except latest period
+        # ── C2 FIX: snapshot columns ──────────────────────────────────
         # PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS are today's
-        # snapshot values from screener's .company-ratios box.
-        # Stamping them on historical rows encodes future info.
-        # Only the most recent period row gets these values.
+        # snapshot. Only the most recent period row gets these values.
+        # All prior year rows get NULL to prevent look-ahead leakage.
         if is_latest:
-            pe_val        = round(pe, 4)        if pe        is not None else None
-            roe_val       = round(roe_snap / 100, 4) if roe_snap  is not None else None
+            pe_val        = round(pe, 4)              if pe        is not None else None
+            roe_val       = round(roe_snap / 100, 4)  if roe_snap  is not None else None
             roce_val      = round(roce_snap / 100, 4) if roce_snap is not None else None
             div_yield_val = round(div_yield / 100, 4) if div_yield is not None else None
-            book_val_val  = round(book_val, 4)  if book_val  is not None else None
+            book_val_val  = round(book_val, 4)        if book_val  is not None else None
         else:
             pe_val        = None
             roe_val       = None
@@ -435,6 +491,7 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 
 def get_already_scraped() -> set:
+    """Returns set of tickers already present in fundamentals table."""
     try:
         result = pd.read_sql(
             f"SELECT DISTINCT Ticker FROM {TABLES['fundamentals']}",
@@ -446,6 +503,10 @@ def get_already_scraped() -> set:
 
 
 def deduplicate_db():
+    """
+    Removes duplicate (Ticker, Period) rows — keeps highest id.
+    Runs at start to clean up any partial previous runs.
+    """
     print("  Deduplicating fundamentals table...")
     try:
         with engine.connect() as conn:
@@ -468,7 +529,7 @@ def deduplicate_db():
 
 def main():
     print("=" * 60)
-    print("SCREENER.IN FUNDAMENTALS — hedge_v2 (v5)")
+    print("SCREENER.IN FUNDAMENTALS — hedge_v2 (v6 — config-driven)")
     print("=" * 60)
 
     if not SCREENER_EMAIL or not SCREENER_PASSWORD:
@@ -506,13 +567,6 @@ def main():
         try:
             soup = fetch_company_page(session, ticker)
             if soup is None:
-                # Session may have expired — refresh and retry once
-                try:
-                    session = create_session()
-                    soup = fetch_company_page(session, ticker)
-                except Exception:
-                    soup = None
-            if soup is None:
                 print("page not found")
                 no_data.append(ticker)
                 time.sleep(DELAY)
@@ -527,15 +581,17 @@ def main():
 
             all_records.extend(records)
 
-            latest = records[-1]
-            ref    = records[-2] if len(records) > 1 else records[-1]
+            ref = records[-2] if len(records) > 1 else records[-1]
             print(
                 f"OK {len(records)} yrs | "
                 f"Rev={'Y' if ref['Revenue'] else 'N'} "
+                f"GP={'Y' if ref['Gross_Profit'] else 'N'} "
                 f"NI={'Y' if ref['Net_Income'] else 'N'} "
                 f"FCF={'Y' if ref['Free_Cash_Flow'] else 'N'} "
-                f"PE={'Y' if latest['PE_Ratio'] else 'N'} "
-                f"ROE={'Y' if latest['ROE'] else 'N'} "
+                f"Cash={'Y' if ref['Cash'] else 'N'} "
+                f"PE={'Y' if records[-1]['PE_Ratio'] else 'N'} "
+                f"ROE={'Y' if records[-1]['ROE'] else 'N'} "
+                f"ROA={'Y' if ref['ROA'] else 'N'} "
                 f"D/E={'Y' if ref['Debt_to_Equity'] else 'N'}"
             )
 
@@ -544,12 +600,13 @@ def main():
             failed.append(ticker)
 
         if len(all_records) >= 260:
-            save_to_db(pd.DataFrame(all_records), TABLES["fundamentals"], engine)
+            df = pd.DataFrame(all_records)
+            save_to_db(df, TABLES["fundamentals"], engine)
             all_records = []
 
         time.sleep(DELAY)
 
-        if idx % 50 == 0:
+        if idx % 100 == 0:
             print(f"\n  Re-logging in at ticker {idx}...")
             try:
                 session = create_session()
@@ -557,20 +614,21 @@ def main():
                 pass
 
     if all_records:
-        save_to_db(pd.DataFrame(all_records), TABLES["fundamentals"], engine)
+        df = pd.DataFrame(all_records)
+        save_to_db(df, TABLES["fundamentals"], engine)
 
     print(f"""
 {'='*60}
 COMPLETE
-  Scraped : {len(pending) - len(failed) - len(no_data)}
-  No data : {len(no_data)}
-  Errors  : {len(failed)}
+  Scraped  : {len(pending) - len(failed) - len(no_data)}
+  No data  : {len(no_data)}
+  Errors   : {len(failed)}
 {'='*60}""")
 
     if no_data:
-        print(f"No data : {no_data}")
+        print(f"No data  : {no_data}")
     if failed:
-        print(f"Errors  : {failed}")
+        print(f"Errors   : {failed}")
 
     print("\nNext: python data/macro.py")
 
