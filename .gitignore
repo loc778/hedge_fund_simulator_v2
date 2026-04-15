@@ -4,3 +4,4 @@ models/
 features_master.csv
 files/
 .venv/
+debugging/

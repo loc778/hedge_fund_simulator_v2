@@ -5,19 +5,21 @@
 # SETUP:
 #   Place all downloaded NSDL .xls files in:
 #   hedge_fund_simulator_v2/files/fii_nsdl/
-#   Files can have any name — year is auto-detected from content.
 #
-# WHAT IT DOES:
-#   1. Reads all .xls files in files/fii_nsdl/
-#   2. Parses FPI Equity net flows (handles both pre/post 2022 formats)
-#   3. Matches each month's value to exact trading dates in macro_indicators
-#   4. UPDATEs FII_Net_Buy_Cr — only fills NULLs, never overwrites
+# C5 FIX — UNIT MISMATCH:
+# NSDL provides monthly totals only. Previously each trading day
+# in a month received the full month's total — mixing monthly
+# units with daily units in the same column.
 #
-# GRANULARITY NOTE:
-#   NSDL provides monthly totals only. Each trading day in a given
-#   month receives that month's total. This is standard practice —
-#   FII flow is a monthly trend signal for model training purposes.
-#   Recent daily precision is handled by fii_dii.py (NSE API).
+# Fix: divide monthly total by number of NSE trading days in that
+# month to produce a unit-consistent daily approximation.
+# Written to FII_Monthly_Net_Cr (separate column from FII_Daily_Net_Cr).
+# This is an approximation — each trading day gets an equal share
+# of the monthly flow. Not exact daily values, but unit-consistent.
+#
+# Recent daily precision is handled by fii_dii.py → FII_Daily_Net_Cr.
+# features.py will prefer FII_Daily_Net_Cr when available (post-2025),
+# and fall back to FII_Monthly_Net_Cr for historical rows.
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -28,7 +30,7 @@ import pandas as pd
 import re
 from sqlalchemy import text
 
-from config import TABLES, PROJECT_ROOT
+from config import TABLES, PROJECT_ROOT, NSE_HOLIDAYS
 from data.db import get_engine
 
 engine = get_engine()
@@ -42,18 +44,30 @@ MONTH_MAP = {
 }
 
 
+def get_trading_days_in_month(year: int, month: int) -> int:
+    """
+    Returns the count of NSE trading days in a given year/month.
+    Uses NSE_HOLIDAYS from config to exclude known holidays.
+    """
+    from datetime import date, timedelta
+    first = date(year, month, 1)
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+
+    count   = 0
+    current = first
+    while current <= last:
+        if current.weekday() < 5 and current not in NSE_HOLIDAYS:
+            count += 1
+        current += timedelta(days=1)
+    return max(count, 1)   # avoid division by zero
+
+
 def parse_fii_file(filepath: str):
     """
-    Parses one NSDL FPI .xls file (HTML-disguised-as-xls).
-
-    Handles both formats:
-      Pre-2022 : 5 cols  — Month | Equity | Debt | Total | (empty)
-      Post-2022: 13 cols — Month | Equity | Debt-General | Debt-VRR |
-                           Debt-FAR | Hybrid | MF cols... | AIF | Total
-
-    In both formats: Equity is always column index 1.
-    Year is extracted from the column header title string.
-
+    Parses one NSDL FPI .xls file.
     Returns (DataFrame[Year, Month, FII_Equity_Cr], error_string)
     """
     try:
@@ -66,7 +80,6 @@ def parse_fii_file(filepath: str):
 
     df = max(dfs, key=len)
 
-    # Extract year from column headers
     year = None
     for col in df.columns:
         m = re.search(r"Calendar Year - (\d{4})", str(col))
@@ -112,10 +125,11 @@ def parse_fii_file(filepath: str):
 
 def expand_to_daily(monthly_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Loads all dates from macro_indicators and assigns each trading day
-    the FII equity value for its (Year, Month).
-    Only dates that exist in macro_indicators are matched —
-    ensures no orphaned rows and exact date alignment.
+    Expands monthly totals to daily rows in macro_indicators.
+    Each trading day receives (monthly_total / trading_days_in_month).
+    This makes the column unit-consistent: Cr per trading day.
+
+    Written to FII_Monthly_Net_Cr (not FII_Net_Buy_Cr).
     """
     trading_dates = pd.read_sql(
         f"SELECT Date FROM {TABLES['macro']} ORDER BY Date",
@@ -125,30 +139,41 @@ def expand_to_daily(monthly_df: pd.DataFrame) -> pd.DataFrame:
     trading_dates["Year"]  = trading_dates["Date"].dt.year
     trading_dates["Month"] = trading_dates["Date"].dt.month
 
+    # Compute per-day value = monthly total / trading days in that month
+    monthly_df = monthly_df.copy()
+    monthly_df["Trading_Days"] = monthly_df.apply(
+        lambda r: get_trading_days_in_month(int(r["Year"]), int(r["Month"])),
+        axis=1
+    )
+    monthly_df["FII_Monthly_Net_Cr"] = (
+        monthly_df["FII_Equity_Cr"] / monthly_df["Trading_Days"]
+    ).round(4)
+
     merged = trading_dates.merge(
-        monthly_df[["Year", "Month", "FII_Equity_Cr"]],
+        monthly_df[["Year", "Month", "FII_Monthly_Net_Cr"]],
         on=["Year", "Month"],
         how="left"
-    ).dropna(subset=["FII_Equity_Cr"])
+    ).dropna(subset=["FII_Monthly_Net_Cr"])
 
     merged["Date"] = merged["Date"].dt.date
-    return merged[["Date", "FII_Equity_Cr"]].rename(
-        columns={"FII_Equity_Cr": "FII_Net_Buy_Cr"}
-    )
+    return merged[["Date", "FII_Monthly_Net_Cr"]]
 
 
 def update_db(daily_df: pd.DataFrame) -> int:
-    """UPDATE macro_indicators — only fills NULLs, never overwrites."""
+    """
+    UPDATEs FII_Monthly_Net_Cr — only fills NULLs, never overwrites.
+    (Historical data doesn't change once NSDL files are finalized.)
+    """
     updated = 0
     with engine.connect() as conn:
         for _, row in daily_df.iterrows():
             result = conn.execute(
                 text(
                     f"UPDATE {TABLES['macro']} "
-                    f"SET FII_Net_Buy_Cr = :val "
-                    f"WHERE Date = :date AND FII_Net_Buy_Cr IS NULL"
+                    f"SET FII_Monthly_Net_Cr = :val "
+                    f"WHERE Date = :date AND FII_Monthly_Net_Cr IS NULL"
                 ),
-                {"val":  round(float(row["FII_Net_Buy_Cr"]), 4),
+                {"val":  float(row["FII_Monthly_Net_Cr"]),
                  "date": str(row["Date"])}
             )
             updated += result.rowcount
@@ -163,7 +188,7 @@ def main():
 
     if not os.path.exists(FII_FILES_DIR):
         print(f"❌ Folder not found: {FII_FILES_DIR}")
-        print(f"   Create it and place your NSDL .xls files there.")
+        print(f"   Create it and place NSDL .xls files there.")
         return
 
     xls_files = sorted([
@@ -178,12 +203,11 @@ def main():
 
     print(f"\n📂 {len(xls_files)} files found\n")
 
-    # Parse all files
     all_monthly  = []
     failed_files = []
 
     for filepath in xls_files:
-        fname = os.path.basename(filepath)
+        fname  = os.path.basename(filepath)
         df, err = parse_fii_file(filepath)
 
         if err:
@@ -193,8 +217,7 @@ def main():
 
         year  = df["Year"].iloc[0]
         total = df["FII_Equity_Cr"].sum()
-        print(f"  ✅ {fname} → {year} | "
-              f"{len(df)} months | net: {total:+,.0f} Cr")
+        print(f"  ✅ {fname} → {year} | {len(df)} months | net: {total:+,.0f} Cr")
         all_monthly.append(df)
 
     if not all_monthly:
@@ -203,7 +226,6 @@ def main():
 
     combined = pd.concat(all_monthly, ignore_index=True)
 
-    # Guard against duplicate year files
     dupes = combined.groupby("Year")["Month"].count()
     dupes = dupes[dupes > 12]
     if not dupes.empty:
@@ -213,36 +235,34 @@ def main():
     print(f"\n✅ {len(combined)} monthly records | "
           f"{combined['Year'].min()}–{combined['Year'].max()}")
 
-    # Expand monthly → daily using exact macro_indicators dates
-    print("\n🔧 Matching to trading dates in macro_indicators...")
+    print("\n🔧 Expanding to daily with per-trading-day approximation...")
     daily_df = expand_to_daily(combined)
     print(f"   {len(daily_df)} trading days matched")
 
     if daily_df.empty:
-        print("❌ No dates matched — run macro.py first to populate macro_indicators.")
+        print("❌ No dates matched — run macro.py first.")
         return
 
-    # Update DB
-    print("\n💾 Updating FII_Net_Buy_Cr...")
+    print("\n💾 Updating FII_Monthly_Net_Cr in macro_indicators...")
     updated = update_db(daily_df)
     print(f"✅ {updated} rows updated")
 
-    # Verification summary
+    # Verification
     result = pd.read_sql(
         f"""SELECT
                 COUNT(*) as total_rows,
-                SUM(CASE WHEN FII_Net_Buy_Cr IS NULL  THEN 1 ELSE 0 END) as nulls,
-                SUM(CASE WHEN FII_Net_Buy_Cr IS NOT NULL THEN 1 ELSE 0 END) as filled,
-                MIN(CASE WHEN FII_Net_Buy_Cr IS NOT NULL THEN Date END) as earliest,
-                MAX(CASE WHEN FII_Net_Buy_Cr IS NOT NULL THEN Date END) as latest
+                SUM(CASE WHEN FII_Monthly_Net_Cr IS NULL  THEN 1 ELSE 0 END) as nulls,
+                SUM(CASE WHEN FII_Monthly_Net_Cr IS NOT NULL THEN 1 ELSE 0 END) as filled,
+                MIN(CASE WHEN FII_Monthly_Net_Cr IS NOT NULL THEN Date END) as earliest,
+                MAX(CASE WHEN FII_Monthly_Net_Cr IS NOT NULL THEN Date END) as latest
             FROM {TABLES['macro']}""",
         con=engine
     )
     r = result.iloc[0]
-    print(f"\n   macro_indicators total rows : {r['total_rows']}")
-    print(f"   FII_Net_Buy_Cr filled        : {r['filled']}")
-    print(f"   FII_Net_Buy_Cr NULLs left    : {r['nulls']}")
-    print(f"   FII data range               : {r['earliest']} → {r['latest']}")
+    print(f"\n   macro_indicators total rows      : {r['total_rows']}")
+    print(f"   FII_Monthly_Net_Cr filled        : {r['filled']}")
+    print(f"   FII_Monthly_Net_Cr NULLs left    : {r['nulls']}")
+    print(f"   FII data range                   : {r['earliest']} → {r['latest']}")
 
     if failed_files:
         print(f"\n⚠️  Failed: {failed_files}")

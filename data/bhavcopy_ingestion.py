@@ -2,19 +2,19 @@
 # ═══════════════════════════════════════════════════════════
 # NSE BHAVCOPY INGESTION — hedge_v2
 # Downloads daily bhavcopy ZIPs from NSE archives (Jan 2010 → today)
-# Parses OHLCV, fetches adjustment factors from yfinance,
-# calculates Adj_Close, saves to nifty500_ohlcv table.
+# Parses OHLCV, builds Adj_Close from corporate_actions splits table,
+# saves to nifty500_ohlcv table.
 #
-# WHAT IS A BHAVCOPY:
-# NSE publishes a daily ZIP file after market close containing
-# OHLCV data for every stock traded that day. These are the
-# official NSE settlement prices — more reliable than yfinance.
+# HOW ADJ_CLOSE IS CALCULATED (C3 fix — splits-based, no yfinance):
+# Built entirely from the corporate_actions table (splits only).
+# Walk backwards from today: for each split event on date D with ratio R,
+# all prices BEFORE D are multiplied by (1 / R).
+# e.g. 2:1 split (ratio=2.0) → pre-split prices × 0.5
+# Dividends are ignored — small relative to price, negligible for 21-day models.
 #
-# HOW ADJ_CLOSE IS CALCULATED:
-# 1. Fetch split history and dividend history per ticker from yfinance
-# 2. Build a cumulative adjustment factor for each ticker
-# 3. Adj_Close[t] = Close[t] * product of all adjustment factors
-#    for events AFTER date t (working backwards from present)
+# BISECT LOOKUP (C4 fix):
+# Adj factor lookup uses bisect.bisect_right — O(log N) per call,
+# not O(N²) sorted() in the hot loop.
 #
 # RESUME SUPPORT:
 # Script checks which dates already exist in the DB and skips them.
@@ -32,19 +32,19 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import time
+import bisect
 import pickle
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
 
-from config import (TICKERS, DATA_START, DATA_END, BHAVCOPY_URL,
-                    BHAVCOPY_TEMP_DIR, TABLES, BATCH_SIZE, BATCH_DELAY)
+from config import (TICKERS, DATA_START, DATA_END, BHAVCOPY_TEMP_DIR,
+                    TABLES, BATCH_SIZE, BATCH_DELAY, NSE_HOLIDAYS)
 from data.db import get_engine, save_to_db
 
 engine = get_engine()
 
 # ── NSE Bhavcopy Request Headers ─────────────────────────────────────
 # NSE blocks requests without a proper browser user-agent
-# These headers mimic a real browser visit
 HEADERS = {
     "User-Agent"      : ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -60,30 +60,6 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# ── NSE Holidays ─────────────────────────────────────────────────────
-# NSE is closed on these dates (partial list — updated annually)
-# The script skips weekends automatically via date logic
-# These are additional market holidays
-# Source: NSE official holiday calendar
-NSE_HOLIDAYS = {
-    # 2026
-    date(2026,1,26), date(2026,3,25), date(2026,4,2), date(2026,4,10),
-    date(2026,4,14), date(2026,5,1), date(2026,6,19), date(2026,8,15),
-    date(2026,10,2), date(2026,10,20), date(2026,11,4), date(2026,12,25),
-    # 2025
-    date(2025,1,26), date(2025,2,26), date(2025,3,14), date(2025,3,31),
-    date(2025,4,10), date(2025,4,14), date(2025,4,18), date(2025,5,1),
-    date(2025,8,15), date(2025,8,27), date(2025,10,2), date(2025,10,2),
-    date(2025,10,21), date(2025,10,24), date(2025,11,5), date(2025,12,25),
-    # 2024
-    date(2024,1,22), date(2024,1,26), date(2024,3,25), date(2024,4,9),
-    date(2024,4,11), date(2024,4,14), date(2024,4,17), date(2024,5,1),
-    date(2024,5,23), date(2024,6,17), date(2024,7,17), date(2024,8,15),
-    date(2024,10,2), date(2024,11,1), date(2024,11,15), date(2024,12,25),
-    # Add earlier years here as needed — script will still work without them
-    # (it will just try to download those days and get 404, which it handles)
-}
-
 # ── Ticker Set for Fast Lookup ────────────────────────────────────────
 # Convert TICKERS list to set of base symbols (without .NS) for bhavcopy matching
 TICKER_SET = {t.replace('.NS', '') for t in TICKERS}
@@ -93,28 +69,7 @@ TICKER_SET = {t.replace('.NS', '') for t in TICKERS}
 # For 15 years of training data, this creates survivorship bias:
 # we only train on stocks that SURVIVED to be in today's index,
 # ignoring the ones that were dropped (often the worst performers).
-# This makes the model look better in backtesting than it will in reality.
-#
-# PRACTICAL APPROACH TAKEN HERE:
-# We download bhavcopy data for today's 500 tickers going back to 2010.
-# Stocks listed after 2010 will simply have fewer rows in the DB —
-# the data_quality.py script will classify them as Tier B or C accordingly.
-# Stocks that were in the 2010-2026 Nifty 500 but are now delisted or
-# removed from the index are NOT captured here.
-#
-# COMPLETE FIX (deferred — requires significant research effort):
-# NSE publishes historical index constituent files on their archives page.
-# A proper survivorship-bias-free dataset requires:
-# 1. Download NSE's historical Nifty 500 constituent CSV for each quarter
-#    from 2010 to present
-# 2. Build a union of all tickers that were EVER in Nifty 500
-# 3. Download bhavcopy data for all those tickers (will be ~700-800 symbols)
-# 4. Mark each stock's active periods in stock_data_quality table
-# This is the production-grade approach and should be done before
-# submitting to mentor for final review.
-#
-# For now: current 500 tickers gives us a usable training set.
-# The model will have mild survivorship bias but the architecture is correct.
+# Full fix requires NSE historical constituent files (deferred).
 
 
 # ═══════════════════════════════════════════════════════════
@@ -123,10 +78,8 @@ TICKER_SET = {t.replace('.NS', '') for t in TICKERS}
 
 def is_trading_day(d: date) -> bool:
     """Returns True if the date is a likely NSE trading day."""
-    # Skip weekends
     if d.weekday() >= 5:
         return False
-    # Skip known holidays
     if d in NSE_HOLIDAYS:
         return False
     return True
@@ -193,8 +146,6 @@ def build_bhavcopy_urls(d: date) -> list:
     new_url = (f"https://nsearchives.nseindia.com/content/cm"
                f"/BhavCopy_NSE_CM_0_0_0_{date_new}_F_0000.csv.zip")
 
-    # Jul 8 2024 onwards: try UDiFF first, old as fallback
-    # Before Jul 8 2024: old format only (UDiFF didn't exist yet)
     udiff_cutoff = date(2024, 7, 8)
     if d >= udiff_cutoff:
         return [new_url, old_url]
@@ -211,8 +162,6 @@ def parse_bhavcopy_df(raw_df: pd.DataFrame, d: date) -> pd.DataFrame | None:
     raw_df.columns = raw_df.columns.str.strip().str.upper()
 
     # Column name mapping across all NSE format versions
-    # Old format (pre Jul 8 2024): SYMBOL, SERIES, OPEN, HIGH, LOW, CLOSE, TOTTRDQTY
-    # UDiFF format (Jul 8 2024+):  TckrSymb, SctySrs, OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol
     col_map = {
         'SYMBOL'          : 'SYMBOL',
         'TCKRSYMB'        : 'SYMBOL',
@@ -300,100 +249,102 @@ def download_bhavcopy(d: date, retries: int = 3) -> pd.DataFrame | None:
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 3 — ADJUSTMENT FACTOR CALCULATION
+# SECTION 3 — SPLITS-BASED ADJUSTMENT FACTORS (C3 + C4 FIX)
 # ═══════════════════════════════════════════════════════════
+# C3 fix: Adj_Close is now built from corporate_actions splits only.
+#         No yfinance ratio multiplication — eliminates yfinance error propagation.
+# C4 fix: get_adj_close uses bisect.bisect_right for O(log N) lookup.
+#         Old approach sorted() inside the hot loop was O(N²).
 
-def fetch_adjustment_factors(tickers: list) -> dict:
+def build_adjustment_factors_from_splits() -> dict:
     """
-    Fetches split and dividend history from yfinance for each ticker.
-    Builds a cumulative adjustment factor per ticker per date.
+    Builds cumulative price adjustment factors from corporate_actions table.
+    Uses splits only (dividends ignored — too small to affect 21-day models).
 
-    Returns dict: {ticker: pd.Series(index=date, values=adj_factor)}
-    The adj_factor at date t means: multiply Close[t] by adj_factor[t]
-    to get the split/dividend adjusted close.
+    Method: walk backwards from today.
+    For each split event on date D with ratio R:
+      All prices on dates < D are multiplied by (1 / R).
 
-    Logic:
-    - Work backwards from today
-    - Start with factor = 1.0 (today's price needs no adjustment)
-    - Each split event before today: multiply all prices BEFORE split date
-      by the split ratio (e.g. 2:1 split → ratio = 0.5)
-    - Each dividend: subtract dividend from all prices before ex-date
-      (but we only apply this if dividend > 1% of price to avoid noise)
+    Returns dict:
+      { ticker: (sorted_dates_list, cumulative_factors_list) }
+      sorted_dates are split dates in ascending order.
+      cumulative_factors[i] = factor to apply to any price date < sorted_dates[i]
+
+    Example — INFY had splits on:
+      2014-12-02  ratio=2.0  → pre-2014 prices × 0.5
+      2018-09-04  ratio=2.0  → pre-2018 prices × 0.5
+    Cumulative factor for price in 2012: 0.5 × 0.5 = 0.25
+    Cumulative factor for price in 2016: 0.5
+    Cumulative factor for price in 2020: 1.0 (no splits after)
     """
-    print(f"\n📊 Fetching adjustment factors for {len(tickers)} tickers from yfinance...")
-    print("   (This runs once — factors saved to models/adj_factors.pkl for reuse)")
+    print("\n📊 Building adjustment factors from corporate_actions (splits only)...")
+
+    try:
+        splits_df = pd.read_sql(
+            f"""SELECT Ticker, Date, Ratio
+                FROM {TABLES['corporate_actions']}
+                WHERE Action_Type = 'split'
+                  AND Ratio IS NOT NULL
+                  AND Ratio > 0
+                ORDER BY Ticker, Date ASC""",
+            con=engine
+        )
+    except Exception as e:
+        print(f"  ❌ Cannot read corporate_actions: {e}")
+        return {}
+
+    if splits_df.empty:
+        print("  ⚠️  No splits found in corporate_actions. All Adj_Close = Close.")
+        return {}
+
+    splits_df['Date'] = pd.to_datetime(splits_df['Date']).dt.date
 
     adj_factors = {}
-    failed      = []
 
-    # Process in batches to avoid yfinance rate limits
-    for i in range(0, len(tickers), BATCH_SIZE):
-        batch = tickers[i:i + BATCH_SIZE]
-        print(f"  Batch {i//BATCH_SIZE + 1}/{(len(tickers)-1)//BATCH_SIZE + 1}...")
+    for ticker, grp in splits_df.groupby('Ticker'):
+        grp          = grp.sort_values('Date', ascending=True).reset_index(drop=True)
+        split_dates  = grp['Date'].tolist()
+        split_ratios = grp['Ratio'].tolist()
+        n            = len(split_dates)
 
-        for ticker in batch:
-            try:
-                stock = yf.Ticker(ticker)
+        # cum_factors[i] = product of (1/ratio) for all splits at index >= i
+        # i.e. how much to multiply a price at a date just before split_dates[i]
+        cum_factors = [1.0] * n
+        running = 1.0
+        for i in range(n - 1, -1, -1):
+            running *= (1.0 / split_ratios[i])
+            cum_factors[i] = running
 
-                # Get full price history to use as reference
-                hist = stock.history(start=DATA_START, auto_adjust=False)
+        adj_factors[ticker] = (split_dates, cum_factors)
 
-                if hist.empty:
-                    adj_factors[ticker] = {}
-                    continue
-
-                # yfinance already provides an adjusted close in its history
-                # We use the ratio: Adj Close / Close as our adjustment factor
-                # This captures both splits and dividends implicitly
-                hist = hist[['Close', 'Adj Close']].dropna()
-
-                if len(hist) < 10:
-                    adj_factors[ticker] = {}
-                    continue
-
-                # Ratio: how much to multiply raw close to get adj close
-                ratio = (hist['Adj Close'] / hist['Close']).round(6)
-                ratio.index = ratio.index.date   # convert to plain date objects
-
-                adj_factors[ticker] = ratio.to_dict()
-
-            except Exception as e:
-                print(f"    ⚠️  {ticker} adj factor failed: {e}")
-                adj_factors[ticker] = {}
-                failed.append(ticker)
-
-            time.sleep(0.3)
-
-        time.sleep(BATCH_DELAY)
-
-    print(f"  ✅ Adjustment factors fetched: {len(adj_factors)} tickers")
-    if failed:
-        print(f"  ⚠️  {len(failed)} tickers failed (will use raw close = adj close): {failed[:10]}")
-
+    print(f"  ✅ Adjustment factors built for {len(adj_factors)} tickers with splits")
     return adj_factors
 
 
 def get_adj_close(ticker: str, raw_close: float, d: date,
                   adj_factors: dict) -> float:
     """
-    Returns the adjusted close for a ticker on a given date.
-    Uses the pre-fetched adjustment factor ratio from yfinance.
-    Falls back to raw close if no adjustment factor available.
+    Returns split-adjusted close for ticker on date d.
+    If no splits exist for this ticker, returns raw_close unchanged.
+
+    Uses bisect for O(log N) lookup — fixes audit issue C4.
     """
-    factors = adj_factors.get(ticker, {})
-    if not factors:
-        return raw_close
+    if ticker not in adj_factors:
+        return round(raw_close, 4)
 
-    # Find the closest available date in the factors dict
-    factor = factors.get(d)
-    if factor is None:
-        # Fallback: use the most recent factor before this date
-        available_dates = sorted([dd for dd in factors.keys() if dd <= d])
-        if available_dates:
-            factor = factors[available_dates[-1]]
-        else:
-            return raw_close
+    split_dates, cum_factors = adj_factors[ticker]
 
+    # bisect_right gives the insertion point for d in split_dates.
+    # All elements at index < idx are <= d.
+    # The first split AFTER d is at index idx.
+    idx = bisect.bisect_right(split_dates, d)
+
+    if idx == len(split_dates):
+        # d is after all split dates — no adjustment needed
+        return round(raw_close, 4)
+
+    # Apply cumulative factor for splits at index idx onwards
+    factor = cum_factors[idx]
     return round(raw_close * factor, 4)
 
 
@@ -404,12 +355,13 @@ def get_adj_close(ticker: str, raw_close: float, d: date,
 def save_corporate_actions(tickers: list):
     """
     Saves split and dividend history to corporate_actions table.
-    This is for reference/audit — actual adjustment uses adj_factors dict.
+    This table is the source for build_adjustment_factors_from_splits().
     """
     print(f"\n💾 Saving corporate actions history...")
     all_actions = []
+    failed      = []
 
-    for ticker in tickers:
+    for idx, ticker in enumerate(tickers, 1):
         try:
             stock = yf.Ticker(ticker)
 
@@ -441,22 +393,32 @@ def save_corporate_actions(tickers: list):
 
         except Exception as e:
             print(f"  ⚠️  {ticker} corporate actions failed: {e}")
+            failed.append(ticker)
+
+        # Batch save every 250 rows to avoid memory buildup
+        if len(all_actions) >= 250:
+            save_to_db(pd.DataFrame(all_actions), TABLES['corporate_actions'], engine)
+            all_actions = []
+
+        if idx % 50 == 0:
+            print(f"  {idx}/{len(tickers)} tickers processed...")
 
     if all_actions:
-        df = pd.DataFrame(all_actions)
-        save_to_db(df, TABLES['corporate_actions'], engine)
-        print(f"  ✅ Saved {len(all_actions)} corporate action events")
+        save_to_db(pd.DataFrame(all_actions), TABLES['corporate_actions'], engine)
+
+    print(f"  ✅ Corporate actions saved")
+    if failed:
+        print(f"  ⚠️  {len(failed)} tickers failed")
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 5 — MAIN INGESTION LOOP
+# SECTION 5 — VERIFICATION
 # ═══════════════════════════════════════════════════════════
 
 def verify_ingestion(all_days: list):
     """
     Runs after ingestion completes. Queries the DB and prints a verification
     report so you can confirm data quality before running the next script.
-    Prints a verification report — review before running the next script.
     """
     print("\n" + "=" * 60)
     print("VERIFICATION — Checking ingested data quality")
@@ -501,7 +463,6 @@ def verify_ingestion(all_days: list):
         print(f"  ❌ Verification query failed: {e}")
         return
 
-    # Checks
     issues = []
     max_date = pd.to_datetime(summary['Max_Date'].iloc[0]).date()
     today    = date.today()
@@ -526,6 +487,10 @@ def verify_ingestion(all_days: list):
     print("   Next step: python data/indicators.py")
 
 
+# ═══════════════════════════════════════════════════════════
+# SECTION 6 — MAIN INGESTION LOOP
+# ═══════════════════════════════════════════════════════════
+
 def main():
     print("=" * 60)
     print("NSE BHAVCOPY INGESTION — hedge_v2")
@@ -548,31 +513,22 @@ def main():
         verify_ingestion(all_days)
         return
 
-    # ── Step 2: Load or fetch adjustment factors ──────────────────────
-    adj_factors_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "models", "adj_factors.pkl"
-    )
-    os.makedirs(os.path.dirname(adj_factors_path), exist_ok=True)
-
-    if os.path.exists(adj_factors_path):
-        print(f"\n📂 Loading cached adjustment factors...")
-        with open(adj_factors_path, 'rb') as f:
-            adj_factors = pickle.load(f)
-        print(f"  ✅ Loaded factors for {len(adj_factors)} tickers")
-    else:
-        adj_factors = fetch_adjustment_factors(TICKERS)
-        with open(adj_factors_path, 'wb') as f:
-            pickle.dump(adj_factors, f)
-        print(f"  ✅ Saved adjustment factors to {adj_factors_path}")
-
-    # ── Step 3: Save corporate actions (once) ─────────────────────────
+    # ── Step 2: Save corporate actions (once) ─────────────────────────
     corp_actions_done = os.path.join(
-        os.path.dirname(adj_factors_path), "corp_actions_saved.flag"
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "corp_actions_saved.flag"
     )
+    os.makedirs(os.path.dirname(corp_actions_done), exist_ok=True)
+
     if not os.path.exists(corp_actions_done):
         save_corporate_actions(TICKERS)
         open(corp_actions_done, 'w').close()
+    else:
+        print("\n📂 Corporate actions already saved (flag exists).")
+
+    # ── Step 3: Build adjustment factors from splits ──────────────────
+    # C3 fix: uses corporate_actions table, not yfinance ratio
+    adj_factors = build_adjustment_factors_from_splits()
 
     # ── Step 4: Download bhavcopy day by day ─────────────────────────
     print(f"\n📥 Downloading {len(pending_days):,} bhavcopy files...\n")

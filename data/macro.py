@@ -6,12 +6,13 @@
 #   FRED API  — GDP India, CPI India, Fed Rate, US CPI, US 10Y Bond
 #
 # Writes to macro_indicators table.
-# FII/DII and RBI columns (Repo_Rate, IIP_Growth, Forex_Reserves_USD)
-# are written by fii_dii.py and rbi_macro.py respectively.
+# FII/DII and RBI columns written by fii_dii.py and rbi_macro.py.
 #
-# RESUME SUPPORT:
-# Checks latest date in DB and only fetches what's missing.
-# Safe to re-run at any time.
+# C6 FIX — UPSERT RESUME:
+# Previous version used INSERT IGNORE on resume, meaning stale or
+# preliminary FRED values (e.g. revised GDP) were never corrected.
+# Fixed: resume window uses ON DUPLICATE KEY UPDATE so revised
+# values overwrite stale ones on re-run.
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -22,17 +23,17 @@ import yfinance as yf
 import pandas as pd
 from fredapi import Fred
 from dotenv import load_dotenv
+from sqlalchemy import text
 import time
 
 from config import DATA_START, MACRO_YFINANCE, MACRO_FRED, TABLES
-from data.db import get_engine, save_to_db
+from data.db import get_engine
 
 load_dotenv()
 engine = get_engine()
 fred   = Fred(api_key=os.getenv("FRED_API_KEY"))
 
 
-# ── Resume: find latest date already in DB ────────────────────────────
 def get_latest_date_in_db() -> str:
     """Returns latest date in macro_indicators, or DATA_START if empty."""
     try:
@@ -43,32 +44,89 @@ def get_latest_date_in_db() -> str:
         max_date = result["max_date"].iloc[0]
         if pd.isna(max_date):
             return DATA_START
-        # Move back 5 days to re-fetch recent dates (handles late data arrival)
+        # Overlap 5 days to catch revised FRED values (C6 fix: these are now UPSERTed)
         return (pd.to_datetime(str(max_date)) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
     except Exception:
         return DATA_START
 
 
-# ── yfinance download with retry ──────────────────────────────────────
 def download_yfinance(symbol: str, start: str, retries: int = 3) -> pd.Series | None:
     for attempt in range(1, retries + 1):
         try:
             df = yf.download(
                 symbol, start=start, interval="1d",
-                progress=False, timeout=20
+                progress=False, timeout=20,
+                auto_adjust=False
             )
-            if df.empty:
+            if df is None or df.empty:
                 return None
-            # Handle MultiIndex columns from newer yfinance versions
+            # Flatten MultiIndex columns (newer yfinance versions)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            return df["Close"]
+            # Some symbols return 'Adj Close' instead of 'Close'
+            if "Close" in df.columns:
+                series = df["Close"]
+            elif "Adj Close" in df.columns:
+                series = df["Adj Close"]
+            else:
+                return None
+            series = series.dropna()
+            return series if not series.empty else None
         except Exception as e:
             if attempt < retries:
                 time.sleep(5 * attempt)
             else:
                 print(f"    ❌ {symbol} failed after {retries} attempts: {e}")
                 return None
+
+
+def upsert_macro_rows(df: pd.DataFrame):
+    """
+    Inserts new rows and updates existing ones (UPSERT).
+    For the overlap window: revised FRED values overwrite stale ones.
+    FII/DII and RBI columns are NOT touched — written by their own scripts.
+    """
+    import math
+
+    yf_cols     = list(MACRO_YFINANCE.keys())
+    fred_cols   = list(MACRO_FRED.keys())
+    update_cols = [c for c in yf_cols + fred_cols if c in df.columns]
+
+    if not update_cols:
+        return
+
+    set_clause   = ", ".join([f"{c} = VALUES({c})" for c in update_cols])
+    col_list     = ["Date"] + update_cols
+    placeholders = ", ".join([":" + c for c in col_list])
+    col_names    = ", ".join(col_list)
+
+    sql = text(f"""
+        INSERT INTO {TABLES['macro']} ({col_names})
+        VALUES ({placeholders})
+        ON DUPLICATE KEY UPDATE {set_clause}
+    """)
+
+    def clean_val(v):
+        """Convert NaN/inf to None — MySQL cannot store Python nan literals."""
+        if v is None:
+            return None
+        try:
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return None
+        except Exception:
+            pass
+        return v
+
+    rows = df[col_list].to_dict(orient="records")
+
+    with engine.connect() as conn:
+        for row in rows:
+            row["Date"] = str(row["Date"])
+            clean_row   = {k: clean_val(v) for k, v in row.items()}
+            conn.execute(sql, clean_row)
+        conn.commit()
+
+    print(f"  ✅ Upserted {len(rows)} rows into macro_indicators")
 
 
 def main():
@@ -94,16 +152,14 @@ def main():
             print("⚠️  failed — will be NULL")
 
     if not daily_frames:
-        print("\n❌ All yfinance fetches failed — check network/API")
+        print("\n❌ All yfinance fetches failed — check network")
         return
 
     daily = pd.concat(daily_frames, axis=1, sort=True)
-    daily.index = pd.to_datetime(
-        [str(d)[:10] for d in daily.index]
-    )
+    daily.index = pd.to_datetime([str(d)[:10] for d in daily.index])
     daily.index.name = "Date"
 
-    # ── Step 2: FRED monthly/quarterly data ──────────────────────────
+    # ── Step 2: FRED data ─────────────────────────────────────────────
     print("\n📥 Fetching macro indicators from FRED...")
     fred_frames = []
 
@@ -111,9 +167,7 @@ def main():
         try:
             series = fred.get_series(series_id, observation_start=fetch_start)
             series.name = col_name
-            series.index = pd.to_datetime(
-                [str(d)[:10] for d in series.index]
-            )
+            series.index = pd.to_datetime([str(d)[:10] for d in series.index])
             series.index.name = "Date"
             fred_frames.append(series)
             print(f"  ✅ {col_name} ({series_id}) — {len(series)} observations")
@@ -125,8 +179,6 @@ def main():
         return
 
     fred_df = pd.concat(fred_frames, axis=1, sort=True).round(4)
-
-    # Forward fill FRED monthly/quarterly onto daily trading dates
     fred_df = fred_df.ffill()
     fred_daily = fred_df.reindex(daily.index, method="ffill")
 
@@ -137,15 +189,16 @@ def main():
         combined["Date"].astype(str).str[:10]
     ).dt.date
 
-    # Drop rows where ALL yfinance columns are null (non-trading days)
     market_cols = [c for c in list(MACRO_YFINANCE.keys()) if c in combined.columns]
     combined.dropna(how="all", subset=market_cols, inplace=True)
     combined = combined.round(4)
 
     print(f"\n✅ Combined macro data: {len(combined)} rows")
 
-    # ── Step 4: Save ──────────────────────────────────────────────────
-    save_to_db(combined, TABLES["macro"], engine)
+    # ── Step 4: UPSERT (C6 fix — not INSERT IGNORE) ───────────────────
+    print("\n💾 Upserting into macro_indicators...")
+    upsert_macro_rows(combined)
+
     print("\n📋 Next: python data/fii_dii.py")
 
 

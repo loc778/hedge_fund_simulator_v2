@@ -6,6 +6,7 @@
 
 import os
 import pandas as pd
+from datetime import date
 
 # ── Project Paths ─────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -14,33 +15,189 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Re-download every quarter when SEBI rebalances and replace this file
 NIFTY500_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_tickers.csv")
 
+# Path to Nifty 500 sector classification CSV
+# Columns: Company Name, Industry, Symbol, Series, ISIN Code
+NIFTY500_SECTORS_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_sectors.csv")
+
+# Path to RBI repo rate history CSV
+# Columns: effective_date, repo_rate
+# Update this file manually after each MPC meeting
+RBI_REPO_CSV = os.path.join(PROJECT_ROOT, "files", "rbi", "repo_history.csv")
+
+
 # ── Load Tickers from CSV ─────────────────────────────────────────────
-# Reads the NSE watchlist CSV and appends .NS suffix for yfinance
-# Column name in NSE CSV is 'SYMBOL \n' (with newline — NSE quirk)
 def load_tickers(csv_path: str) -> list:
     """
     Load Nifty 500 tickers from NSE watchlist CSV.
     Strips whitespace, removes the index row, appends .NS suffix.
-    Re-run any time the CSV is replaced with a new quarterly list.
     """
     df = pd.read_csv(csv_path)
-    # Column has trailing newline in name — strip it
     symbol_col = [c for c in df.columns if 'SYMBOL' in c][0]
     symbols = df[symbol_col].str.strip().tolist()
-    # Remove the index name row (first row is 'NIFTY 500')
     symbols = [s for s in symbols if s and s != 'NIFTY 500']
-    # Append .NS for yfinance / NSE identification
     return [f"{s}.NS" for s in symbols]
 
-TICKERS = load_tickers(NIFTY500_CSV)
+
+try:
+    TICKERS = load_tickers(NIFTY500_CSV)
+except FileNotFoundError:
+    TICKERS = []
+    print(f"WARNING: {NIFTY500_CSV} not found. TICKERS is empty.")
+
+
+# ── Load Sector Map from CSV ──────────────────────────────────────────
+# Replaces the hardcoded SECTOR_MAP_FALLBACK dict.
+# Source: files/nifty500_sectors.csv (NSE official sector classification)
+# Covers all 500 tickers — no "Others" fallback needed for known universe.
+def load_sector_map(csv_path: str) -> dict:
+    """
+    Loads ticker → sector mapping from nifty500_sectors.csv.
+    Returns dict: { 'RELIANCE.NS': 'Energy', 'HDFCBANK.NS': 'Financial Services', ... }
+    Falls back to 'Others' for any ticker not found in the file.
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        sector_map = {}
+        for _, row in df.iterrows():
+            symbol = str(row.get("Symbol", "")).strip()
+            industry = str(row.get("Industry", "Others")).strip()
+            if symbol:
+                sector_map[f"{symbol}.NS"] = industry
+        return sector_map
+    except FileNotFoundError:
+        print(f"WARNING: {csv_path} not found. SECTOR_MAP is empty.")
+        return {}
+
+
+try:
+    SECTOR_MAP = load_sector_map(NIFTY500_SECTORS_CSV)
+except Exception:
+    SECTOR_MAP = {}
+
+
+def get_sector(ticker: str) -> str:
+    """Returns sector for a ticker. Defaults to 'Others' if not found."""
+    return SECTOR_MAP.get(ticker, "Others")
+
+
+# ── NSE Holidays ──────────────────────────────────────────────────────
+# NSE is closed on these dates. Updated annually.
+# bhavcopy_ingestion.py and any script that iterates trading days uses this.
+# Source: NSE official holiday calendar (https://www.nseindia.com)
+NSE_HOLIDAYS = {
+    # 2026
+    date(2026, 1, 26), date(2026, 3, 25), date(2026, 4, 2),  date(2026, 4, 10),
+    date(2026, 4, 14), date(2026, 5, 1),  date(2026, 6, 19), date(2026, 8, 15),
+    date(2026, 10, 2), date(2026, 10, 20),date(2026, 11, 4), date(2026, 12, 25),
+    # 2025
+    date(2025, 1, 26), date(2025, 2, 26), date(2025, 3, 14), date(2025, 3, 31),
+    date(2025, 4, 10), date(2025, 4, 14), date(2025, 4, 18), date(2025, 5, 1),
+    date(2025, 8, 15), date(2025, 8, 27), date(2025, 10, 2), date(2025, 10, 21),
+    date(2025, 10, 24),date(2025, 11, 5), date(2025, 12, 25),
+    # 2024
+    date(2024, 1, 22), date(2024, 1, 26), date(2024, 3, 25), date(2024, 4, 9),
+    date(2024, 4, 11), date(2024, 4, 14), date(2024, 4, 17), date(2024, 5, 1),
+    date(2024, 5, 23), date(2024, 6, 17), date(2024, 7, 17), date(2024, 8, 15),
+    date(2024, 10, 2), date(2024, 11, 1), date(2024, 11, 15),date(2024, 12, 25),
+    # 2023
+    date(2023, 1, 26), date(2023, 3, 7),  date(2023, 3, 30), date(2023, 4, 4),
+    date(2023, 4, 7),  date(2023, 4, 14), date(2023, 5, 1),  date(2023, 6, 29),
+    date(2023, 8, 15), date(2023, 9, 19), date(2023, 10, 2), date(2023, 10, 24),
+    date(2023, 11, 14),date(2023, 11, 27),date(2023, 12, 25),
+    # 2022
+    date(2022, 1, 26), date(2022, 3, 1),  date(2022, 3, 18), date(2022, 4, 14),
+    date(2022, 4, 15), date(2022, 5, 3),  date(2022, 8, 9),  date(2022, 8, 15),
+    date(2022, 10, 2), date(2022, 10, 5), date(2022, 10, 24),date(2022, 10, 26),
+    date(2022, 11, 8), date(2022, 12, 26),
+    # 2021
+    date(2021, 1, 26), date(2021, 3, 11), date(2021, 3, 29), date(2021, 4, 2),
+    date(2021, 4, 14), date(2021, 4, 21), date(2021, 5, 13), date(2021, 7, 21),
+    date(2021, 8, 19), date(2021, 9, 10), date(2021, 10, 15),date(2021, 11, 4),
+    date(2021, 11, 5), date(2021, 11, 19),date(2021, 12, 25),
+    # 2020
+    date(2020, 2, 21), date(2020, 3, 10), date(2020, 4, 2),  date(2020, 4, 6),
+    date(2020, 4, 10), date(2020, 4, 14), date(2020, 5, 1),  date(2020, 5, 25),
+    date(2020, 8, 3),  date(2020, 8, 11), date(2020, 8, 31), date(2020, 9, 2),
+    date(2020, 10, 2), date(2020, 11, 16),date(2020, 11, 30),date(2020, 12, 25),
+    # 2019
+    date(2019, 3, 4),  date(2019, 3, 21), date(2019, 4, 17), date(2019, 4, 19),
+    date(2019, 4, 29), date(2019, 5, 18), date(2019, 6, 5),  date(2019, 8, 12),
+    date(2019, 8, 15), date(2019, 9, 2),  date(2019, 10, 2), date(2019, 10, 8),
+    date(2019, 10, 28),date(2019, 11, 12),date(2019, 12, 25),
+    # 2018
+    date(2018, 1, 26), date(2018, 2, 13), date(2018, 3, 2),  date(2018, 3, 29),
+    date(2018, 3, 30), date(2018, 5, 1),  date(2018, 8, 15), date(2018, 8, 22),
+    date(2018, 9, 13), date(2018, 9, 20), date(2018, 10, 2), date(2018, 11, 7),
+    date(2018, 11, 8), date(2018, 11, 23),date(2018, 12, 25),
+    # 2017
+    date(2017, 1, 26), date(2017, 2, 24), date(2017, 3, 13), date(2017, 4, 4),
+    date(2017, 4, 14), date(2017, 5, 1),  date(2017, 6, 26), date(2017, 8, 15),
+    date(2017, 8, 25), date(2017, 10, 2), date(2017, 10, 19),date(2017, 10, 20),
+    date(2017, 12, 25),
+    # 2016
+    date(2016, 1, 26), date(2016, 3, 7),  date(2016, 3, 24), date(2016, 3, 25),
+    date(2016, 4, 14), date(2016, 4, 19), date(2016, 7, 6),  date(2016, 8, 15),
+    date(2016, 9, 5),  date(2016, 10, 11),date(2016, 10, 12),date(2016, 11, 14),
+    date(2016, 12, 26),
+    # 2015
+    date(2015, 1, 26), date(2015, 2, 17), date(2015, 3, 6),  date(2015, 4, 2),
+    date(2015, 4, 3),  date(2015, 4, 14), date(2015, 5, 1),  date(2015, 7, 17),
+    date(2015, 8, 28), date(2015, 9, 17), date(2015, 10, 2), date(2015, 10, 22),
+    date(2015, 11, 12),date(2015, 12, 25),
+    # 2014
+    date(2014, 1, 14), date(2014, 1, 26), date(2014, 2, 27), date(2014, 3, 17),
+    date(2014, 4, 8),  date(2014, 4, 14), date(2014, 4, 15), date(2014, 4, 18),
+    date(2014, 5, 1),  date(2014, 7, 29), date(2014, 8, 11), date(2014, 8, 15),
+    date(2014, 10, 2), date(2014, 10, 3), date(2014, 10, 23),date(2014, 10, 24),
+    date(2014, 11, 4), date(2014, 12, 25),
+    # 2013
+    date(2013, 1, 26), date(2013, 3, 27), date(2013, 3, 29), date(2013, 4, 11),
+    date(2013, 4, 19), date(2013, 4, 24), date(2013, 5, 9),  date(2013, 6, 17),
+    date(2013, 8, 9),  date(2013, 8, 15), date(2013, 9, 9),  date(2013, 10, 2),
+    date(2013, 10, 14),date(2013, 10, 15),date(2013, 11, 5), date(2013, 12, 25),
+    # 2012
+    date(2012, 1, 26), date(2012, 2, 20), date(2012, 3, 8),  date(2012, 3, 23),
+    date(2012, 4, 5),  date(2012, 4, 6),  date(2012, 4, 14), date(2012, 5, 1),
+    date(2012, 8, 15), date(2012, 9, 19), date(2012, 10, 2), date(2012, 11, 2),
+    date(2012, 11, 14),date(2012, 11, 28),date(2012, 12, 25),
+    # 2011
+    date(2011, 1, 26), date(2011, 3, 2),  date(2011, 4, 4),  date(2011, 4, 12),
+    date(2011, 4, 14), date(2011, 4, 22), date(2011, 5, 13), date(2011, 8, 15),
+    date(2011, 8, 31), date(2011, 9, 1),  date(2011, 10, 6), date(2011, 10, 26),
+    date(2011, 10, 27),date(2011, 11, 10),date(2011, 12, 26),
+    # 2010
+    date(2010, 1, 26), date(2010, 3, 1),  date(2010, 3, 16), date(2010, 4, 1),
+    date(2010, 4, 2),  date(2010, 4, 14), date(2010, 5, 13), date(2010, 9, 10),
+    date(2010, 9, 30), date(2010, 11, 5), date(2010, 11, 17),date(2010, 11, 22),
+    date(2010, 12, 17),
+}
+
+
+# ── Banking / NBFC Tickers ────────────────────────────────────────────
+# Used by screener_fundamentals.py to apply bank-specific P&L row names.
+# Only pure deposit-taking banks and pure lending NBFCs.
+# Insurance, fintech, holding companies use standard Sales+ layout.
+BANKING_TICKERS = {
+    # Scheduled commercial banks
+    "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",       "KOTAKBANK.NS",
+    "AXISBANK.NS", "BANDHANBNK.NS","FEDERALBNK.NS", "IDFCFIRSTB.NS",
+    "PNB.NS",      "BANKBARODA.NS","CANBK.NS",       "UNIONBANK.NS",
+    "YESBANK.NS",  "INDUSINDBK.NS","RBLBANK.NS",     "DCBBANK.NS",
+    "KTKBANK.NS",  "KARURVYSYA.NS","CUB.NS",         "AUBANK.NS",
+    "EQUITASBNK.NS","UJJIVANSFB.NS","ESAFSFB.NS",
+    # Pure lending NBFCs
+    "BAJFINANCE.NS","MUTHOOTFIN.NS","CHOLAFIN.NS",   "M&MFIN.NS",
+    "MANAPPURAM.NS","RECLTD.NS",    "PFC.NS",         "IRFC.NS",
+    "SHRIRAMFIN.NS","LICHSGFIN.NS", "ABCAPITAL.NS",  "AAVAS.NS",
+    "HOMEFIRST.NS", "CANFINHOME.NS","APTUS.NS",       "CREDITACC.NS",
+}
+
 
 # ── Data Range ────────────────────────────────────────────────────────
-# Bhavcopy ingestion uses explicit start/end dates (not yfinance period string)
 DATA_START = "2010-01-01"
-DATA_END   = None   # None = today (always fetch up to latest available date)
+DATA_END   = None   # None = today
 
 # ── Batch Settings ────────────────────────────────────────────────────
-# Used for yfinance calls (adjustment factors, fallback fetches)
 BATCH_SIZE  = 10
 BATCH_DELAY = 2
 STOCK_DELAY = 1
@@ -63,142 +220,70 @@ TABLES = {
 }
 
 # ── Model Version ─────────────────────────────────────────────────────
-# Update this after every retraining session
-# Format: YYYYMMDD matching the date suffix on saved model files
 MODEL_VERSION = "20260409"
-
-# ── Model Directory ───────────────────────────────────────────────────
-MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
+MODEL_DIR     = os.path.join(PROJECT_ROOT, "models")
 
 # ── Bhavcopy Config ───────────────────────────────────────────────────
-# NSE archive URL pattern — {year} {month} {date} filled in by ingestion script
-BHAVCOPY_URL = (
-    "https://nsearchives.nseindia.com/content/historical/EQUITIES"
-    "/{year}/{month}/cm{date}bhav.csv.zip"
-)
-
-# Local folder to store downloaded bhavcopy ZIPs temporarily
-# ZIPs are deleted immediately after parsing to save disk space
 BHAVCOPY_TEMP_DIR = os.path.join(PROJECT_ROOT, "data", "bhavcopy_temp")
+DATA_SOURCE       = "bhavcopy"
 
-# ── Data Source Flag ──────────────────────────────────────────────────
-DATA_SOURCE = "bhavcopy"   # options: "bhavcopy", "yfinance"
-
-# ── Sector Map ────────────────────────────────────────────────────────
-# Auto-fetched from yfinance during ingestion — stored in sector_map.pkl
-# This manual map is the fallback for any ticker yfinance can't classify
-# Expand this as you add more tickers
-SECTOR_MAP_FALLBACK = {
-    "IT":            ["TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS",
-                      "LTIM.NS", "MPHASIS.NS", "COFORGE.NS", "PERSISTENT.NS"],
-    "Banking":       ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS",
-                      "AXISBANK.NS", "BANDHANBNK.NS", "FEDERALBNK.NS",
-                      "IDFCFIRSTB.NS", "PNB.NS", "BANKBARODA.NS",
-                      "CANBK.NS", "UNIONBANK.NS"],
-    "Finance":       ["BAJFINANCE.NS", "BAJAJFINSV.NS", "HDFCLIFE.NS",
-                      "SBILIFE.NS", "ICICIPRULI.NS", "MUTHOOTFIN.NS",
-                      "CHOLAFIN.NS", "M&MFIN.NS", "MANAPPURAM.NS",
-                      "RECLTD.NS", "PFC.NS", "IRFC.NS", "PAYTM.NS",
-                      "POLICYBZR.NS"],
-    "Auto":          ["MARUTI.NS", "BAJAJ-AUTO.NS", "EICHERMOT.NS",
-                      "HEROMOTOCO.NS", "M&M.NS", "TATAMOTORS.NS"],
-    "Pharma":        ["SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS",
-                      "DIVISLAB.NS", "AUROPHARMA.NS", "GLAND.NS"],
-    "Energy":        ["RELIANCE.NS", "ONGC.NS", "IOC.NS", "BPCL.NS",
-                      "GAIL.NS", "COALINDIA.NS", "POWERGRID.NS", "NTPC.NS"],
-    "Metals":        ["TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS",
-                      "VEDL.NS", "NMDC.NS", "SAIL.NS", "JINDALSTEL.NS"],
-    "FMCG":          ["HINDUNILVR.NS", "ITC.NS", "BRITANNIA.NS", "DABUR.NS",
-                      "GODREJCP.NS", "MARICO.NS", "NESTLEIND.NS"],
-    "Infra":         ["LT.NS", "ADANIPORTS.NS", "ADANIENT.NS", "HAL.NS",
-                      "SIEMENS.NS", "INDUSTOWER.NS"],
-    "RealEstate":    ["DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS",
-                      "PRESTIGE.NS", "PHOENIXLTD.NS"],
-    "Consumer":      ["ASIANPAINT.NS", "TITAN.NS", "PIDILITIND.NS",
-                      "BERGEPAINT.NS", "HAVELLS.NS", "VOLTAS.NS",
-                      "DMART.NS", "TRENT.NS", "INDHOTEL.NS", "IRCTC.NS"],
-    "Cement":        ["ULTRACEMCO.NS", "SHREECEM.NS", "AMBUJACEM.NS",
-                      "ACC.NS", "RAMCOCEM.NS", "GRASIM.NS"],
-    "Telecom":       ["BHARTIARTL.NS", "TATACOMM.NS"],
-    "Chemicals":     [],   # populated as tickers are identified
-    "Logistics":     [],
-    "Defence":       [],
-    "Media":         [],
-    "Others":        [],   # catch-all for unclassified tickers
+# ── Data Quality Tier Thresholds ──────────────────────────────────────
+# Max observed coverage_ratio across 500 bhavcopy-ingested stocks = 0.9454.
+# Tier A threshold set to 0.93 (not 0.95) to account for NSE holiday gaps.
+DATA_QUALITY = {
+    "tier_a": {"min_years": 8,  "min_coverage": 0.93, "min_adv_cr": 5},
+    "tier_b": {"min_years": 4,  "min_coverage": 0.75, "min_adv_cr": 1},
+    "tier_x_min_days": 252,
 }
+
+# ── Tier X Exclusion List ─────────────────────────────────────────────
+# Recent IPOs with < 252 trading days as of Apr 2026.
+# data_quality.py maintains this going forward.
+TIER_X_EXCLUDED = [
+    "LTM.NS",        "ICICIAMC.NS",  "CANHLIFE.NS",  "JAINREC.NS",
+    "LGEINDIA.NS",   "TATACAP.NS",   "JSWCEMENT.NS", "MEESHO.NS",
+    "PIRAMALFIN.NS", "SWANCORP.NS",  "CEMPRO.NS",    "URBANCO.NS",
+    "PINELABS.NS",   "CPPLUS.NS",    "TMCV.NS",      "ANTHEM.NS",
+    "ENRIN.NS",      "TENNIND.NS",   "EMMVEE.NS",    "PWL.NS",
+    "TRAVELFOOD.NS", "TMPV.NS",      "ABLBL.NS",     "GROWW.NS",
+    "HDBFS.NS",      "LENSKART.NS",  "ETERNAL.NS",   "ACUTAAS.NS",
+    "AEGISVOPAK.NS", "THELEELA.NS",  "BELRISE.NS",   "COHANCE.NS",
+    "ATHERENERG.NS",
+]
 
 # ── Portfolio Constraints ─────────────────────────────────────────────
-# All constraints from Constraints doc — single source of truth
-#
-# IMPORTANT — CAP vs TARGET distinction:
-#   "max_*"  = hard ceiling — the portfolio engine NEVER exceeds this
-#   "target_*" = ideal operating range — the engine AIM for this
-#   There are NO forced minimums on long/short exposure.
-#   The model is free to hold less short (or zero short) if signals
-#   don't justify it. Forcing minimum exposure would mean taking bad
-#   trades just to meet an arbitrary floor — that defeats the purpose.
 PORTFOLIO = {
-    # Stock count limits
-    "min_stocks"              : 30,     # minimum positions (regime-dependent floor)
-    "max_stocks"              : 55,     # maximum positions
-    "max_stocks_hard_limit"   : 60,     # absolute hard cap (only in extreme cases +5)
-
-    # Individual position limits (% of NAV)
-    "max_position_pct"        : 0.05,   # HARD CAP: 5% max per stock at cost
-    "min_position_pct"        : 0.001,  # 0.1% minimum — below this, skip the position
-
-    # Sector limits
-    # max_sector_long_pct  = HARD CAP on gross long per sector (not a target)
-    #   e.g. if IT is at 25%, no new IT longs are opened until existing ones reduce
-    # max_sector_short_pct = HARD CAP on gross short per sector (not a target)
-    #   the model is NOT forced to short any sector at all
-    "max_sector_long_pct"     : 0.25,   # HARD CAP: 25% max gross long per sector
-    "max_sector_short_pct"    : 0.15,   # HARD CAP: 15% max gross short per sector
-
-    # Long/short book structure — CAPS ONLY, no forced minimums
-    # The model targets 110-120% long and 10-20% short when signals exist.
-    # If there are no valid short signals, short book can be zero.
-    # These are caps to prevent over-leverage, not floors to force exposure.
-    "max_long_exposure"       : 1.20,   # HARD CAP: never exceed 120% long
-    "target_long_exposure"    : 1.15,   # TARGET: aim for ~115% long when signals exist
-    "max_short_exposure"      : 0.20,   # HARD CAP: never exceed 20% short
-    "target_short_exposure"   : 0.15,   # TARGET: aim for ~15% short when signals exist
-    # Note: short book can be 0% if no valid short signals exist
-
-    # Long book composition (targets, not hard rules)
-    "nifty100_anchor_pct"     : 0.65,   # TARGET: 60-65% of long book in Nifty 100
-    "alpha_midcap_pct"        : 0.35,   # TARGET: 35-40% in Nifty 100-500
-    "max_midcap_exposure"     : 0.35,   # HARD CAP: 35% max mid-cap total
-
-    # Cash buffer — both min and max are hard rules
-    # Min cash protects against forced selling during RBI surprises / FII sell-offs
-    "min_cash_pct"            : 0.08,   # HARD FLOOR: always keep 8% cash minimum
-    "max_cash_pct"            : 0.12,   # SOFT CEILING: above 12% = deploy or explain why
-
-    # Drawdown limits
-    "monthly_drawdown_trigger": 0.05,   # -5% in 21 days → mandatory risk review
-    "peak_trough_hard_stop"   : 0.10,   # -10% from peak → reduce book 30% within 5 days
-
-    # Stop losses
-    "long_stop_loss"          : 0.15,   # -15% from entry → exit long immediately
-    "short_stop_loss"         : 0.10,   # +10% against short → cover immediately
-
-    # Transaction cost model (basis points = 0.01%)
-    # These are deducted in backtesting and shown separately in the dashboard UI
-    "brokerage_bps"           : 3,      # ~3bps per leg (Zerodha/discount broker)
-    "stamp_duty_bps"          : 1.5,    # 0.015% on buy side only
-    "stt_bps"                 : 10,     # 0.1% STT on sell side (equity delivery)
-    "slippage_bps"            : 5,      # estimated market impact / slippage
-    # Total round-trip cost = (3+1.5+5) buy + (3+10+5) sell = ~27.5 bps ≈ 0.275%
+    "min_stocks"              : 30,
+    "max_stocks"              : 55,
+    "max_stocks_hard_limit"   : 60,
+    "max_position_pct"        : 0.05,
+    "min_position_pct"        : 0.001,
+    "max_sector_long_pct"     : 0.25,
+    "max_sector_short_pct"    : 0.15,
+    "max_long_exposure"       : 1.20,
+    "target_long_exposure"    : 1.15,
+    "max_short_exposure"      : 0.20,
+    "target_short_exposure"   : 0.15,
+    "nifty100_anchor_pct"     : 0.65,
+    "alpha_midcap_pct"        : 0.35,
+    "max_midcap_exposure"     : 0.35,
+    "min_cash_pct"            : 0.08,
+    "max_cash_pct"            : 0.12,
+    "monthly_drawdown_trigger": 0.05,
+    "peak_trough_hard_stop"   : 0.10,
+    "long_stop_loss"          : 0.15,
+    "short_stop_loss"         : 0.10,
+    "brokerage_bps"           : 3,
+    "stamp_duty_bps"          : 1.5,
+    "stt_bps"                 : 10,
+    "slippage_bps"            : 5,
 }
 
-# Regime-aware deployable capital multipliers
-# In bear/elevated regimes, keep more cash
 DEPLOY_PCT = {
-    "Bull"     : 0.92,   # deploy 92% — keep 8% cash minimum
+    "Bull"     : 0.92,
     "Sideways" : 0.90,
-    "Bear"     : 0.80,   # deploy 80% — keep 20% cash in bear
-    "Elevated" : 0.75,   # highest cash buffer in crisis regime
+    "Bear"     : 0.80,
+    "Elevated" : 0.75,
 }
 
 # ── Macro Data Config ─────────────────────────────────────────────────
@@ -210,44 +295,21 @@ MACRO_YFINANCE = {
 }
 
 MACRO_FRED = {
-    # GDP_India: India Real GDP from IMF via FRED
-    # NOTE: This is quarterly data. Forward-filled to daily in features.py.
-    # The prototype used 999999.9999 as placeholder — that bug is fixed here
-    # by using the correct FRED series ID and validating on load.
-    "GDP_India"      : "NGDPRNSAXDCINQ",   # India Real GDP (IMF, quarterly, USD)
-    "CPI_India"      : "INDCPIALLMINMEI",   # India CPI (monthly)
-    "Fed_Funds_Rate" : "FEDFUNDS",          # US Fed Funds Rate (monthly)
-    "US_CPI"         : "CPIAUCSL",          # US CPI (monthly)
-    "US_10Y_Bond"    : "DGS10",             # US 10-Year Treasury (daily)
+    "GDP_India"      : "NGDPRNSAXDCINQ",
+    "CPI_India"      : "INDCPIALLMINMEI",
+    "Fed_Funds_Rate" : "FEDFUNDS",
+    "US_CPI"         : "CPIAUCSL",
+    "US_10Y_Bond"    : "DGS10",
 }
 
-# FII/DII Daily Flows
-# Source: NSE publishes FII/DII daily activity data free on their website
-# Script: data/fii_dii.py (separate dedicated script)
-# Table: stored in macro_indicators alongside other daily macro data
-# NSE endpoint: https://www.nseindia.com/api/fiidiiTradeReact
-# Columns added to macro_indicators: FII_Net_Buy_Cr, DII_Net_Buy_Cr
-# These are critical Indian market signals — FII sell-off > Rs 5000 Cr
-# in a session triggers the risk manager's defensive protocol
-
-# RBI DBIE series — repo rate, IIP, forex reserves
-# Script: data/rbi_macro.py (separate dedicated script)
-# RBI does not have a clean public API — data is downloaded as CSV
-# from RBI DBIE portal and parsed
 MACRO_RBI = {
-    "Repo_Rate"         : "rbi_repo_rate",      # fetched by rbi_macro.py
-    "IIP_Growth"        : "rbi_iip",            # Index of Industrial Production
-    "Forex_Reserves"    : "rbi_forex_reserves", # USD billions
+    "Repo_Rate"      : "rbi_repo_rate",
+    "IIP_Growth"     : "rbi_iip",
+    "Forex_Reserves" : "rbi_forex_reserves",
 }
 
-# ── Fundamentals Data Source ──────────────────────────────────────────
-# Source: Screener.in (primary) — 10+ years of clean quarterly data
-# Script: data/screener_fundamentals.py
-# yfinance is NOT used for fundamentals at scale — it is unreliable
-# for Indian stocks (missing quarters, wrong currency, inconsistent columns)
-# Screener.in provides structured quarterly P&L, balance sheet, cash flow
-# for all NSE-listed stocks going back 10+ years for free
-FUNDAMENTALS_SOURCE = "screener"   # options: "screener", "yfinance" (testing only)
+# ── Fundamentals Source ───────────────────────────────────────────────
+FUNDAMENTALS_SOURCE = "screener"
 
 # ── Sentiment Config ──────────────────────────────────────────────────
 SENTIMENT = {
@@ -266,48 +328,8 @@ ET_RSS_FEEDS = {
 }
 
 # ── Liquidity Filter ──────────────────────────────────────────────────
-# Stocks below this average daily value are excluded from portfolio
-# Units: INR Crores
 LIQUIDITY_FILTER = {
-    "long_book_min_adv_cr"  : 5.0,    # min 5 Cr ADV for long positions
-    "short_book_min_adv_cr" : 10.0,   # min 10 Cr ADV for short (need to exit fast)
-    "lookback_days"         : 90,     # 90-day average
+    "long_book_min_adv_cr"  : 5.0,
+    "short_book_min_adv_cr" : 10.0,
+    "lookback_days"         : 90,
 }
-
-
-# ── Data Quality Tier Thresholds ──────────────────────────────────────
-# Used by data/data_quality.py to classify stocks
-#
-# CALIBRATION NOTE (Apr 2026):
-# Max observed coverage_ratio across all 500 bhavcopy-ingested stocks is 0.9454.
-# The ceiling is caused by NSE holidays not present in the NSE_HOLIDAYS list in
-# bhavcopy_ingestion.py — those days show as "missing" but are valid market closures.
-# Data quality is sound. Tier A threshold lowered from 0.95 → 0.93 accordingly.
-#
-# Verified tier distribution from bhavcopy ingestion (Apr 2026):
-#   Tier A: 275 stocks  (8+ years, coverage >= 0.93) — full model suite
-#   Tier B: 107 stocks  (4+ years, coverage >= 0.75) — reduced model suite
-#   Tier C:  85 stocks  (below thresholds)           — signal inheritance
-#   Tier X:  33 stocks  (< 252 days)                 — excluded entirely
-DATA_QUALITY = {
-    "tier_a": {"min_years": 8,  "min_coverage": 0.93, "min_adv_cr": 5},
-    "tier_b": {"min_years": 4,  "min_coverage": 0.75, "min_adv_cr": 1},
-    # Tier C = everything else (still included, signal inherited from sector)
-    # Tier X = fewer than 252 trading days — excluded from all training and allocation
-    "tier_x_min_days": 252,
-}
-
-# ── Tier X Exclusion List ─────────────────────────────────────────────
-# Recent IPOs with < 252 trading days as of Apr 2026 bhavcopy ingestion.
-# These tickers are excluded from: indicators.py, features.py, model training,
-# and portfolio allocation. data_quality.py will maintain this list going forward.
-# Re-run data_quality.py quarterly — stocks graduate out of Tier X as data accumulates.
-TIER_X_EXCLUDED = [
-    "LTM.NS", "ICICIAMC.NS", "CANHLIFE.NS", "JAINREC.NS", "LGEINDIA.NS",
-    "TATACAP.NS", "JSWCEMENT.NS", "MEESHO.NS", "PIRAMALFIN.NS", "SWANCORP.NS",
-    "CEMPRO.NS", "URBANCO.NS", "PINELABS.NS", "CPPLUS.NS", "TMCV.NS",
-    "ANTHEM.NS", "ENRIN.NS", "TENNIND.NS", "EMMVEE.NS", "PWL.NS",
-    "TRAVELFOOD.NS", "TMPV.NS", "ABLBL.NS", "GROWW.NS", "HDBFS.NS",
-    "LENSKART.NS", "ETERNAL.NS", "ACUTAAS.NS", "AEGISVOPAK.NS", "THELEELA.NS",
-    "BELRISE.NS", "COHANCE.NS", "ATHERENERG.NS",
-]
