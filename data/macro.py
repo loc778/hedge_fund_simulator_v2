@@ -55,15 +55,16 @@ def download_yfinance(symbol: str, start: str, retries: int = 3) -> pd.Series | 
         try:
             df = yf.download(
                 symbol, start=start, interval="1d",
-                progress=False, timeout=20,
-                auto_adjust=False
+                progress=False, timeout=20
+                # auto_adjust removed — causes YFTzMissingError on index/FX/commodity
+                # symbols (^INDIAVIX, INR=X, CL=F, GC=F) in newer yfinance versions
             )
             if df is None or df.empty:
                 return None
             # Flatten MultiIndex columns (newer yfinance versions)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            # Some symbols return 'Adj Close' instead of 'Close'
+            # Newer yfinance auto-adjusts by default — Close is already adjusted
             if "Close" in df.columns:
                 series = df["Close"]
             elif "Adj Close" in df.columns:
@@ -130,12 +131,19 @@ def upsert_macro_rows(df: pd.DataFrame):
 
 
 def main():
+    import sys as _sys
     print("=" * 60)
     print("MACRO DATA INGESTION — hedge_v2")
     print("=" * 60)
 
-    fetch_start = get_latest_date_in_db()
-    print(f"\nFetching from: {fetch_start} → today\n")
+    # Optional CLI override: python data/macro.py 2010-01-01
+    # Use for full historical backfill when yfinance columns are NULL
+    if len(_sys.argv) > 1:
+        fetch_start = _sys.argv[1]
+        print(f"\n⚠️  CLI override: full backfill from {fetch_start} → today\n")
+    else:
+        fetch_start = get_latest_date_in_db()
+        print(f"\nFetching from: {fetch_start} → today\n")
 
     # ── Step 1: yfinance daily data ───────────────────────────────────
     print("📥 Fetching daily market data from yfinance...")
