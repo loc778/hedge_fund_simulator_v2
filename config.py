@@ -24,6 +24,9 @@ NIFTY500_SECTORS_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_sectors.csv
 # Update this file manually after each MPC meeting
 RBI_REPO_CSV = os.path.join(PROJECT_ROOT, "files", "rbi", "repo_history.csv")
 
+#path to the FO_LIST CSV file
+FO_LIST_CSV = os.path.join(PROJECT_ROOT, "files", "fo_list.csv")
+
 
 # ── Load Tickers from CSV ─────────────────────────────────────────────
 def load_tickers(csv_path: str) -> list:
