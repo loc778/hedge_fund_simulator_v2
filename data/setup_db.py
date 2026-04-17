@@ -110,13 +110,12 @@ TABLES = {
     """,
 
     # ── Layer 3A: Macro & Economic Indicators ─────────────────────────
-    # C5 FIX: FII column split into two:
-    #   FII_Monthly_Net_Cr = monthly total ÷ trading days (historical, 2010–present)
-    #                        Written by fii_dii_historical.py
-    #                        Unit: Cr per trading day (approximation)
-    #   FII_Daily_Net_Cr   = actual daily NSE-reported value (last ~30 days)
-    #                        Written by fii_dii.py
-    #                        Unit: Cr per day (exact)
+    # FII/DII columns — all written by fii_dii_stockedge.py:
+    #   FII_Monthly_Net_Cr = monthly net flow stamped on every trading day (2010–present)
+    #   DII_Monthly_Net_Cr = monthly net flow stamped on every trading day (2010–present)
+    #   FII_Daily_Net_Cr   = actual daily value for last ~50 trading days
+    #   DII_Daily_Net_Cr   = actual daily value for last ~50 trading days
+    #   FII_Source_Flag    = 'monthly' or 'daily' — tells features.py data resolution
     # features.py uses FII_Daily_Net_Cr when not NULL, else FII_Monthly_Net_Cr.
     "macro_indicators": """
         CREATE TABLE IF NOT EXISTS macro_indicators (
@@ -134,9 +133,11 @@ TABLES = {
             Repo_Rate           DECIMAL(10,4),
             IIP_Growth          DECIMAL(10,4),
             Forex_Reserves_USD  DECIMAL(20,4),
-            FII_Monthly_Net_Cr  DECIMAL(15,4),
-            FII_Daily_Net_Cr    DECIMAL(15,4),
-            DII_Net_Buy_Cr      DECIMAL(15,4)
+            FII_Monthly_Net_Cr  DECIMAL(20,2),
+            DII_Monthly_Net_Cr  DECIMAL(20,2),
+            FII_Daily_Net_Cr    DECIMAL(20,2),
+            DII_Daily_Net_Cr    DECIMAL(20,2),
+            FII_Source_Flag     VARCHAR(10)
         )
     """,
 
@@ -311,10 +312,6 @@ def run_setup():
 
     print("🔧 Setting up hedge_v2_db tables...\n")
 
-    # For existing macro_indicators table: add new FII columns if missing
-    # (handles upgrade on machines that already ran the old setup)
-    _migrate_macro_columns(engine)
-
     with engine.connect() as conn:
         for table_name, ddl in TABLES.items():
             try:
@@ -352,71 +349,6 @@ Setup Complete
         print("✅ All tables ready. See README.md for the full run order.")
     else:
         print("⚠️  Fix the failed tables before running data scripts.")
-
-
-def _migrate_macro_columns(engine):
-    """
-    Adds FII_Monthly_Net_Cr and FII_Daily_Net_Cr columns to macro_indicators
-    if they don't exist yet (handles upgrade on machines with old schema).
-    Also removes old FII_Net_Buy_Cr if it still exists from old schema.
-    """
-    migrations = [
-        ("FII_Monthly_Net_Cr", "DECIMAL(15,4)",
-         "ADD COLUMN FII_Monthly_Net_Cr DECIMAL(15,4) AFTER Forex_Reserves_USD"),
-        ("FII_Daily_Net_Cr", "DECIMAL(15,4)",
-         "ADD COLUMN FII_Daily_Net_Cr DECIMAL(15,4) AFTER FII_Monthly_Net_Cr"),
-        ("DII_Net_Buy_Cr", "DECIMAL(15,4)",
-         "ADD COLUMN DII_Net_Buy_Cr DECIMAL(15,4) AFTER FII_Daily_Net_Cr"),
-    ]
-
-    with engine.connect() as conn:
-        # Check if macro_indicators exists at all
-        exists = conn.execute(text(
-            "SELECT COUNT(*) FROM information_schema.tables "
-            "WHERE table_schema = DATABASE() AND table_name = 'macro_indicators'"
-        )).scalar()
-
-        if not exists:
-            return   # will be created fresh by the main DDL loop
-
-        for col_name, _, alter_sql in migrations:
-            col_exists = conn.execute(text(
-                "SELECT COUNT(*) FROM information_schema.columns "
-                "WHERE table_schema = DATABASE() "
-                f"AND table_name = 'macro_indicators' "
-                f"AND column_name = '{col_name}'"
-            )).scalar()
-
-            if not col_exists:
-                try:
-                    conn.execute(text(f"ALTER TABLE macro_indicators {alter_sql}"))
-                    conn.commit()
-                    print(f"  🔄 Migration: added {col_name} to macro_indicators")
-                except Exception as e:
-                    print(f"  ⚠️  Migration for {col_name} failed: {e}")
-
-        # Migrate data from old FII_Net_Buy_Cr → FII_Monthly_Net_Cr if old column exists
-        old_col_exists = conn.execute(text(
-            "SELECT COUNT(*) FROM information_schema.columns "
-            "WHERE table_schema = DATABASE() "
-            "AND table_name = 'macro_indicators' "
-            "AND column_name = 'FII_Net_Buy_Cr'"
-        )).scalar()
-
-        if old_col_exists:
-            try:
-                conn.execute(text(
-                    "UPDATE macro_indicators "
-                    "SET FII_Monthly_Net_Cr = FII_Net_Buy_Cr "
-                    "WHERE FII_Monthly_Net_Cr IS NULL AND FII_Net_Buy_Cr IS NOT NULL"
-                ))
-                conn.execute(text(
-                    "ALTER TABLE macro_indicators DROP COLUMN FII_Net_Buy_Cr"
-                ))
-                conn.commit()
-                print("  🔄 Migration: FII_Net_Buy_Cr → FII_Monthly_Net_Cr, old column dropped")
-            except Exception as e:
-                print(f"  ⚠️  FII_Net_Buy_Cr migration failed: {e}")
 
 
 if __name__ == "__main__":
