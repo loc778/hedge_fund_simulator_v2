@@ -215,6 +215,7 @@ TABLES = {
     "fundamentals"             : "nifty500_fundamentals",
     "macro"                    : "macro_indicators",
     "sentiment"                : "nifty500_sentiment",
+    "sentiment_raw"           : "nifty500_sentiment_raw",
     "features"                 : "features_master",
     "data_quality"             : "stock_data_quality",
     "portfolio_positions"      : "portfolio_positions",
@@ -314,21 +315,83 @@ MACRO_RBI = {
 # ── Fundamentals Source ───────────────────────────────────────────────
 FUNDAMENTALS_SOURCE = "screener"
 
-# ── Sentiment Config ──────────────────────────────────────────────────
-SENTIMENT = {
-    "sources"                  : ["gdelt", "newsapi", "et_rss"],
-    "max_headlines_per_stock"  : 10,
-    "model"                    : "ProsusAI/finbert",
-    "hf_api"                   : True,
-    "lookback_days"            : 3,
-}
+ # ── Sentiment Config ──────────────────────────────────────────────────
+    # Data source strategy (see project_context_architecture.txt Layer 3B):
+    #   1. NSE Corporate Announcements (structured, 2022-present, rule-scored)
+    #      Full historical depth since SENTIMENT_START_DATE.
+    #   2. Moneycontrol RSS (unstructured, today-forward only)
+    #      RSS feeds are current snapshot; no historical backfill possible.
+    # FinBERT scoring runs in separate Colab notebook (reads Raw_Text,
+    # writes FinBERT_Score/FinBERT_Label back to nifty500_sentiment_raw).
 
-ET_RSS_FEEDS = {
-    "markets" : "https://economictimes.indiatimes.com/markets/rss.cms",
-    "stocks"  : "https://economictimes.indiatimes.com/markets/stocks/rss.cms",
-    "economy" : "https://economictimes.indiatimes.com/news/economy/rss.cms",
-    "results" : "https://economictimes.indiatimes.com/markets/earnings/rss.cms",
-}
+SENTIMENT_START_DATE = "2022-01-01"
+ 
+SENTIMENT = {
+        "sources"                 : ["nse_announcement", "moneycontrol"],
+        "model"                   : "ProsusAI/finbert",
+        "daily_lookback_days"     : 2,
+        "backfill_window_days"    : 50,
+        "fuzzy_match_threshold"   : 85,
+    }
+ 
+    # NSE corporate announcements API (public, no auth, rate-limited)
+NSE_ANNOUNCEMENT_URL = (
+        "https://www.nseindia.com/api/corporate-announcements"
+        "?index=equities&from_date={from_date}&to_date={to_date}"
+    )
+ 
+    # Moneycontrol RSS feeds — current snapshot only (~50-100 items per feed)
+MONEYCONTROL_RSS_FEEDS = {
+        "business"  : "https://www.moneycontrol.com/rss/business.xml",
+        "markets"   : "https://www.moneycontrol.com/rss/marketsnews.xml",
+        "economy"   : "https://www.moneycontrol.com/rss/economy.xml",
+        "results"   : "https://www.moneycontrol.com/rss/results.xml",
+        "latest"    : "https://www.moneycontrol.com/rss/latestnews.xml",
+    }
+ 
+    # Rule-based scoring for NSE announcements.
+    # Matches subject/description against keyword lists (case-insensitive).
+    # First matching category wins. Score range [-1.0, +1.0].
+NSE_ANNOUNCEMENT_RULES = {
+        "earnings_result": {
+            "keywords": ["financial result", "quarterly result", "audited result",
+                         "unaudited result", "board meeting outcome"],
+            "score": 0.2,
+        },
+        "buyback": {
+            "keywords": ["buy-back", "buyback", "buy back of equity"],
+            "score": 0.6,
+        },
+        "dividend": {
+            "keywords": ["dividend declared", "interim dividend", "final dividend",
+                         "dividend declaration"],
+            "score": 0.3,
+        },
+        "pledge": {
+            "keywords": ["pledge", "encumbrance", "invocation of pledge"],
+            "score": -1.0,
+        },
+        "credit_rating": {
+            "keywords": ["credit rating", "rating action", "rating revision",
+                         "rating upgrade", "rating downgrade"],
+            "score": 0.0,
+        },
+        "order_win": {
+            "keywords": ["order win", "new order", "contract awarded",
+                         "letter of intent", "loi received", "work order"],
+            "score": 0.5,
+        },
+        "management_change": {
+            "keywords": ["resignation", "appointment", "cessation",
+                         "managing director", "chief executive", "cfo"],
+            "score": 0.0,
+        },
+        "regulatory": {
+            "keywords": ["sebi", "penalty", "show cause", "adjudication",
+                         "enforcement", "violation"],
+            "score": -0.7,
+        },
+    }
 
 # ── Liquidity Filter ──────────────────────────────────────────────────
 LIQUIDITY_FILTER = {

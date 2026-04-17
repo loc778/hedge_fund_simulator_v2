@@ -141,20 +141,52 @@ TABLES = {
         )
     """,
 
-    # ── Layer 3B: Sentiment Data ──────────────────────────────────────
-    # NEVER TRUNCATE — historical news cannot be recovered
+   # ── Layer 3B: Sentiment Data — Daily Aggregate ────────────────────
+    # NEVER TRUNCATE — historical news cannot be recovered.
+    # Populated by sentiment.py --mode aggregate from nifty500_sentiment_raw.
+    # One row per (Ticker, Date).
     "nifty500_sentiment": """
         CREATE TABLE IF NOT EXISTS nifty500_sentiment (
+            id                    INT AUTO_INCREMENT PRIMARY KEY,
+            Date                  DATE            NOT NULL,
+            Ticker                VARCHAR(20)     NOT NULL,
+            Announcement_Score    DECIMAL(10,4),
+            News_Sentiment_Score  DECIMAL(10,4),
+            Sentiment_Score       DECIMAL(10,4),
+            Positive_Score        DECIMAL(10,4),
+            Negative_Score        DECIMAL(10,4),
+            Neutral_Score         DECIMAL(10,4),
+            Events_Count          INT DEFAULT 0,
+            Headlines_Count       INT DEFAULT 0,
+            Has_Announcement      TINYINT DEFAULT 0,
+            Has_News              TINYINT DEFAULT 0,
+            Last_Updated          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                          ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_ticker_date (Ticker, Date)
+        )
+    """,
+ 
+    # ── Layer 3B: Sentiment Raw Events ────────────────────────────────
+    # Per-event rows. One row per (Ticker, Date, Source, Headline).
+    # NSE announcements: rule-scored at ingest time (Rule_Score populated).
+    # Moneycontrol RSS: raw text stored, Rule_Score NULL.
+    # FinBERT_Score/FinBERT_Label: populated by separate Colab notebook.
+    # NEVER TRUNCATE.
+    "nifty500_sentiment_raw": """
+        CREATE TABLE IF NOT EXISTS nifty500_sentiment_raw (
             id              INT AUTO_INCREMENT PRIMARY KEY,
             Date            DATE            NOT NULL,
             Ticker          VARCHAR(20)     NOT NULL,
-            Sentiment_Score DECIMAL(10,4),
-            Positive_Score  DECIMAL(10,4),
-            Negative_Score  DECIMAL(10,4),
-            Neutral_Score   DECIMAL(10,4),
-            Headlines_Count INT,
-            Source          VARCHAR(50),
-            UNIQUE KEY unique_ticker_date (Ticker, Date)
+            Source          VARCHAR(30)     NOT NULL,
+            Event_Category  VARCHAR(50),
+            Headline        TEXT,
+            Raw_Text        TEXT,
+            Rule_Score      DECIMAL(5,2),
+            FinBERT_Score   DECIMAL(5,4),
+            FinBERT_Label   VARCHAR(20),
+            URL             VARCHAR(500),
+            Ingested_At     TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_event (Ticker, Date, Source, Headline(200))
         )
     """,
 
