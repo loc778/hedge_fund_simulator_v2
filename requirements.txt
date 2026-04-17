@@ -27,6 +27,7 @@ ta
 # ── Sentiment & NLP ───────────────────────────────────────
 vaderSentiment
 rapidfuzz
+brotli
 
 # ── Environment & Config ──────────────────────────────────
 python-dotenv

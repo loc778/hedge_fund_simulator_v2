@@ -1,4 +1,14 @@
 # data/sentiment.py
+
+# One-time historical pull (NSE 2022→today + current RSS)
+#python data/sentiment.py --mode backfill
+
+# Daily cron (last 2 days both sources)
+#python data/sentiment.py --mode daily
+
+# Rebuild daily aggregate only (use after Colab FinBERT run)
+#python data/sentiment.py --mode aggregate
+
 # ═══════════════════════════════════════════════════════════════════════
 # SENTIMENT INGESTION — hedge_v2 (Layer 3B)
 #
@@ -93,6 +103,13 @@ def refresh_nse_cookies():
         time.sleep(2)
         nse_session.get(
             "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+            timeout=15
+        )
+        time.sleep(1)
+        # This specific page sets the token NSE's API requires
+        nse_session.get(
+            "https://www.nseindia.com/api/corporate-announcements"
+            "?index=equities&from_date=01-01-2022&to_date=02-01-2022",
             timeout=15
         )
         time.sleep(1)
@@ -203,12 +220,7 @@ def score_announcement(subject: str, description: str) -> tuple:
     return None, None
 
 
-def fetch_nse_announcements(from_date: date, to_date: date,
-                            max_retries: int = 3) -> list:
-    """
-    Fetch NSE corporate announcements for a date window.
-    Returns list of dicts (raw JSON items).
-    """
+def fetch_nse_announcements(from_date: date, to_date: date, max_retries: int = 3) -> list:
     url = NSE_ANNOUNCEMENT_URL.format(
         from_date=from_date.strftime("%d-%m-%Y"),
         to_date=to_date.strftime("%d-%m-%Y"),
@@ -217,23 +229,46 @@ def fetch_nse_announcements(from_date: date, to_date: date,
     for attempt in range(max_retries):
         try:
             resp = nse_session.get(url, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                # NSE returns either a list directly or a dict with data key
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict):
-                    return data.get("data", data.get("rows", []))
-                return []
-            elif resp.status_code in (401, 403):
+
+            if not resp.content:
                 refresh_nse_cookies()
                 time.sleep(2 ** attempt)
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2 ** attempt * 2)
-            else:
+                continue
+
+            if resp.status_code in (401, 403):
+                refresh_nse_cookies()
+                time.sleep(2 ** attempt)
+                continue
+
+            if resp.status_code not in (200,):
                 print(f"  ⚠️  NSE API HTTP {resp.status_code} for "
                       f"{from_date}→{to_date}")
                 return []
+
+            text = resp.text.strip()
+
+            if not text or text.startswith("<"):
+                print(f"  ⚠️  Non-JSON response for {from_date}→{to_date} "
+                      f"(attempt {attempt+1}) — refreshing cookies")
+                refresh_nse_cookies()
+                time.sleep(2 ** attempt)
+                continue
+
+            try:
+                data = json.loads(text)
+            except ValueError:
+                print(f"  ⚠️  JSON decode failed for "
+                      f"{from_date}→{to_date} (attempt {attempt+1})")
+                refresh_nse_cookies()
+                time.sleep(2 ** attempt)
+                continue
+
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("data", data.get("rows", []))
+            return []
+
         except requests.RequestException as e:
             print(f"  ⚠️  NSE request failed (attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)

@@ -485,4 +485,9 @@ Key decisions:
 TIER_X_EXCLUDED hardcoded list in config.py is now superseded by the stock_data_quality table. All downstream scripts must query the DB for tier classification — do not use the hardcoded list.
 Tier A count (292) is higher than the 275 estimated in the Apr 10 session log — the earlier estimate was from a manual bhavcopy query without ADV filtering. The new count from combined coverage + ADV logic is the authoritative figure.
 
+7.  python data/sentiment.py --mode backfill ← DONE. 212,891 raw rows,
+    152,826 aggregated. 2022→2026.
+    python data/sentiment.py --mode daily ← Run daily after market close
+    python data/sentiment.py --mode aggregate ← Run after Colab FinBERT scoring
+
 _End of session log. Add your next entry above this line._
