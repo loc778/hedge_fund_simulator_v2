@@ -27,21 +27,21 @@ hedge_fund_simulator_v2/
 │
 ├── files/
 │   ├── nifty500_tickers.csv     ← NSE Nifty 500 watchlist (re-download quarterly)
-│   └── fii_nsdl/                ← NSDL FPI .xls files, one per calendar year (2010-present)
+│   ├── nifty500_sectors.csv     ← NSE official sector classification, all 500 tickers (loaded into config.py as SECTOR_MAP)
+│   └── rbi/
+│       └── repo_history.csv     ← Repo rate history 2010-present (update manually after each MPC meeting)
 │
 ├── data/
 │   ├── db.py                    ← Shared DB utilities (get_engine, save_to_db)
 │   ├── setup_db.py              ← Run once on any new machine to create all tables
 │   ├── bhavcopy_ingestion.py    ← Layer 1: OHLCV via NSE bhavcopy archives — DONE, VERIFIED
-│   ├── indicators.py            ← Layer 4: Technical indicators — DONE, ⚠️ USES RAW CLOSE (bug)
-│   ├── indicators1.py           ← Layer 4: Fixed version using Adj_Close — NOT WIRED IN
-│   ├── screener_fundamentals.py ← Layer 2: Annual fundamentals from Screener.in — DONE, ⚠️ SNAPSHOT LEAK
-│   ├── macro.py                 ← Layer 3A: yfinance + FRED macro data — DONE, VERIFIED
-│   ├── fii_dii.py               ← Layer 3A: FII/DII daily flows from NSE (~30 days) — DONE
-│   ├── fii_dii_historical.py    ← Layer 3A: FII monthly from NSDL files — DONE, ⚠️ UNIT MISMATCH
+│   ├── indicators.py            ← Layer 4: Technical indicators — DONE, C1 FIXED (Adj_Close)
+│   ├── screener_fundamentals.py ← Layer 2: Annual fundamentals from Screener.in — DONE, C2 FIXED
+│   ├── macro.py                 ← Layer 3A: yfinance + FRED macro data — DONE, C6 FIXED (UPSERT)
+│   ├── fii_dii_stockedge.py     ← Layer 3A: FII+DII monthly+daily via StockEdge API — DONE (replaces fii_dii.py + fii_dii_historical.py)
 │   ├── rbi_macro.py             ← Layer 3A: Repo Rate + IIP + Forex — DONE, VERIFIED
-│   ├── sentiment.py             ← Layer 3B: News sentiment via FinBERT — NOT BUILT
-│   ├── data_quality.py          ← Stock tier classification A/B/C/X — NOT BUILT
+│   ├── sentiment.py             ← Layer 3B: News sentiment via FinBERT — NOT BUILT (home laptop only)
+│   ├── data_quality.py          ← Stock tier classification A/B/C/X — NOT BUILT (NEXT STEP)
 │   ├── features.py              ← Feature engineering — unified ML table — NOT BUILT
 │   └── export_features.py       ← Export features_master.csv for Colab — NOT BUILT
 │
@@ -67,18 +67,19 @@ hedge_fund_simulator_v2/
 Run these in order on a fresh machine after `python data/setup_db.py`:
 
 ```
-1.  python data/bhavcopy_ingestion.py      ← ~30-45 mins, DONE
-2.  python data/indicators.py              ← ⚠️ BLOCKED — must fix Adj_Close bug first
-3.  python data/screener_fundamentals.py   ← DONE, needs re-scrape after snapshot fix
-4.  python data/macro.py                   ← DONE
-5.  python data/fii_dii.py                 ← DONE (recent 30 days only)
-6.  python data/fii_dii_historical.py      ← DONE (NSDL monthly files)
-7.  python data/rbi_macro.py               ← DONE
-8.  python data/sentiment.py               ← NOT BUILT (home laptop only)
-9.  python data/data_quality.py            ← NOT BUILT
-10. python data/features.py                ← NOT BUILT
-11. python data/export_features.py         ← NOT BUILT
+1.  python data/bhavcopy_ingestion.py      ← DONE. 500 tickers, 1.3M rows, 2010-2026
+2.  python data/indicators.py              ← DONE. C1 fixed — runs on Adj_Close
+3.  python data/screener_fundamentals.py   ← DONE. C2 fixed — snapshot leak removed
+4.  python data/macro.py                   ← DONE. C6 fixed — UPSERT resume
+5.  python data/fii_dii_stockedge.py       ← DONE. Run MODE=monthly on 1st trading day of month, MODE=daily after market close daily
+6.  python data/rbi_macro.py               ← DONE
+7.  python data/sentiment.py               ← NOT BUILT (home laptop only — corporate firewall blocks HuggingFace/GDELT)
+8.  python data/data_quality.py            ← NOT BUILT (NEXT STEP)
+9.  python data/features.py                ← NOT BUILT
+10. python data/export_features.py         ← NOT BUILT
 ```
+
+> ⚠️ **fii_dii.py and fii_dii_historical.py are retired.** Do not run them. Replaced by fii_dii_stockedge.py.
 
 **Then on Google Colab (in order):**
 
@@ -99,29 +100,32 @@ None of the Colab notebooks have been built yet.
 - **Credentials:** stored in `.env` file (never committed to GitHub)
 - **Tables:** see `data/setup_db.py` for full schema
 
-| Table                      | Purpose                        | Source                 | Status           |
-| -------------------------- | ------------------------------ | ---------------------- | ---------------- |
-| nifty500_ohlcv             | Daily OHLCV prices             | NSE Bhavcopy           | POPULATED        |
-| nifty500_indicators        | Technical indicators           | Computed from OHLCV    | ⚠️ BAD DATA      |
-| nifty500_fundamentals      | Annual P&L, balance sheet      | Screener.in            | ⚠️ SNAPSHOT LEAK |
-| macro_indicators           | Daily/monthly macro signals    | yfinance + FRED + NSDL | POPULATED        |
-| nifty500_sentiment         | Daily news sentiment           | FinBERT (planned)      | EMPTY            |
-| stock_data_quality         | Tier A/B/C classification      | Computed from OHLCV    | EMPTY            |
-| features_master            | Unified ML training dataset    | All layers combined    | EMPTY            |
-| portfolio_positions        | Active/closed position tracker | Portfolio engine       | EMPTY            |
-| sector_fundamentals_median | Sector median ratios           | Imputation fallback    | EMPTY            |
-| corporate_actions          | Split/dividend history         | yfinance               | POPULATED        |
+| Table                      | Purpose                        | Source                        | Status           |
+| -------------------------- | ------------------------------ | ----------------------------- | ---------------- |
+| nifty500_ohlcv             | Daily OHLCV prices             | NSE Bhavcopy                  | POPULATED        |
+| nifty500_indicators        | Technical indicators           | Computed from OHLCV           | POPULATED (C1 FIXED) |
+| nifty500_fundamentals      | Annual P&L, balance sheet      | Screener.in                   | POPULATED (C2 FIXED) |
+| macro_indicators           | Daily/monthly macro signals    | yfinance + FRED + StockEdge   | POPULATED (4246 rows, new FII/DII columns) |
+| nifty500_sentiment         | Daily news sentiment           | FinBERT (planned)             | EMPTY            |
+| stock_data_quality         | Tier A/B/C/X classification    | Computed from OHLCV           | EMPTY            |
+| features_master            | Unified ML training dataset    | All layers combined           | EMPTY            |
+| portfolio_positions        | Active/closed position tracker | Portfolio engine              | EMPTY            |
+| sector_fundamentals_median | Sector median ratios           | Imputation fallback           | EMPTY            |
+| corporate_actions          | Split/dividend history         | yfinance                      | POPULATED (9455 events) |
+| fii_dii_staging            | Staging table from Apr 17 FII overhaul | StockEdge API         | ⚠️ DROP THIS — data migrated to macro_indicators. Run: `DROP TABLE fii_dii_staging;` |
 
 ---
 
 ## Key Design Decisions
 
-- **Config-driven:** `config.py` is the primary config file. Note: some config is also hardcoded in individual scripts (BANKING_TICKERS in screener_fundamentals.py, NSE_HOLIDAYS in bhavcopy_ingestion.py, repo rate history in rbi_macro.py).
-- **INSERT IGNORE everywhere:** via `save_to_db()` — never use `.to_sql()` directly. **Caveat:** INSERT IGNORE means bad rows from earlier runs can never be corrected without TRUNCATE.
+- **Config-driven:** `config.py` is the single source of truth. BANKING_TICKERS, NSE_HOLIDAYS, SECTOR_MAP (from `files/nifty500_sectors.csv`, covers all 500 tickers), and `get_sector()` helper all live here.
+- **UPSERT for macro:** `macro.py` uses `ON DUPLICATE KEY UPDATE` — stale/preliminary FRED values (GDP, CPI) are corrected on re-run. All other scripts use `INSERT IGNORE` via `save_to_db()` — never use `.to_sql()` directly.
 - **nifty500_sentiment must NEVER be truncated** — historical news cannot be recovered.
 - **All ML training on Google Colab** — home laptop (AMD Ryzen 7, 8GB RAM, no GPU) cannot train models.
 - **Survivorship bias:** current implementation uses today's Nifty 500 only. Full fix requires NSE historical constituent files — deferred.
-- **Fundamentals source:** Screener.in (not yfinance). Currently scrapes annual data, not quarterly. Historical PE/ROE/ROCE/Dividend_Yield are current-snapshot values pasted onto all years — this is a look-ahead leak and must be fixed before model training.
+- **Fundamentals source:** Screener.in annual data (not quarterly). Historical PE/ROE/ROCE/Dividend_Yield/BVPS are NULLed for all periods except latest — snapshot leak fixed (C2).
+- **FII/DII source:** StockEdge CM Provisional API (not NSDL). Covers 2008-present, includes DII, consistent units. `fii_dii_stockedge.py` is the only active FII/DII script. `fii_dii.py` and `fii_dii_historical.py` are retired — do not run them.
+- **Adj_Close:** computed from `corporate_actions` splits table (not yfinance ratio). Dividends excluded.
 
 ---
 
@@ -144,19 +148,19 @@ None of the Colab notebooks have been built yet.
 
 ## Critical Issues (from Apr 15 audit — must fix before model training)
 
-| #   | Issue                                            | Severity | Status |
-| --- | ------------------------------------------------ | -------- | ------ |
-| C1  | indicators.py uses raw Close, not Adj_Close      | CRITICAL | OPEN   |
-| C2  | PE/ROE/ROCE/DivYield are snapshot, not history   | CRITICAL | OPEN   |
-| C3  | Adj_Close via yfinance ratio — propagates errors | CRITICAL | OPEN   |
-| C5  | FII column has monthly + daily values mixed      | CRITICAL | OPEN   |
-| C6  | macro.py resume never corrects stale rows        | CRITICAL | OPEN   |
-| H1  | features.py / data_quality.py not built          | HIGH     | OPEN   |
-| H2  | Tier A/B/C is README prose only, not computed    | HIGH     | OPEN   |
-| H3  | Fundamentals are annual, not quarterly           | HIGH     | OPEN   |
-| H4  | Cash derivation for non-banks is wrong           | HIGH     | OPEN   |
-| H7  | BE series excluded from bhavcopy parsing         | HIGH     | OPEN   |
-| H14 | requirements.txt has zero version pins           | HIGH     | OPEN   |
+| #   | Issue                                            | Severity | Status        |
+| --- | ------------------------------------------------ | -------- | ------------- |
+| C1  | indicators.py uses raw Close, not Adj_Close      | CRITICAL | ✅ FIXED       |
+| C2  | PE/ROE/ROCE/DivYield are snapshot, not history   | CRITICAL | ✅ FIXED       |
+| C3  | Adj_Close via yfinance ratio — propagates errors | CRITICAL | ✅ FIXED       |
+| C5  | FII column has monthly + daily values mixed      | CRITICAL | ✅ FIXED       |
+| C6  | macro.py resume never corrects stale rows        | CRITICAL | ✅ FIXED       |
+| H1  | features.py / data_quality.py not built          | HIGH     | OPEN          |
+| H2  | Tier A/B/C is README prose only, not computed    | HIGH     | OPEN          |
+| H3  | Fundamentals are annual, not quarterly           | HIGH     | OPEN (deferred) |
+| H4  | Cash derivation for non-banks is wrong           | HIGH     | OPEN          |
+| H7  | BE series excluded from bhavcopy parsing         | HIGH     | OPEN          |
+| H14 | requirements.txt has zero version pins           | HIGH     | OPEN          |
 
 Full issue list: see `audit_report.txt` in project files.
 
@@ -168,11 +172,13 @@ Full issue list: see `audit_report.txt` in project files.
 | ------------------------------------ | -------- | -------------------------------------------------- |
 | Survivorship bias in ticker list     | Medium   | Need NSE historical constituent CSVs               |
 | Sentiment historical backfill        | Medium   | GDELT bulk API — weeks of calls                    |
-| DII_Net_Buy_Cr NULL for history      | Low      | No free bulk source. Deferred post-model eval.     |
-| Sector map covers 130/500 tickers    | High     | No code path populates the other 370               |
+| Sector map covers 130/500 tickers    | High     | ✅ FIXED — nifty500_sectors.csv now covers all 500 |
 | OBV uses unadjusted volume           | Medium   | Discontinuity on every split date                  |
 | VWAP_Daily is actually Typical_Price | Medium   | Mislabeled column — (H+L+C)/3, not volume-weighted |
 | BB_Width in schema but not computed  | Low      | Will remain NULL until indicators.py adds it       |
+| Screener ~124 tickers JS-rendered    | Low      | BeautifulSoup can't parse JS tables. These tickers will have NULL fundamentals — handled via sector median fallback in features.py |
+| rbi_macro.py hardcodes repo rate     | Medium   | repo_history.csv created but rbi_macro.py not yet patched to read it |
+| requirements.txt no version pins     | High     | Must pin — yfinance 1.2.1 breaks India_VIX/USDINR/Crude. Pin to yfinance==0.2.48 |
 
 ---
 
@@ -386,5 +392,74 @@ No free bulk historical source exists for 15-year DII data. Remains NULL for his
 6. Pin requirements.txt via pip freeze
 
 **Next session:** Begin Phase A remediation.
+
+### 15 Apr 2026 — Phase A remediation: all critical bugs fixed
+
+**Status:** All 5 critical audit issues (C1–C6) resolved. Data pipeline is now clean for feature engineering.
+
+**Changes made:**
+
+- `indicators.py` — replaced with fixed version (was `indicators1.py`). Now computes all indicators on `Adj_Close`. Old `indicators1.py` deleted. `nifty500_indicators` truncated and recomputed. **C1 FIXED.**
+- `screener_fundamentals.py` (v5) — PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS NULLed for all periods except latest per ticker. Snapshot look-ahead leak eliminated. **C2 FIXED.**
+- `bhavcopy_ingestion.py` — Adj_Close rebuilt from `corporate_actions` splits table (backward walk, cumulative ratio, bisect O(log N) lookup). Homepage cookie refresh calls removed (were causing 15s timeout waste per 20 iterations). Per-file sleep reduced 0.5s → 0.1s. **C3 FIXED.**
+- `macro.py` — UPSERT resume (`ON DUPLICATE KEY UPDATE`). NaN→None fix for DB writes. **C6 FIXED.**
+- `setup_db.py` — `macro_indicators` schema updated: `FII_Net_Buy_Cr` replaced with `FII_Monthly_Net_Cr` + `FII_Daily_Net_Cr`. Auto-migration function added.
+- `config.py` — NSE_HOLIDAYS moved from bhavcopy_ingestion.py; BANKING_TICKERS moved from screener_fundamentals.py; SECTOR_MAP now loaded from `files/nifty500_sectors.csv` (covers all 500 tickers, replaces hardcoded 130-ticker fallback); `get_sector()` helper added; RBI_REPO_CSV path added.
+- `files/nifty500_sectors.csv` — NEW. NSE official sector classification, all 500 tickers.
+- `files/rbi/repo_history.csv` — NEW. Repo rate history 2010-2026. Update manually after each MPC meeting. Note: `rbi_macro.py` not yet patched to read this file.
+
+**FII split (C5 partial fix — superseded by Apr 17 session):**
+`FII_Monthly_Net_Cr` = monthly total ÷ trading days in month. `FII_Daily_Net_Cr` = actual NSE API daily values (~30 days). `fii_dii_historical.py` and `fii_dii.py` updated to write to respective columns.
+
+**Known issue at end of session:** yfinance 1.2.1 installed — breaks `^INDIAVIX`, `INR=X`, `CL=F`. Fix: `pip install yfinance==0.2.48` then rerun `macro.py`. Must pin in `requirements.txt`.
+
+**Next session:** FII/DII overhaul + data_quality.py.
+
+---
+
+### 17 Apr 2026 — FII/DII pipeline overhaul, StockEdge source adopted
+
+**Status:** FII/DII data fully replaced with clean StockEdge CM Provisional source. All 5 critical bugs now closed. Next step: `data_quality.py`.
+
+**Problem with old approach:**
+- `fii_dii_historical.py` (NSDL): monthly totals divided by trading days — approximation, still not true daily data.
+- `fii_dii.py` (NSE API): only last 30 days; DII column was NULL for all history.
+- Both scripts retired permanently.
+
+**New source — StockEdge CM Provisional API:**
+- Endpoint: `https://api.stockedge.com/Api/FIIDashboardApi/GetFIIDIIProvisional`
+- No authentication. Public API discovered via DevTools.
+- `TimeSpan=M`: monthly FII+DII back to Jan 2008. `TimeSpan=D`: daily last ~50 trading days.
+- NSE CM Provisional data — same-day estimates used by the market. Correct for regime detection.
+- Verified: Mar 2020 FII = -65,816.70 Cr (COVID selloff), DII = +55,595.18 Cr (bought during crash). ✅
+
+**New script: `data/fii_dii_stockedge.py`**
+- MODE 1 (monthly): fetches all months back to 2008, stamps monthly total on every trading day via `nifty500_ohlcv` join. Resume logic skips months already in DB.
+- MODE 2 (daily): fetches last ~50 days of actual daily values. Resume logic skips dates already in DB.
+- `FII_Source_Flag` = `'monthly'` or `'daily'` — tells `features.py` data resolution per row.
+- Run schedule: MODE 1 on 1st trading day of each month; MODE 2 daily after market close.
+
+**Schema changes to `macro_indicators`:**
+
+| Column | Change |
+| --- | --- |
+| FII_Monthly_Net_Cr | Monthly FII net flow (same value on all trading days in month) |
+| DII_Monthly_Net_Cr | Monthly DII net flow — NEW, was not available before |
+| FII_Daily_Net_Cr | Actual daily FII — last ~50 trading days |
+| DII_Daily_Net_Cr | Actual daily DII — NEW |
+| FII_Source_Flag | `'monthly'` or `'daily'` |
+| DII_Net_Buy_Cr | DROPPED — old broken NSDL column |
+
+**Staging and migration:**
+- Data first written to `fii_dii_staging` table for verification against NSDL source.
+- Migration SQL run: `UPDATE macro_indicators JOIN fii_dii_staging ON Date`.
+- All values confirmed in `macro_indicators`. **⚠️ `fii_dii_staging` table can now be dropped:**
+  ```sql
+  DROP TABLE fii_dii_staging;
+  ```
+
+**C5 FIXED.** All FII/DII audit issues closed.
+
+**Next step:** Build `data/data_quality.py` — classifies all 500 tickers into Tier A/B/C/X based on `nifty500_ohlcv` coverage, gap%, ADV. Populates `stock_data_quality` table. Pending decision: F&O list source (CSV or fetch from NSE).
 
 _End of session log. Add your next entry above this line._
