@@ -401,8 +401,21 @@ TABLES = {
             UNIQUE KEY unique_sector_period (Sector, Period)
         )
     """,
-
+    "market_regimes": """
+        CREATE TABLE IF NOT EXISTS market_regimes (
+            Date            DATE            NOT NULL,
+            Regime_Label    VARCHAR(10)     NOT NULL,       -- Bull/Bear/HighVol/Sideways
+            Regime_Int      TINYINT         NOT NULL,       -- 0/1/2/3
+            Prob_Bull       DECIMAL(6,4)    DEFAULT NULL,
+            Prob_Bear       DECIMAL(6,4)    DEFAULT NULL,
+            Prob_HighVol    DECIMAL(6,4)    DEFAULT NULL,
+            Prob_Sideways   DECIMAL(6,4)    DEFAULT NULL,
+            Model_Version   VARCHAR(20)     DEFAULT NULL,
+            PRIMARY KEY (Date)
+        )
+    """
 }
+
 
 
 def run_setup():

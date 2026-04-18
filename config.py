@@ -228,10 +228,11 @@ TABLES = {
     "portfolio_positions"      : "portfolio_positions",
     "sector_median"            : "sector_fundamentals_median",
     "corporate_actions"        : "corporate_actions",
+    "market_regimes"           : "market_regimes",
 }
 
 # ── Model Version ─────────────────────────────────────────────────────
-MODEL_VERSION = "20260409"
+MODEL_VERSION = "v2_20260418"
 MODEL_DIR     = os.path.join(PROJECT_ROOT, "models")
 
 # ── Bhavcopy Config ───────────────────────────────────────────────────
