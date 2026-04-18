@@ -450,4 +450,9 @@ FEATURES = {
     # Volatility annualization factor (trading days per year).
     # Indian equity markets: ~250 trading days/year.
     "trading_days_per_year": 252,
+
+    # Export directory for features_master.parquet.
+    # Path is relative to PROJECT_ROOT.
+    # export_features.py writes here; upload to Google Drive for Colab.
+    "export_dir": "exports",
 }
