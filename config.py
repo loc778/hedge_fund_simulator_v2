@@ -2,6 +2,11 @@
 # ═══════════════════════════════════════════════════════════
 # CENTRAL CONFIGURATION — hedge_v2 (scaled production version)
 # Change values here to scale up/modify behaviour
+#
+# CHANGES (Apr 2026):
+#   - TABLES key renamed: "sector_fundamentals_med" → "sector_median"
+#     (consistent naming, shorter key)
+#   - Added FEATURES config block for features.py tunable parameters
 # ═══════════════════════════════════════════════════════════
 
 import os
@@ -209,17 +214,19 @@ STOCK_DELAY = 1
 DB_NAME = "hedge_v2_db"
 
 # ── Table Names ───────────────────────────────────────────────────────
+# NOTE: "sector_median" key renamed from "sector_fundamentals_med" (Apr 2026)
+#       for consistency. features.py uses TABLES["sector_median"].
 TABLES = {
     "ohlcv"                    : "nifty500_ohlcv",
     "indicators"               : "nifty500_indicators",
     "fundamentals"             : "nifty500_fundamentals",
     "macro"                    : "macro_indicators",
     "sentiment"                : "nifty500_sentiment",
-    "sentiment_raw"           : "nifty500_sentiment_raw",
+    "sentiment_raw"            : "nifty500_sentiment_raw",
     "features"                 : "features_master",
     "data_quality"             : "stock_data_quality",
     "portfolio_positions"      : "portfolio_positions",
-    "sector_fundamentals_med"  : "sector_fundamentals_median",
+    "sector_median"            : "sector_fundamentals_median",
     "corporate_actions"        : "corporate_actions",
 }
 
@@ -243,6 +250,9 @@ DATA_QUALITY = {
 # ── Tier X Exclusion List ─────────────────────────────────────────────
 # Recent IPOs with < 252 trading days as of Apr 2026.
 # data_quality.py maintains this going forward.
+# NOTE: features.py does NOT use this list — it queries stock_data_quality
+# table directly (single source of truth). This list remains for
+# screener_fundamentals.py which runs before data_quality.py.
 TIER_X_EXCLUDED = [
     "LTM.NS",        "ICICIAMC.NS",  "CANHLIFE.NS",  "JAINREC.NS",
     "LGEINDIA.NS",   "TATACAP.NS",   "JSWCEMENT.NS", "MEESHO.NS",
@@ -398,4 +408,46 @@ LIQUIDITY_FILTER = {
     "long_book_min_adv_cr"  : 5.0,
     "short_book_min_adv_cr" : 10.0,
     "lookback_days"         : 90,
+}
+
+
+# ── Features Pipeline Config ──────────────────────────────────────────
+# Tunable parameters for data/features.py. All values locked via
+# Apr 2026 architecture discussion — change here to re-tune without
+# editing features.py directly.
+FEATURES = {
+    # Fundamental availability lag:
+    # Annual reports become "public" this many calendar days after fiscal
+    # year-end. Controls look-ahead prevention. 60 days = standard Indian
+    # reporting lag (results typically released within 45-60 days of FY-end).
+    "fundamentals_availability_lag_days": 60,
+
+    # Sector median fallback — minimum tickers with actual data required
+    # to compute a reliable sector median for a given (Sector, Period).
+    # If fewer than this many tickers have actual data → NULL (no fallback).
+    # Rationale: median of <3 observations is statistically unstable.
+    "sector_median_min_tickers": 3,
+
+    # Maximum days to forward-fill annual fundamental data into daily rows.
+    # Beyond this, data is considered stale → trigger sector-median fallback.
+    # 400 days = annual reporting cycle + 35-day buffer for late filings.
+    "fundamentals_max_forward_fill_days": 400,
+
+    # Price gap detection threshold (calendar days between consecutive OHLCV
+    # rows for a ticker). Rows where prior gap exceeds this → Price_Gap_Flag=1.
+    # NSE max legitimate gap = long weekend + holidays = ~5 days.
+    "price_gap_flag_threshold_days": 5,
+
+    # Target forecast horizon (trading days, not calendar days).
+    # All target variables use this window: Target_Return_21d, Target_Rank_21d.
+    # Must match the horizon used in Colab ML training (v2 Section 5.1).
+    "target_horizon_days": 21,
+
+    # LSTM Head 2 realized volatility target window (trading days).
+    # Target_Vol_5d = std(log_returns[t+1..t+N]) × sqrt(252), ddof=1.
+    "target_vol_window_days": 5,
+
+    # Volatility annualization factor (trading days per year).
+    # Indian equity markets: ~250 trading days/year.
+    "trading_days_per_year": 252,
 }

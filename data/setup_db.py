@@ -3,6 +3,31 @@
 # ONE-TIME DATABASE SETUP — hedge_v2
 # Run once on any new machine to create all tables.
 # IF NOT EXISTS means re-running never breaks anything.
+#
+# CHANGES (Apr 2026):
+#   - features_master schema rewritten for v2 architecture:
+#       * Dropped snapshot-polluted columns (PE, PB, EV/EBITDA, ROE, ROCE,
+#         Dividend_Yield, FCF_Yield, PE_Is_PB_Proxy)
+#       * Added fundamental ratios computed from annual data
+#         (Revenue_YoY_Growth, EBITDA_Margin, Net_Margin, FCF_Margin,
+#          Asset_Turnover, ROA, Debt_to_Equity, EPS_Basic)
+#       * Added derived price features (Log_Return_1d, Return_60d, ADV_20d_Cr)
+#       * Split FII/DII into 5 separate columns (monthly/daily/flag)
+#       * Expanded sentiment to 5 columns
+#       * Added target variables: Target_Rank_21d, Target_Direction_Median,
+#         Target_Direction_Tertile, Target_Vol_5d
+#       * Added indicator availability flags (SMA50, ADX14, Volatility20d)
+#   - sector_fundamentals_median schema rewritten to match features_master
+#     (drops PE/PB/EV-EBITDA/Dividend_Yield; adds computed ratios)
+#   - nifty500_fundamentals EPS_Basic/EPS_Diluted widened to DECIMAL(12,4)
+#     for high-EPS stocks (MRF, PAGEIND, NESTLEIND)
+#
+# BEFORE RE-RUNNING (one-time manual SQL):
+#   DROP TABLE IF EXISTS features_master;
+#   DROP TABLE IF EXISTS sector_fundamentals_median;
+#   ALTER TABLE nifty500_fundamentals
+#       MODIFY COLUMN EPS_Basic   DECIMAL(12,4),
+#       MODIFY COLUMN EPS_Diluted DECIMAL(12,4);
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -74,6 +99,8 @@ TABLES = {
     """,
 
     # ── Layer 2: Fundamental Data ─────────────────────────────────────
+    # EPS_Basic / EPS_Diluted widened to DECIMAL(12,4) — high-EPS stocks
+    # (MRF, PAGEIND, NESTLEIND) exceed the previous DECIMAL(10,4) max.
     "nifty500_fundamentals": """
         CREATE TABLE IF NOT EXISTS nifty500_fundamentals (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
@@ -83,8 +110,8 @@ TABLES = {
             Gross_Profit        BIGINT,
             EBITDA              BIGINT,
             Net_Income          BIGINT,
-            EPS_Basic           DECIMAL(10,4),
-            EPS_Diluted         DECIMAL(10,4),
+            EPS_Basic           DECIMAL(12,4),
+            EPS_Diluted         DECIMAL(12,4),
             Total_Assets        BIGINT,
             Total_Liabilities   BIGINT,
             Total_Equity        BIGINT,
@@ -116,7 +143,6 @@ TABLES = {
     #   FII_Daily_Net_Cr   = actual daily value for last ~50 trading days
     #   DII_Daily_Net_Cr   = actual daily value for last ~50 trading days
     #   FII_Source_Flag    = 'monthly' or 'daily' — tells features.py data resolution
-    # features.py uses FII_Daily_Net_Cr when not NULL, else FII_Monthly_Net_Cr.
     "macro_indicators": """
         CREATE TABLE IF NOT EXISTS macro_indicators (
             id                  INT AUTO_INCREMENT PRIMARY KEY,
@@ -165,7 +191,7 @@ TABLES = {
             UNIQUE KEY unique_ticker_date (Ticker, Date)
         )
     """,
- 
+
     # ── Layer 3B: Sentiment Raw Events ────────────────────────────────
     # Per-event rows. One row per (Ticker, Date, Source, Headline).
     # NSE announcements: rule-scored at ingest time (Rule_Score populated).
@@ -206,85 +232,124 @@ TABLES = {
     """,
 
     # ── Feature Engineering: Unified ML Training Dataset ─────────────
+    # v2 schema (Apr 2026):
+    #   - Dropped snapshot-polluted ratios (PE, PB, EV/EBITDA, ROE, ROCE,
+    #     Dividend_Yield, FCF_Yield, PE_Is_PB_Proxy)
+    #   - Added annual-derived ratios (Revenue_YoY_Growth, margins,
+    #     Asset_Turnover, ROA, Debt_to_Equity, EPS_Basic)
+    #   - Split FII/DII into 5 separate columns (keep raw + flag)
+    #   - Expanded sentiment to 5 columns
+    #   - Added targets: Target_Rank_21d, Target_Direction_Median/Tertile,
+    #     Target_Vol_5d (LSTM dual-head)
+    #   - Added flags: SMA50_Available, ADX14_Available, Volatility20d_Available
+    #   - Raw ratios stored; normalization done in Colab per walk-forward fold
     "features_master": """
         CREATE TABLE IF NOT EXISTS features_master (
-            id                      INT AUTO_INCREMENT PRIMARY KEY,
-            Date                    DATE            NOT NULL,
-            Ticker                  VARCHAR(20)     NOT NULL,
+            id                          INT AUTO_INCREMENT PRIMARY KEY,
+            Date                        DATE            NOT NULL,
+            Ticker                      VARCHAR(20)     NOT NULL,
 
-            Open                    DECIMAL(10,4),
-            High                    DECIMAL(10,4),
-            Low                     DECIMAL(10,4),
-            Close                   DECIMAL(10,4),
-            Adj_Close               DECIMAL(10,4),
-            Volume                  BIGINT,
-            VWAP_Daily              DECIMAL(10,4),
+            -- ── Price & Volume (from OHLCV) ──────────────────────────
+            Open                        DECIMAL(10,4),
+            High                        DECIMAL(10,4),
+            Low                         DECIMAL(10,4),
+            Close                       DECIMAL(10,4),
+            Adj_Close                   DECIMAL(10,4),
+            Volume                      BIGINT,
+            VWAP_Daily                  DECIMAL(10,4),
 
-            Return_1d               DECIMAL(10,4),
-            Return_5d               DECIMAL(10,4),
-            Return_21d              DECIMAL(10,4),
-            Volatility_20d          DECIMAL(10,4),
-            Volume_Ratio_20d        DECIMAL(10,4),
+            -- ── Derived Price Features ───────────────────────────────
+            Return_1d                   DECIMAL(10,6),
+            Log_Return_1d               DECIMAL(10,6),
+            Return_5d                   DECIMAL(10,6),
+            Return_21d                  DECIMAL(10,6),
+            Return_60d                  DECIMAL(10,6),
+            Volatility_20d              DECIMAL(10,6),
+            Volume_Ratio_20d            DECIMAL(10,6),
+            ADV_20d_Cr                  DECIMAL(15,4),
 
-            SMA_20                  DECIMAL(10,4),
-            SMA_50                  DECIMAL(10,4),
-            SMA_200                 DECIMAL(10,4),
-            EMA_9                   DECIMAL(10,4),
-            EMA_21                  DECIMAL(10,4),
-            MACD                    DECIMAL(10,4),
-            MACD_Signal             DECIMAL(10,4),
-            MACD_Hist               DECIMAL(10,4),
-            RSI_14                  DECIMAL(10,4),
-            BB_Upper                DECIMAL(10,4),
-            BB_Middle               DECIMAL(10,4),
-            BB_Lower                DECIMAL(10,4),
-            BB_Width                DECIMAL(10,4),
-            ATR_14                  DECIMAL(10,4),
-            Stoch_K                 DECIMAL(10,4),
-            Stoch_D                 DECIMAL(10,4),
-            ADX_14                  DECIMAL(10,4),
-            OBV                     DECIMAL(20,4),
-            VWAP_Dev                DECIMAL(10,4),
+            -- ── Technical Indicators (from nifty500_indicators) ──────
+            SMA_20                      DECIMAL(10,4),
+            SMA_50                      DECIMAL(10,4),
+            SMA_200                     DECIMAL(10,4),
+            EMA_9                       DECIMAL(10,4),
+            EMA_21                      DECIMAL(10,4),
+            MACD                        DECIMAL(10,4),
+            MACD_Signal                 DECIMAL(10,4),
+            MACD_Hist                   DECIMAL(10,4),
+            RSI_14                      DECIMAL(10,4),
+            BB_Upper                    DECIMAL(10,4),
+            BB_Middle                   DECIMAL(10,4),
+            BB_Lower                    DECIMAL(10,4),
+            BB_Width                    DECIMAL(10,4),
+            ATR_14                      DECIMAL(10,4),
+            Stoch_K                     DECIMAL(10,4),
+            Stoch_D                     DECIMAL(10,4),
+            ADX_14                      DECIMAL(10,4),
+            OBV                         DECIMAL(20,4),
+            VWAP_Dev                    DECIMAL(10,4),
 
-            PE_Ratio                DECIMAL(10,4),
-            PB_Ratio                DECIMAL(10,4),
-            EV_EBITDA               DECIMAL(10,4),
-            ROE                     DECIMAL(10,4),
-            ROA                     DECIMAL(10,4),
-            ROCE                    DECIMAL(10,4),
-            Debt_to_Equity          DECIMAL(10,4),
-            FCF_Yield               DECIMAL(10,4),
-            Dividend_Yield          DECIMAL(10,4),
-            EPS_Basic               DECIMAL(10,4),
+            -- ── Fundamental Ratios (computed in features.py) ─────────
+            -- Raw values; normalization done in Colab per fold.
+            Revenue_YoY_Growth          DECIMAL(12,6),
+            EBITDA_Margin               DECIMAL(12,6),
+            Net_Margin                  DECIMAL(12,6),
+            FCF_Margin                  DECIMAL(12,6),
+            Asset_Turnover              DECIMAL(12,6),
+            ROA                         DECIMAL(12,6),
+            Debt_to_Equity              DECIMAL(12,6),
+            EPS_Basic                   DECIMAL(12,4),
 
-            Sentiment_Score         DECIMAL(10,4),
-            Positive_Score          DECIMAL(10,4),
-            Negative_Score          DECIMAL(10,4),
+            -- ── Sentiment (5 columns) ────────────────────────────────
+            Announcement_Score          DECIMAL(10,4),
+            News_Sentiment_Score        DECIMAL(10,4),
+            Sentiment_Score             DECIMAL(10,4),
+            Positive_Score              DECIMAL(10,4),
+            Negative_Score              DECIMAL(10,4),
 
-            India_VIX               DECIMAL(10,4),
-            USDINR                  DECIMAL(10,4),
-            Crude_Oil               DECIMAL(10,4),
-            Gold                    DECIMAL(10,4),
-            CPI_India               DECIMAL(10,4),
-            GDP_India               DECIMAL(20,4),
-            Fed_Funds_Rate          DECIMAL(10,4),
-            US_CPI                  DECIMAL(10,4),
-            US_10Y_Bond             DECIMAL(10,4),
-            Repo_Rate               DECIMAL(10,4),
-            IIP_Growth              DECIMAL(10,4),
-            -- Unified FII feature: daily when available, monthly approx otherwise
-            FII_Net_Cr              DECIMAL(15,4),
-            DII_Net_Buy_Cr          DECIMAL(15,4),
+            -- ── Macro (from macro_indicators) ────────────────────────
+            India_VIX                   DECIMAL(10,4),
+            USDINR                      DECIMAL(10,4),
+            Crude_Oil                   DECIMAL(10,4),
+            Gold                        DECIMAL(10,4),
+            CPI_India                   DECIMAL(10,4),
+            GDP_India                   DECIMAL(20,4),
+            Fed_Funds_Rate              DECIMAL(10,4),
+            US_CPI                      DECIMAL(10,4),
+            US_10Y_Bond                 DECIMAL(10,4),
+            Repo_Rate                   DECIMAL(10,4),
+            IIP_Growth                  DECIMAL(10,4),
+            Forex_Reserves_USD          DECIMAL(20,4),
 
-            Price_Gap_Flag          TINYINT DEFAULT 0,
-            SMA200_Available        TINYINT DEFAULT 0,
-            Sentiment_Available     TINYINT DEFAULT 0,
-            PE_Is_PB_Proxy          TINYINT DEFAULT 0,
-            Fundamentals_Available  TINYINT DEFAULT 0,
-            Data_Tier               TINYINT DEFAULT 3,
+            -- ── FII/DII (5 separate columns — no pre-collapse) ──────
+            FII_Monthly_Net_Cr          DECIMAL(20,2),
+            FII_Daily_Net_Cr            DECIMAL(20,2),
+            DII_Monthly_Net_Cr          DECIMAL(20,2),
+            DII_Daily_Net_Cr            DECIMAL(20,2),
+            FII_Source_Flag             VARCHAR(10),
 
-            Target_Return_21d       DECIMAL(10,4),
-            Target_Direction        TINYINT,
+            -- ── Missing-data flags ──────────────────────────────────
+            Price_Gap_Flag              TINYINT DEFAULT 0,
+            SMA200_Available            TINYINT DEFAULT 0,
+            SMA50_Available             TINYINT DEFAULT 0,
+            ADX14_Available             TINYINT DEFAULT 0,
+            Volatility20d_Available     TINYINT DEFAULT 0,
+            Sentiment_Available         TINYINT DEFAULT 0,
+            Fundamentals_Available      TINYINT DEFAULT 0,
+            Data_Tier                   TINYINT DEFAULT 3,
+
+            -- ── Target Variables ─────────────────────────────────────
+            -- Target_Return_21d: raw forward return (reference)
+            -- Target_Rank_21d: cross-sectional percentile among Tier A+B
+            --                   (primary ML target, v2 Section 5.1)
+            -- Target_Direction_Median: 1 if rank > 0.5 else 0
+            -- Target_Direction_Tertile: 1 if rank > 2/3, 0 if < 1/3, NULL middle
+            -- Target_Vol_5d: annualized 5-day realized vol (LSTM Head 2)
+            Target_Return_21d           DECIMAL(10,6),
+            Target_Rank_21d             DECIMAL(10,6),
+            Target_Direction_Median     TINYINT,
+            Target_Direction_Tertile    TINYINT,
+            Target_Vol_5d               DECIMAL(10,6),
 
             UNIQUE KEY unique_ticker_date (Ticker, Date)
         )
@@ -314,21 +379,25 @@ TABLES = {
     """,
 
     # ── Sector Fundamentals Median ────────────────────────────────────
+    # v2 schema: matches features_master annual-derived ratios.
+    # Populated by features.py — fallback for tickers with missing
+    # fundamentals (>1 year gap triggers sector-median substitution).
+    # Computed per (Sector, Period) from actual non-imputed values only.
+    # If <3 tickers in sector have actual data for that Period → NULL.
     "sector_fundamentals_median": """
         CREATE TABLE IF NOT EXISTS sector_fundamentals_median (
-            id              INT AUTO_INCREMENT PRIMARY KEY,
-            Sector          VARCHAR(50)     NOT NULL,
-            Period          DATE            NOT NULL,
-            PE_Ratio        DECIMAL(10,4),
-            PB_Ratio        DECIMAL(10,4),
-            EV_EBITDA       DECIMAL(10,4),
-            ROE             DECIMAL(10,4),
-            ROA             DECIMAL(10,4),
-            ROCE            DECIMAL(10,4),
-            Debt_to_Equity  DECIMAL(10,4),
-            FCF_Yield       DECIMAL(10,4),
-            Dividend_Yield  DECIMAL(10,4),
-            EPS_Basic       DECIMAL(10,4),
+            id                      INT AUTO_INCREMENT PRIMARY KEY,
+            Sector                  VARCHAR(50)     NOT NULL,
+            Period                  DATE            NOT NULL,
+            Revenue_YoY_Growth      DECIMAL(12,6),
+            EBITDA_Margin           DECIMAL(12,6),
+            Net_Margin              DECIMAL(12,6),
+            FCF_Margin              DECIMAL(12,6),
+            Asset_Turnover          DECIMAL(12,6),
+            ROA                     DECIMAL(12,6),
+            Debt_to_Equity          DECIMAL(12,6),
+            EPS_Basic               DECIMAL(12,4),
+            Ticker_Count            INT,
             UNIQUE KEY unique_sector_period (Sector, Period)
         )
     """,
