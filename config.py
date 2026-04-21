@@ -303,10 +303,12 @@ DEPLOY_PCT = {
 
 # ── Macro Data Config ─────────────────────────────────────────────────
 MACRO_YFINANCE = {
-    "India_VIX" : "^INDIAVIX",
-    "USDINR"    : "INR=X",
-    "Crude_Oil" : "CL=F",
-    "Gold"      : "GC=F",
+    "India_VIX"    : "^INDIAVIX",
+    "USDINR"       : "INR=X",
+    "Crude_Oil"    : "CL=F",
+    "Gold"         : "GC=F",
+    "Nifty50_Close"  : "^NSEI",
+    "Nifty500_Close" : "^CRSLDX",
 }
 
 MACRO_FRED = {

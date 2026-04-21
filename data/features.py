@@ -14,7 +14,7 @@
 #   stock_data_quality        500 rows (Tier A/B/C/X classification)
 #
 # OUTPUTS (TRUNCATED and rebuilt on every run):
-#   features_master               ~1.2-1.5M rows, ~75 columns
+#   features_master               ~1.2-1.5M rows, ~79 columns
 #   sector_fundamentals_median    ~200-500 rows (Sector × Period)
 #
 # EXECUTION:
@@ -29,6 +29,18 @@
 #   - All NULLs flow through — XGBoost handles natively, flags carry info
 #   - No z-score normalization here — done in Colab per walk-forward fold
 #   - Targets NULL for rows where forward window > max available date
+#
+# FIXES (Apr 2026 — macro leakage remediation):
+#   - Raw macro level columns replaced with stock-specific betas
+#   - USDINR, Crude_Oil, Gold retained as raw features (daily, cross-sectional)
+#   - India_VIX retained as raw feature (cross-sectional regime signal)
+#   - Beta_to_FII uses FII flow level (not pct_change) — monthly flow is
+#     a level signal; pct_change on a flat monthly series produces near-zero
+#     variance which collapses beta to NaN
+#   - FII_Momentum_5d / DII_Momentum_5d cast to float (not Int8) to survive
+#     pandas merge without nullable integer dtype corruption
+#   - Repo_Rate and USDINR_1d_Return accessed directly after macro join
+#     with explicit column existence guard
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -87,13 +99,17 @@ FEATURES_COLUMNS = [
     # Sentiment (5 cols)
     "Announcement_Score", "News_Sentiment_Score", "Sentiment_Score",
     "Positive_Score", "Negative_Score",
-    # Macro
-    "India_VIX", "USDINR", "Crude_Oil", "Gold", "CPI_India", "GDP_India",
-    "Fed_Funds_Rate", "US_CPI", "US_10Y_Bond", "Repo_Rate", "IIP_Growth",
-    "Forex_Reserves_USD",
-    # FII/DII (5 separate cols)
-    "FII_Monthly_Net_Cr", "FII_Daily_Net_Cr",
-    "DII_Monthly_Net_Cr", "DII_Daily_Net_Cr", "FII_Source_Flag",
+    # Macro regime — daily market prices kept as raw features
+    # (cross-sectionally valid: daily variation, different sector impact)
+    "India_VIX", "USDINR", "Crude_Oil", "Gold",
+    # Stock-specific macro sensitivities (rolling 252d, min 63d)
+    "Beta_to_Nifty50", "Beta_to_Nifty500",
+    "Beta_to_USDINR", "Beta_to_VIX", "Beta_to_Crude", "Beta_to_Gold",
+    "Beta_to_FII",
+    # Macro regime signals (market-wide, low-frequency)
+    "FII_Momentum_5d", "DII_Momentum_5d",
+    # Cross-sectional macro interactions
+    "RepoRate_x_DebtEquity", "USDINR_x_Revenue_Growth",
     # Flags
     "Price_Gap_Flag", "SMA200_Available", "SMA50_Available",
     "ADX14_Available", "Volatility20d_Available", "Sentiment_Available",
@@ -178,11 +194,73 @@ def load_tier_map() -> dict:
 # ═══════════════════════════════════════════════════════════
 
 def load_macro() -> pd.DataFrame:
-    """Load macro_indicators in full (daily, already ffilled at ingest)."""
-    df = pd.read_sql(f"SELECT * FROM {TABLES['macro']}", con=engine)
+    """
+    Load macro_indicators. Returns daily DataFrame with:
+      - India_VIX, USDINR, Crude_Oil, Gold (raw — kept as features)
+      - Daily return series for rolling beta regression
+      - FII/DII flow columns for momentum signals and Beta_to_FII
+      - Repo_Rate for interaction term
+
+    FIX: Beta_to_FII uses FII flow LEVEL (not pct_change).
+         Monthly FII flow is a level signal — large positive = FII buying.
+         pct_change on a flat monthly series produces near-zero variance,
+         collapsing rolling beta to NaN for all historical rows.
+
+    FIX: FII_Momentum_5d / DII_Momentum_5d cast to float (not Int8).
+         Nullable integer dtype (Int8) survives in-memory operations but
+         corrupts to all-NULL after pandas merge in process_ticker().
+         Float dtype merges cleanly.
+    """
+    df = pd.read_sql(
+        f"""
+        SELECT Date, India_VIX, USDINR, Crude_Oil, Gold,
+               Nifty50_Close, Nifty500_Close,
+               Repo_Rate,
+               FII_Monthly_Net_Cr, FII_Daily_Net_Cr,
+               DII_Monthly_Net_Cr, DII_Daily_Net_Cr,
+               FII_Source_Flag
+        FROM {TABLES['macro']}
+        ORDER BY Date
+        """,
+        con=engine,
+    )
     df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
-    df = df.drop(columns=["id"], errors="ignore")
     df = df.sort_values("Date").reset_index(drop=True)
+
+    # Daily return series for rolling beta regression
+    for col, ret_col in [
+        ("Nifty50_Close",  "Ret_Nifty50"),
+        ("Nifty500_Close", "Ret_Nifty500"),
+        ("USDINR",         "Ret_USDINR"),
+        ("India_VIX",      "Ret_VIX"),
+        ("Crude_Oil",      "Ret_Crude"),
+        ("Gold",           "Ret_Gold"),
+    ]:
+        df[ret_col] = pd.to_numeric(df[col], errors="coerce").pct_change()
+
+    # FII net flow — prefer daily when available, else monthly
+    fii_daily   = pd.to_numeric(df["FII_Daily_Net_Cr"],   errors="coerce")
+    fii_monthly = pd.to_numeric(df["FII_Monthly_Net_Cr"], errors="coerce")
+    dii_monthly = pd.to_numeric(df["DII_Monthly_Net_Cr"], errors="coerce")
+    df["FII_Flow_Best"] = fii_daily.where(df["FII_Source_Flag"] == "daily", fii_monthly)
+
+    # Beta_to_FII: use flow LEVEL as factor (not pct_change)
+    # Monthly flow is a level signal — high positive = FII net buyers this month.
+    # pct_change on monthly-stamped data is meaningless (same value 20+ days).
+    df["Ret_FII"] = df["FII_Flow_Best"]
+
+    # FII/DII momentum: sign of 5-day rolling sum
+    # Cast to float — Int8 (nullable) corrupts through pandas merge to all-NULL
+    df["FII_Momentum_5d"] = np.sign(
+        df["FII_Flow_Best"].rolling(window=5, min_periods=3).sum()
+    ).astype(float)
+    df["DII_Momentum_5d"] = np.sign(
+        dii_monthly.rolling(window=5, min_periods=3).sum()
+    ).astype(float)
+
+    # USDINR 1-day return — for USDINR_x_Revenue_Growth interaction
+    df["USDINR_1d_Return"] = df["Ret_USDINR"]
+
     print(f"  ✅ Macro: {len(df):,} daily rows | {df['Date'].min().date()} → {df['Date'].max().date()}")
     return df
 
@@ -234,12 +312,11 @@ def compute_fundamental_ratios(fund_df: pd.DataFrame) -> pd.DataFrame:
     # Asset turnover
     df["Asset_Turnover"] = safe_div(df["Revenue"], df["Total_Assets"])
 
-    # Keep ROA, Debt_to_Equity, EPS_Basic from source (already computed by screener_fundamentals.py)
-    # ROA is Net_Income / Total_Assets — already populated per year in source table
+    # ROA, Debt_to_Equity, EPS_Basic sourced directly from screener_fundamentals.py
 
     # Effective date = Period + 60 days (lag for report availability)
-    # Force ns precision — pd.Timedelta addition can produce datetime64[s]
-    # which breaks merge_asof against MySQL-derived datetime64[us] columns.
+    # Force ns precision — pd.Timedelta addition produces datetime64[s] in some
+    # pandas versions, breaking merge_asof against datetime64[us] from MySQL.
     df["Effective_Date"] = (df["Period"] + pd.Timedelta(days=FUND_LAG_DAYS)).astype("datetime64[ns]")
     df["Period"]         = df["Period"].astype("datetime64[ns]")
 
@@ -277,7 +354,6 @@ def compute_sector_medians(ratios_df: pd.DataFrame) -> pd.DataFrame:
     med_df = pd.DataFrame(records)
     print(f"  ✅ {len(med_df):,} sector-period combinations")
 
-    # Write to DB
     if not med_df.empty:
         save_to_db(med_df, TABLES["sector_median"], engine)
 
@@ -294,7 +370,6 @@ def build_sector_median_lookup(med_df: pd.DataFrame) -> dict:
         g = group.copy()
         g["Period"] = pd.to_datetime(g["Period"]).astype("datetime64[ns]")
         g = g.sort_values("Period").reset_index(drop=True)
-        # Rename ratio cols to distinguish from ticker's own values during merge
         for col in RATIO_COLS:
             g.rename(columns={col: f"SecMed_{col}"}, inplace=True)
         lookup[sector] = g[["Period"] + [f"SecMed_{c}" for c in RATIO_COLS]]
@@ -317,8 +392,6 @@ def load_ticker_ohlcv(ticker: str) -> pd.DataFrame:
         con=engine,
         params=(ticker,),
     )
-    # Force ns precision — MySQL DATE columns arrive as datetime64[us] in
-    # pandas 2.x, which breaks merge_asof against other datetime dtypes.
     df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
     return df
 
@@ -351,30 +424,22 @@ def compute_price_derived(df: pd.DataFrame) -> pd.DataFrame:
     adj = pd.to_numeric(df["Adj_Close"], errors="coerce")
     vol = pd.to_numeric(df["Volume"],    errors="coerce")
 
-    # Simple returns
     df["Return_1d"]  = adj.pct_change(1)
     df["Return_5d"]  = adj.pct_change(5)
     df["Return_21d"] = adj.pct_change(21)
     df["Return_60d"] = adj.pct_change(60)
 
-    # Log returns (stable for LSTM sequence input)
     df["Log_Return_1d"] = np.log(adj / adj.shift(1))
 
-    # 20-day realized vol (annualized, sample std ddof=1)
     log_ret = df["Log_Return_1d"]
     df["Volatility_20d"] = (
         log_ret.rolling(window=20, min_periods=20).std(ddof=1)
         * np.sqrt(TRADING_DAYS_PER_YEAR)
     )
 
-    # Volume ratio — current vs 20-day rolling mean
     vol_mean_20 = vol.rolling(window=20, min_periods=20).mean()
     df["Volume_Ratio_20d"] = vol / vol_mean_20
 
-    # BB_Width — derived from bands (not stored in indicators table)
-    # Computed from BB_Upper/BB_Middle/BB_Lower loaded separately; assign later
-
-    # Average Daily Value (in crores) — rolling 20d
     rupee_vol = vol * adj
     df["ADV_20d_Cr"] = (
         rupee_vol.rolling(window=20, min_periods=20).mean() / 1e7
@@ -398,35 +463,24 @@ def compute_targets(df: pd.DataFrame, max_date: pd.Timestamp) -> pd.DataFrame:
     Rank-based targets computed in Phase 3.
     """
     df = df.copy()
-    adj = pd.to_numeric(df["Adj_Close"], errors="coerce")
+    adj     = pd.to_numeric(df["Adj_Close"], errors="coerce")
     log_ret = df["Log_Return_1d"]
 
-    # Target_Return_21d: trading-day offset (assumes df is sorted by date with
-    # one row per trading day for this ticker — OHLCV guarantees this).
     future_adj = adj.shift(-TARGET_HORIZON)
     df["Target_Return_21d"] = (future_adj / adj) - 1
 
-    # Target_Vol_5d: std of log_returns over [t+1 .. t+5], annualized
-    # Using rolling on shifted series: log_ret.shift(-1) gives t+1 at position t;
-    # rolling(5) on that gives window [t+1..t+5] computed at position t+4;
-    # so we shift back by -(WINDOW-1) to align at position t.
-    forward_log_ret = log_ret.shift(-1)  # t+1 at index t
-    rolling_std = forward_log_ret.rolling(window=TARGET_VOL_WINDOW, min_periods=TARGET_VOL_WINDOW).std(ddof=1)
-    # rolling computes at end of window — shift back so result lives at index t
+    forward_log_ret = log_ret.shift(-1)
+    rolling_std = forward_log_ret.rolling(
+        window=TARGET_VOL_WINDOW, min_periods=TARGET_VOL_WINDOW
+    ).std(ddof=1)
     df["Target_Vol_5d"] = rolling_std.shift(-(TARGET_VOL_WINDOW - 1)) * np.sqrt(TRADING_DAYS_PER_YEAR)
-
-    # NULL out targets where forward window extends past available data.
-    # For Target_Return_21d: last 21 trading-day rows per ticker → NULL
-    # (already handled by future_adj being NaN at end of series)
-    # Extra safety: ensure rows within 21 trading days of dataset max_date
-    # don't accidentally use cross-ticker data (they won't — shift is per-series)
 
     return df
 
 
 def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
-                      ratios_df: pd.DataFrame,
-                      sector_lookup: dict) -> pd.DataFrame:
+                       ratios_df: pd.DataFrame,
+                       sector_lookup: dict) -> pd.DataFrame:
     """
     Attach fundamental ratios to ticker's daily rows using merge_asof.
     For each row's Date:
@@ -436,29 +490,23 @@ def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
     """
     df = ticker_df.copy()
 
-    # --- Attempt 1: ticker's own fundamentals ---
     tick_funds = ratios_df[ratios_df["Ticker"] == ticker].copy()
     tick_funds = tick_funds.sort_values("Effective_Date").reset_index(drop=True)
 
-    # Initialize ratio columns as NaN (will be filled by merges below)
-    # Done on df directly; dropped from df_sorted before merge_asof to avoid
-    # column-name collision with tick_funds (which carries the same columns).
     for col in RATIO_COLS:
         df[col] = np.nan
     df["Fundamentals_Available"] = 0
 
     if not tick_funds.empty:
-        # Drop ratio cols from left side to avoid _x/_y suffixing during merge
         df_sorted = (
             df.drop(columns=RATIO_COLS)
               .sort_values("Date")
-              .reset_index()  # preserves original index as "index" column
+              .reset_index()
         )
 
-        # Safety: force ns precision on all datetime columns used in merge_asof
-        df_sorted["Date"] = df_sorted["Date"].astype("datetime64[ns]")
-        tick_funds["Effective_Date"] = tick_funds["Effective_Date"].astype("datetime64[ns]")
-        tick_funds["Period"] = tick_funds["Period"].astype("datetime64[ns]")
+        df_sorted["Date"]              = df_sorted["Date"].astype("datetime64[ns]")
+        tick_funds["Effective_Date"]   = tick_funds["Effective_Date"].astype("datetime64[ns]")
+        tick_funds["Period"]           = tick_funds["Period"].astype("datetime64[ns]")
 
         merged = pd.merge_asof(
             df_sorted,
@@ -469,15 +517,12 @@ def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
             allow_exact_matches=True,
         )
 
-        # Staleness: if Date - Period > FUND_MAX_FFILL_DAYS, mark as stale
         days_since_period = (merged["Date"] - merged["Period"]).dt.days
         stale_mask = (days_since_period > FUND_MAX_FFILL_DAYS) | days_since_period.isna()
 
-        # Restore original index order
-        merged = merged.set_index("index").sort_index()
-        stale_mask.index = merged.index  # re-align after set_index
+        merged     = merged.set_index("index").sort_index()
+        stale_mask.index = merged.index
 
-        # Where NOT stale and Effective_Date is not null → use ticker's own data
         valid_mask = ~stale_mask & merged["Effective_Date"].notna()
 
         for col in RATIO_COLS:
@@ -485,16 +530,13 @@ def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
 
         df.loc[valid_mask, "Fundamentals_Available"] = 1
 
-    # --- Attempt 2: sector median fallback (only for rows still missing) ---
     sector = get_sector(ticker)
     needs_fallback_mask = df["Fundamentals_Available"] == 0
 
     if needs_fallback_mask.any() and sector in sector_lookup:
-        sec_med = sector_lookup[sector]  # already sorted by Period
+        sec_med = sector_lookup[sector]
 
         if not sec_med.empty:
-            # Use Date - FUND_LAG_DAYS as the Period to join against
-            # (same lag rule — fundamentals for period P available at P + 60d)
             fallback_rows = df.loc[needs_fallback_mask, ["Date"]].copy()
             fallback_rows["Join_Date"] = (
                 fallback_rows["Date"] - pd.Timedelta(days=FUND_LAG_DAYS)
@@ -502,7 +544,6 @@ def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
             fallback_rows = fallback_rows.sort_values("Join_Date")
             fallback_rows["_orig_idx"] = fallback_rows.index
 
-            # Safety: force ns precision on sec_med Period column
             sec_med = sec_med.copy()
             sec_med["Period"] = sec_med["Period"].astype("datetime64[ns]")
 
@@ -517,15 +558,75 @@ def merge_fundamentals(ticker_df: pd.DataFrame, ticker: str,
 
             fb_merged = fb_merged.set_index("_orig_idx").sort_index()
 
-            # For each ratio: where sector median is not NaN, use it
-            # Fundamentals_Available stays 0 (sector-median substitution)
             for col in RATIO_COLS:
                 secmed_col = f"SecMed_{col}"
                 if secmed_col in fb_merged.columns:
                     fb_values = fb_merged[secmed_col]
-                    valid_fb = fb_values.notna()
-                    idx = fb_values.index[valid_fb]
+                    valid_fb  = fb_values.notna()
+                    idx       = fb_values.index[valid_fb]
                     df.loc[idx, col] = fb_values.loc[idx].values
+
+    return df
+
+
+def rolling_beta(stock_returns: pd.Series, factor_returns: pd.Series,
+                 window: int = 252, min_periods: int = 63) -> pd.Series:
+    """
+    Rolling OLS beta of stock_returns on factor_returns.
+    beta = cov(stock, factor) / var(factor)
+    window     : 252 trading days (1 year)
+    min_periods: 63 trading days (1 quarter) — NULL below this threshold
+    """
+    cov  = stock_returns.rolling(window=window, min_periods=min_periods).cov(factor_returns)
+    var  = factor_returns.rolling(window=window, min_periods=min_periods).var()
+    beta = cov / var.replace(0, np.nan)
+    beta = beta.replace([np.inf, -np.inf], np.nan)
+    return beta
+
+
+def compute_macro_sensitivities(df: pd.DataFrame, macro_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute stock-specific macro sensitivities and interaction terms.
+    Called after macro_df has been left-joined onto df.
+
+    Beta columns: rolling 252d OLS beta (min 63d) of stock Return_1d
+                  against each factor's daily return / level series.
+    Interaction terms: stock's own fundamental × shared macro variable
+                       (cross-sectionally valid — different value per stock).
+
+    FIX: Column access uses direct df[col] with explicit existence guard
+         instead of df.get(col, default) which silently returns None when
+         the column exists but pandas .get() falls through on DataFrame.
+    """
+    stock_ret = pd.to_numeric(df["Return_1d"], errors="coerce")
+
+    beta_pairs = [
+        ("Beta_to_Nifty50",  "Ret_Nifty50"),
+        ("Beta_to_Nifty500", "Ret_Nifty500"),
+        ("Beta_to_USDINR",   "Ret_USDINR"),
+        ("Beta_to_VIX",      "Ret_VIX"),
+        ("Beta_to_Crude",    "Ret_Crude"),
+        ("Beta_to_Gold",     "Ret_Gold"),
+        ("Beta_to_FII",      "Ret_FII"),
+    ]
+
+    for beta_col, factor_col in beta_pairs:
+        if factor_col in df.columns:
+            factor = pd.to_numeric(df[factor_col], errors="coerce")
+            df[beta_col] = rolling_beta(stock_ret, factor)
+        else:
+            df[beta_col] = np.nan
+
+    # Interaction terms
+    nan_series = pd.Series(np.nan, index=df.index)
+
+    repo   = pd.to_numeric(df["Repo_Rate"],         errors="coerce") if "Repo_Rate"         in df.columns else nan_series
+    d_e    = pd.to_numeric(df["Debt_to_Equity"],     errors="coerce") if "Debt_to_Equity"     in df.columns else nan_series
+    usdinr = pd.to_numeric(df["USDINR_1d_Return"],   errors="coerce") if "USDINR_1d_Return"   in df.columns else nan_series
+    rev_g  = pd.to_numeric(df["Revenue_YoY_Growth"], errors="coerce") if "Revenue_YoY_Growth" in df.columns else nan_series
+
+    df["RepoRate_x_DebtEquity"]   = repo  * d_e
+    df["USDINR_x_Revenue_Growth"] = usdinr * rev_g
 
     return df
 
@@ -541,72 +642,68 @@ def process_ticker(ticker: str,
     Build full feature row set for one ticker.
     Returns DataFrame ready for features_master insertion (minus rank cols).
     """
-    # Load OHLCV + indicators
     ohlcv = load_ticker_ohlcv(ticker)
     if ohlcv.empty:
         return pd.DataFrame()
 
     indic = load_ticker_indicators(ticker)
 
-    # Merge indicators on Date (left join — NULL where indicators missing)
     df = ohlcv.merge(indic, on="Date", how="left")
 
-    # Compute price-derived features
     df = compute_price_derived(df)
 
-    # BB_Width from bands
     bb_upper = pd.to_numeric(df["BB_Upper"],  errors="coerce")
     bb_lower = pd.to_numeric(df["BB_Lower"],  errors="coerce")
     bb_mid   = pd.to_numeric(df["BB_Middle"], errors="coerce")
     df["BB_Width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
 
-    # Price gap flag
-    df["Price_Gap_Flag"] = compute_price_gap_flag(df)
-
-    # Indicator availability flags
+    df["Price_Gap_Flag"]          = compute_price_gap_flag(df)
     df["SMA200_Available"]        = df["SMA_200"].notna().astype("int8")
     df["SMA50_Available"]         = df["SMA_50"].notna().astype("int8")
     df["ADX14_Available"]         = df["ADX_14"].notna().astype("int8")
     df["Volatility20d_Available"] = df["Volatility_20d"].notna().astype("int8")
 
-    # Targets (Target_Return_21d, Target_Vol_5d)
     df = compute_targets(df, dataset_max_date)
 
-    # Fundamentals + sector median fallback
     df = merge_fundamentals(df, ticker, ratios_df, sector_lookup)
 
-    # Macro (left join on Date — tiny table, already in memory)
+    # Macro join — brings in India_VIX, USDINR, Crude_Oil, Gold, Repo_Rate,
+    # and all derived columns (Ret_*, FII_Momentum_5d, USDINR_1d_Return etc.)
     df = df.merge(macro_df, on="Date", how="left")
 
-    # Sentiment (left join on Ticker+Date)
+    # Stock-specific macro sensitivities + interaction terms
+    df = compute_macro_sensitivities(df, macro_df)
+
     tick_sent = sentiment_df[sentiment_df["Ticker"] == ticker].drop(columns=["Ticker"])
     df = df.merge(tick_sent, on="Date", how="left")
 
-    # Sentiment_Available flag
     sent_start = pd.Timestamp(SENTIMENT_START_DATE)
     df["Sentiment_Available"] = (
         (df["Date"] >= sent_start) & df["Announcement_Score"].notna()
     ).astype("int8")
 
-    # Data tier
     df["Data_Tier"] = data_tier
 
-    # Rank targets — populated in Phase 3
     df["Target_Rank_21d"]          = np.nan
     df["Target_Direction_Median"]  = pd.NA
     df["Target_Direction_Tertile"] = pd.NA
 
-    # Set Ticker column (merge may have lost it from indicators left join)
     df["Ticker"] = ticker
 
-    # Select and reorder final columns
     for col in FEATURES_COLUMNS:
         if col not in df.columns:
             df[col] = np.nan
 
     df = df[FEATURES_COLUMNS].copy()
 
-    # Date → date type for MySQL
+    # Convert nullable int targets for MySQL
+    for col in ["Target_Direction_Median", "Target_Direction_Tertile"]:
+        df[col] = df[col].astype("object").where(df[col].notna(), None)
+
+    # FII_Momentum_5d / DII_Momentum_5d: replace NaN with None for MySQL TINYINT NULL
+    for col in ["FII_Momentum_5d", "DII_Momentum_5d"]:
+        df[col] = df[col].where(df[col].notna(), None)
+
     df["Date"] = df["Date"].dt.date
 
     return df
@@ -626,7 +723,6 @@ def compute_and_write_ranks():
     """
     print("\n🎯 Phase 3 — cross-sectional rank pass...")
 
-    # Load all Tier A+B rows with non-NULL Target_Return_21d
     df = pd.read_sql(
         f"""
         SELECT Ticker, Date, Target_Return_21d
@@ -643,14 +739,11 @@ def compute_and_write_ranks():
         print("  ⚠️  No rows to rank — skipping")
         return
 
-    # Cross-sectional percentile rank per Date
-    # method='average' handles ties (standard); pct=True → [0,1]
     df["Target_Rank_21d"] = (
         df.groupby("Date")["Target_Return_21d"]
         .rank(method="average", pct=True)
     )
 
-    # Direction targets
     df["Target_Direction_Median"] = (df["Target_Rank_21d"] > 0.5).astype("int8")
 
     def tertile(r):
@@ -663,42 +756,17 @@ def compute_and_write_ranks():
         return None
 
     df["Target_Direction_Tertile"] = df["Target_Rank_21d"].map(tertile)
+    df["Target_Rank_21d"]          = df["Target_Rank_21d"].round(6)
+    df["Date"]                     = df["Date"].dt.date
 
-    # Round for DB storage
-    df["Target_Rank_21d"] = df["Target_Rank_21d"].round(6)
-
-    # Convert Date back to date type
-    df["Date"] = df["Date"].dt.date
-
-    # Write to temp table via save_to_db (INSERT IGNORE; temp table is fresh)
-    print("  📤 Writing ranks to temp table...")
-    with engine.connect() as conn:
-        conn.execute(text("DROP TEMPORARY TABLE IF EXISTS tmp_ranks"))
-        conn.execute(text("""
-            CREATE TEMPORARY TABLE tmp_ranks (
-                Ticker                   VARCHAR(20) NOT NULL,
-                Date                     DATE NOT NULL,
-                Target_Rank_21d          DECIMAL(10,6),
-                Target_Direction_Median  TINYINT,
-                Target_Direction_Tertile TINYINT,
-                PRIMARY KEY (Ticker, Date)
-            )
-        """))
-        conn.commit()
-
-    # Bulk insert to temp table using to_sql directly (no INSERT IGNORE needed — fresh table)
     upload_df = df[[
         "Ticker", "Date",
         "Target_Rank_21d", "Target_Direction_Median", "Target_Direction_Tertile"
     ]].copy()
-    # pandas Int64 / nullable int → object for to_sql compatibility
     upload_df["Target_Direction_Median"]  = upload_df["Target_Direction_Median"].astype("Int8")
     upload_df["Target_Direction_Tertile"] = upload_df["Target_Direction_Tertile"].astype("Int8")
 
-    # Use raw to_sql since temp table won't have unique key violations
-    # (one row per Ticker,Date from groupby)
-    # BUT pandas to_sql on a temp table requires same connection — tricky.
-    # Workaround: create the temp table as a real table, then drop after UPDATE.
+    print("  📤 Writing ranks to _tmp_ranks...")
     with engine.connect() as conn:
         conn.execute(text("DROP TABLE IF EXISTS _tmp_ranks"))
         conn.execute(text("""
@@ -719,7 +787,6 @@ def compute_and_write_ranks():
     )
     print(f"  ✅ Wrote {len(upload_df):,} rank rows to _tmp_ranks")
 
-    # Batch UPDATE via JOIN
     print("  🔄 Applying ranks to features_master via JOIN UPDATE...")
     with engine.connect() as conn:
         conn.execute(text(f"""
@@ -747,52 +814,34 @@ def print_verification():
     print("VERIFICATION")
     print("=" * 60)
 
-    q_total = f"SELECT COUNT(*) FROM {TABLES['features']}"
-    q_tier = f"""
-        SELECT Data_Tier, COUNT(*) AS n, COUNT(DISTINCT Ticker) AS tickers
-        FROM {TABLES['features']}
-        GROUP BY Data_Tier
-        ORDER BY Data_Tier
-    """
-    q_dates = f"""
-        SELECT MIN(Date) AS min_d, MAX(Date) AS max_d,
-               COUNT(DISTINCT Date) AS n_dates
-        FROM {TABLES['features']}
-    """
-    q_targets = f"""
-        SELECT
-            SUM(CASE WHEN Target_Return_21d       IS NOT NULL THEN 1 ELSE 0 END) AS r21d,
-            SUM(CASE WHEN Target_Rank_21d         IS NOT NULL THEN 1 ELSE 0 END) AS rank21d,
-            SUM(CASE WHEN Target_Direction_Median IS NOT NULL THEN 1 ELSE 0 END) AS dir_med,
-            SUM(CASE WHEN Target_Direction_Tertile IS NOT NULL THEN 1 ELSE 0 END) AS dir_ter,
-            SUM(CASE WHEN Target_Vol_5d           IS NOT NULL THEN 1 ELSE 0 END) AS vol5d
-        FROM {TABLES['features']}
-    """
-    q_flags = f"""
-        SELECT
-            SUM(Price_Gap_Flag)          AS price_gaps,
-            SUM(SMA200_Available)        AS sma200_avail,
-            SUM(SMA50_Available)         AS sma50_avail,
-            SUM(ADX14_Available)         AS adx14_avail,
-            SUM(Volatility20d_Available) AS vol20_avail,
-            SUM(Sentiment_Available)     AS sent_avail,
-            SUM(Fundamentals_Available)  AS fund_avail
-        FROM {TABLES['features']}
-    """
-
     with engine.connect() as conn:
-        total = conn.execute(text(q_total)).scalar()
+        total = conn.execute(text(f"SELECT COUNT(*) FROM {TABLES['features']}")).scalar()
         print(f"\nTotal rows: {total:,}")
 
         print("\nRows per tier:")
-        for row in conn.execute(text(q_tier)):
+        for row in conn.execute(text(f"""
+            SELECT Data_Tier, COUNT(*) AS n, COUNT(DISTINCT Ticker) AS tickers
+            FROM {TABLES['features']}
+            GROUP BY Data_Tier ORDER BY Data_Tier
+        """)):
             tier_name = {1: "A", 2: "B", 3: "C"}.get(row[0], str(row[0]))
             print(f"  Tier {tier_name}: {row[1]:>10,} rows | {row[2]:>4} tickers")
 
-        dates = conn.execute(text(q_dates)).fetchone()
+        dates = conn.execute(text(f"""
+            SELECT MIN(Date), MAX(Date), COUNT(DISTINCT Date)
+            FROM {TABLES['features']}
+        """)).fetchone()
         print(f"\nDate range: {dates[0]} → {dates[1]} ({dates[2]:,} unique dates)")
 
-        targets = conn.execute(text(q_targets)).fetchone()
+        targets = conn.execute(text(f"""
+            SELECT
+                SUM(CASE WHEN Target_Return_21d        IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN Target_Rank_21d          IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN Target_Direction_Median  IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN Target_Direction_Tertile IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN Target_Vol_5d            IS NOT NULL THEN 1 ELSE 0 END)
+            FROM {TABLES['features']}
+        """)).fetchone()
         print("\nTarget coverage (non-NULL counts):")
         print(f"  Target_Return_21d       : {targets[0]:>12,}")
         print(f"  Target_Rank_21d         : {targets[1]:>12,}")
@@ -800,7 +849,17 @@ def print_verification():
         print(f"  Target_Direction_Tertile: {targets[3]:>12,}")
         print(f"  Target_Vol_5d           : {targets[4]:>12,}")
 
-        flags = conn.execute(text(q_flags)).fetchone()
+        flags = conn.execute(text(f"""
+            SELECT
+                SUM(Price_Gap_Flag),
+                SUM(SMA200_Available),
+                SUM(SMA50_Available),
+                SUM(ADX14_Available),
+                SUM(Volatility20d_Available),
+                SUM(Sentiment_Available),
+                SUM(Fundamentals_Available)
+            FROM {TABLES['features']}
+        """)).fetchone()
         print("\nFlag distributions (rows with flag=1):")
         print(f"  Price_Gap_Flag         : {flags[0]:>12,}")
         print(f"  SMA200_Available       : {flags[1]:>12,}")
@@ -809,6 +868,24 @@ def print_verification():
         print(f"  Volatility20d_Available: {flags[4]:>12,}")
         print(f"  Sentiment_Available    : {flags[5]:>12,}")
         print(f"  Fundamentals_Available : {flags[6]:>12,}")
+
+        new_cols = conn.execute(text(f"""
+            SELECT
+                SUM(CASE WHEN Beta_to_Nifty50      IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN Beta_to_FII          IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN FII_Momentum_5d      IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN DII_Momentum_5d      IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN RepoRate_x_DebtEquity IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN USDINR_x_Revenue_Growth IS NOT NULL THEN 1 ELSE 0 END)
+            FROM {TABLES['features']}
+        """)).fetchone()
+        print("\nNew column coverage (non-NULL counts):")
+        print(f"  Beta_to_Nifty50         : {new_cols[0]:>12,}")
+        print(f"  Beta_to_FII             : {new_cols[1]:>12,}")
+        print(f"  FII_Momentum_5d         : {new_cols[2]:>12,}")
+        print(f"  DII_Momentum_5d         : {new_cols[3]:>12,}")
+        print(f"  RepoRate_x_DebtEquity   : {new_cols[4]:>12,}")
+        print(f"  USDINR_x_Revenue_Growth : {new_cols[5]:>12,}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -821,7 +898,6 @@ def main():
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # Phase 0
     if not validate_inputs():
         print("\n❌ Input validation failed. Exiting.")
         return
@@ -834,7 +910,6 @@ def main():
         print("❌ No tickers in stock_data_quality. Exiting.")
         return
 
-    # Phase 1
     print("\n📥 Phase 1 — pre-computation...")
     macro_df     = load_macro()
     sentiment_df = load_sentiment()
@@ -854,27 +929,24 @@ def main():
     ratios_df = compute_fundamental_ratios(raw_fund)
     print(f"  ✅ Computed ratios for {len(ratios_df):,} (Ticker, Period) pairs")
 
-    med_df = compute_sector_medians(ratios_df)
+    med_df        = compute_sector_medians(ratios_df)
     sector_lookup = build_sector_median_lookup(med_df)
 
-    # Dataset max date (for target leakage guard)
-    dataset_max_date = pd.read_sql(
-        f"SELECT MAX(Date) AS d FROM {TABLES['ohlcv']}", con=engine
-    )["d"].iloc[0]
-    dataset_max_date = pd.to_datetime(dataset_max_date)
+    dataset_max_date = pd.to_datetime(
+        pd.read_sql(f"SELECT MAX(Date) AS d FROM {TABLES['ohlcv']}", con=engine)["d"].iloc[0]
+    )
     print(f"\n📅 Dataset max date: {dataset_max_date.date()}")
 
-    # Phase 2
     print("\n🔄 Phase 2 — per-ticker feature construction...")
-    tickers = sorted(tier_map.keys())
-    total_tickers = len(tickers)
+    tickers            = sorted(tier_map.keys())
+    total_tickers      = len(tickers)
     total_rows_written = 0
-    failed = []
+    failed             = []
 
     for idx, ticker in enumerate(tickers, 1):
         try:
             tier = tier_map[ticker]
-            df = process_ticker(
+            df   = process_ticker(
                 ticker, tier, ratios_df, sector_lookup,
                 macro_df, sentiment_df, dataset_max_date,
             )
@@ -883,12 +955,7 @@ def main():
                 print(f"  [{idx}/{total_tickers}] {ticker}: no OHLCV rows, skipped")
                 continue
 
-            # Sanitize: replace inf with NaN (pandas → MySQL)
             df = df.replace([np.inf, -np.inf], np.nan)
-
-            # Convert nullable int columns for MySQL
-            for col in ["Target_Direction_Median", "Target_Direction_Tertile"]:
-                df[col] = df[col].astype("object").where(df[col].notna(), None)
 
             save_to_db(df, TABLES["features"], engine)
             total_rows_written += len(df)
@@ -902,16 +969,13 @@ def main():
 
     print(f"\n✅ Phase 2 complete: {total_rows_written:,} rows written | {len(failed)} failures")
     if failed:
-        print("  Failed tickers:")
         for t, err in failed[:10]:
             print(f"    {t}: {err}")
         if len(failed) > 10:
             print(f"    ... and {len(failed) - 10} more")
 
-    # Phase 3
     compute_and_write_ranks()
 
-    # Phase 4
     print_verification()
 
     print("\n" + "=" * 60)

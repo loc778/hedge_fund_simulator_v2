@@ -151,6 +151,8 @@ TABLES = {
             USDINR              DECIMAL(10,4),
             Crude_Oil           DECIMAL(10,4),
             Gold                DECIMAL(10,4),
+            Nifty50_Close       DECIMAL(10,4),
+            Nifty500_Close      DECIMAL(10,4),
             CPI_India           DECIMAL(10,4),
             GDP_India           DECIMAL(20,4),
             Fed_Funds_Rate      DECIMAL(10,4),
@@ -307,26 +309,34 @@ TABLES = {
             Positive_Score              DECIMAL(10,4),
             Negative_Score              DECIMAL(10,4),
 
-            -- ── Macro (from macro_indicators) ────────────────────────
+            -- ── Macro regime (India_VIX kept — cross-sectionally valid) ──
             India_VIX                   DECIMAL(10,4),
+            -- Daily market prices (cross-sectionally valid — different impact per sector)
             USDINR                      DECIMAL(10,4),
             Crude_Oil                   DECIMAL(10,4),
             Gold                        DECIMAL(10,4),
-            CPI_India                   DECIMAL(10,4),
-            GDP_India                   DECIMAL(20,4),
-            Fed_Funds_Rate              DECIMAL(10,4),
-            US_CPI                      DECIMAL(10,4),
-            US_10Y_Bond                 DECIMAL(10,4),
-            Repo_Rate                   DECIMAL(10,4),
-            IIP_Growth                  DECIMAL(10,4),
-            Forex_Reserves_USD          DECIMAL(20,4),
 
-            -- ── FII/DII (5 separate columns — no pre-collapse) ──────
-            FII_Monthly_Net_Cr          DECIMAL(20,2),
-            FII_Daily_Net_Cr            DECIMAL(20,2),
-            DII_Monthly_Net_Cr          DECIMAL(20,2),
-            DII_Daily_Net_Cr            DECIMAL(20,2),
-            FII_Source_Flag             VARCHAR(10),
+            -- ── Stock-specific macro sensitivities (rolling 252d) ────
+            -- Beta_History_Days tracks how many days were used (NULL < 63d)
+            Beta_to_Nifty50             DECIMAL(10,6),
+            Beta_to_Nifty500            DECIMAL(10,6),
+            Beta_to_USDINR              DECIMAL(10,6),
+            Beta_to_VIX                 DECIMAL(10,6),
+            Beta_to_Crude               DECIMAL(10,6),
+            Beta_to_Gold                DECIMAL(10,6),
+            Beta_to_FII                 DECIMAL(10,6),
+
+            -- ── Macro regime signals (market-wide, low-frequency) ────
+            -- FII_Momentum_5d: sign of 5d rolling FII net flow (+1/0/-1)
+            -- DII_Momentum_5d: sign of 5d rolling DII net flow (+1/0/-1)
+            FII_Momentum_5d             TINYINT,
+            DII_Momentum_5d             TINYINT,
+
+            -- ── Cross-sectional macro interactions ───────────────────
+            -- RepoRate_x_DebtEquity: Repo_Rate × Debt_to_Equity
+            -- USDINR_x_Revenue_Growth: USDINR_1d_Return × Revenue_YoY_Growth
+            RepoRate_x_DebtEquity       DECIMAL(12,6),
+            USDINR_x_Revenue_Growth     DECIMAL(12,6),
 
             -- ── Missing-data flags ──────────────────────────────────
             Price_Gap_Flag              TINYINT DEFAULT 0,
