@@ -119,16 +119,18 @@ def _load_fo_set(path: str) -> frozenset:
     tickers = set()
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        # Accept column named 'Symbol', 'symbol', 'Ticker', 'ticker', or 'SYMBOL'
+        # Strip trailing spaces from field names (NSE CSVs often have them)
+        raw_fields = reader.fieldnames or []
+        field_map  = {f.strip(): f for f in raw_fields}  # stripped -> original
         col = None
-        for candidate in ("Symbol", "symbol", "Ticker", "ticker", "SYMBOL"):
-            if candidate in (reader.fieldnames or []):
-                col = candidate
+        for candidate in ("SYMBOL", "Symbol", "symbol", "Ticker", "ticker", "UNDERLYING"):
+            if candidate in field_map:
+                col = field_map[candidate]  # use original key for row lookup
                 break
         if col is None:
             raise ValueError(
-                f"[risk_manager] fo_list.csv must have a 'Symbol' column. "
-                f"Found: {reader.fieldnames}"
+                f"[risk_manager] fo_list.csv must have a 'SYMBOL' or 'Symbol' column. "
+                f"Found: {raw_fields}"
             )
         for row in reader:
             raw = row[col].strip()
