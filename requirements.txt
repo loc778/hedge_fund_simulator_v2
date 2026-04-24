@@ -38,7 +38,7 @@ scikit-learn
 xgboost
 lightgbm
 hmmlearn
-
+matplotlib
 # ── Deep Learning ─────────────────────────────────────────
 tensorflow
 keras
