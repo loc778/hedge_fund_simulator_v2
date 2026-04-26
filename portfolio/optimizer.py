@@ -187,28 +187,39 @@ def _load_atr(tickers: list[str], engine) -> pd.DataFrame:
     tickers_all  = list(set(tickers) | set(tickers_bare))
     ticker_list  = ", ".join(f"'{t}'" for t in tickers_all)
 
+    # nifty500_indicators has ATR_14 but NOT Adj_Close
+    # nifty500_ohlcv has Adj_Close — join the two tables
+    try:
+        import config as cfg_inner
+        ohlcv_table = cfg_inner.TABLES.get("ohlcv", "nifty500_ohlcv")
+    except ImportError:
+        ohlcv_table = "nifty500_ohlcv"
+
     query = f"""
-        SELECT i.Ticker, i.Date, i.ATR_14, i.Adj_Close
+        SELECT i.Ticker, i.Date, i.ATR_14, o.Adj_Close
         FROM {table} i
         INNER JOIN (
             SELECT Ticker, MAX(Date) AS MaxDate
             FROM {table}
             WHERE Ticker IN ({ticker_list})
               AND ATR_14 IS NOT NULL
-              AND Adj_Close IS NOT NULL
-              AND Adj_Close > 0
+              AND ATR_14 > 0
             GROUP BY Ticker
         ) m ON i.Ticker = m.Ticker AND i.Date = m.MaxDate
+        LEFT JOIN {ohlcv_table} o
+            ON o.Ticker = i.Ticker AND o.Date = i.Date
+        WHERE o.Adj_Close IS NOT NULL AND o.Adj_Close > 0
     """
 
     try:
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
     except Exception as e:
-        warnings.warn(f"[optimizer] ATR load failed: {e}. Using fallback values.")
+        warnings.warn(f"[optimizer] ATR/price load failed: {e}. Using fallback values.")
         df = pd.DataFrame(columns=["Ticker", "ATR_14", "Adj_Close"])
 
     if df.empty:
+        warnings.warn("[optimizer] ATR query returned no rows — check ticker format in DB. Using fallback.")
         df = pd.DataFrame({"Ticker": tickers})
         df["ATR_14"]   = float("nan")
         df["Adj_Close"]= float("nan")
@@ -332,8 +343,10 @@ def optimize_portfolio(
     # ── 1. Candidate selection ─────────────────────────────────────────────
 
     df = signals_df.copy()
+    # Always use sector_map_df as ground truth — signals CSV sector may be "Unknown"
+    df = df.drop(columns=["Sector"], errors="ignore")
     df = df.merge(sector_map_df[["Ticker","Sector"]], on="Ticker", how="left")
-    df["Sector"]    = df["Sector"].fillna("Unknown")
+    df["Sector"] = df["Sector"].fillna("Unknown")
     df["is_midcap"] = df["Data_Tier"].map(TIER_IS_MIDCAP).fillna(True)
 
     long_cands  = df[df["Final_Rank"] >= LONG_RANK_THRESHOLD].sort_values(

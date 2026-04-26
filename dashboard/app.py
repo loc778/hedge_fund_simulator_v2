@@ -26,6 +26,15 @@ import streamlit as st
 
 warnings.filterwarnings("ignore")
 
+def _wrap_label(s, max_words=2):
+    """Split label into lines of max_words words for clean x-axis display."""
+    words = str(s).split()
+    lines = []
+    for i in range(0, len(words), max_words):
+        lines.append(" ".join(words[i:i+max_words]))
+    return "<br>".join(lines)
+
+
 # ── Path setup ───────────────────────────────────────────────────────────────
 _DASH_DIR    = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_DASH_DIR)
@@ -278,16 +287,27 @@ def load_signals() -> tuple[pd.DataFrame, str]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_macro_latest() -> pd.Series:
-    """Latest row from macro_indicators."""
+def load_macro_latest(as_of_date: str = None) -> pd.Series:
+    """
+    Load macro row closest to as_of_date (on or before).
+    Falls back to most recent row if as_of_date not provided.
+    """
     try:
         engine = get_engine()
+        table  = TABLES.get("macro", "macro_indicators")
         with engine.connect() as conn:
-            df = pd.read_sql(
-                f"SELECT * FROM {TABLES.get('macro','macro_indicators')} "
-                f"ORDER BY Date DESC LIMIT 1",
-                conn
-            )
+            if as_of_date:
+                df = pd.read_sql(
+                    f"SELECT * FROM {table} "
+                    f"WHERE Date <= '{as_of_date}' "
+                    f"ORDER BY Date DESC LIMIT 1",
+                    conn
+                )
+            else:
+                df = pd.read_sql(
+                    f"SELECT * FROM {table} ORDER BY Date DESC LIMIT 1",
+                    conn
+                )
         return df.iloc[0] if len(df) else pd.Series(dtype=object)
     except Exception:
         return pd.Series(dtype=object)
@@ -568,13 +588,86 @@ with st.sidebar:
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_nav_series() -> pd.DataFrame:
+    """Load backtested NAV series from ensemble output."""
+    pattern = os.path.join(SIGNALS_DIR, "nav_series_*.csv")
+    files   = sorted(glob.glob(pattern))
+    if not files:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(files[-1], parse_dates=["Date"])
+        return df.sort_values("Date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_nifty_index(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Load Nifty benchmark from macro_indicators table (Nifty500_Close or Nifty50_Close).
+    Falls back to yfinance if columns not present.
+    """
+    try:
+        engine = get_engine()
+        # Try Nifty500 first, then Nifty50
+        for col in ("Nifty500_Close", "Nifty50_Close", "Nifty_500", "Nifty_50",
+                    "NIFTY500", "NIFTY50"):
+            try:
+                with engine.connect() as conn:
+                    df = pd.read_sql(
+                        f"SELECT Date, `{col}` AS Nifty FROM macro_indicators "
+                        f"WHERE Date BETWEEN '{start_date}' AND '{end_date}' "
+                        f"AND `{col}` IS NOT NULL ORDER BY Date",
+                        conn
+                    )
+                if not df.empty:
+                    df["Date"] = pd.to_datetime(df["Date"])
+                    return df[["Date","Nifty"]].dropna()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Fallback: yfinance
+    try:
+        import yfinance as yf
+        for sym in ("^CRSLDX", "^NSEI"):
+            df = yf.Ticker(sym).history(start=start_date, end=end_date, auto_adjust=True)
+            if not df.empty:
+                df = df[["Close"]].rename(columns={"Close": "Nifty"})
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                return df.reset_index().rename(columns={"Date": "Date"})
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+# ── Tax rates — Union Budget 2024 cutoff (23 Jul 2024) ───────────────────────
+_BUDGET_2024_CUTOFF = pd.Timestamp("2024-07-23")
+_LTCG_EXEMPTION_INR = 100_000   # ₹1L annual LTCG exemption on equity
+
+def _tax_rates(signal_date_ts):
+    """Return (stcg_rate, ltcg_rate) based on signal date."""
+    if pd.Timestamp(signal_date_ts) >= _BUDGET_2024_CUTOFF:
+        return 0.20, 0.125   # post-July 2024
+    return 0.15, 0.10        # pre-July 2024
+
+# Transaction cost rates (from config/architecture)
+_BROKERAGE_BPS   = 3     # 0.03%
+_STAMP_DUTY_BPS  = 1.5   # 0.015%
+_STT_BPS         = 10    # 0.10%
+_SLIPPAGE_BPS    = 5     # 0.05%
+_EXCHANGE_BPS    = 0.345 # NSE exchange + SEBI
+_TOTAL_COST_BPS  = _BROKERAGE_BPS + _STAMP_DUTY_BPS + _STT_BPS + _SLIPPAGE_BPS + _EXCHANGE_BPS
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
 signals_df, signals_path = load_signals()
 sector_map               = load_sectors()
-macro_row                = load_macro_latest()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
@@ -594,6 +687,8 @@ else:
     signals_today = pd.DataFrame()
     n_buy = n_sell = n_hold = 0
 
+macro_row = load_macro_latest(as_of_date=pd.Timestamp(signal_date).strftime("%Y-%m-%d"))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RUN OPTIMIZER (must run before KPIs so opt_stats is available)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -601,6 +696,17 @@ else:
 opt_result = run_optimization(signals_today, sector_map, nav_input, regime_int)
 if opt_result is not None:
     proposed_df = opt_result.positions
+    # Always re-merge sector + company from sector_map CSV (ground truth)
+    if not proposed_df.empty and not sector_map.empty:
+        proposed_df = proposed_df.drop(columns=["Sector","Company_Name"], errors="ignore")
+        merge_cols = ["Ticker","Sector","Company_Name"] if "Company_Name" in sector_map.columns                      else ["Ticker","Sector"]
+        proposed_df = proposed_df.merge(sector_map[merge_cols], on="Ticker", how="left")
+        proposed_df["Sector"] = proposed_df["Sector"].fillna("Unknown")
+        if "Company_Name" not in proposed_df.columns:
+            proposed_df["Company_Name"] = proposed_df["Ticker"].str.replace(".NS","",regex=False)
+        proposed_df["Company_Name"] = proposed_df["Company_Name"].fillna(
+            proposed_df["Ticker"].str.replace(".NS","",regex=False)
+        )
     ps_final    = opt_result.portfolio_state
     opt_stats   = opt_result.stats
     rejected_df = opt_result.rejected
@@ -610,31 +716,117 @@ else:
     opt_stats   = None
     rejected_df = pd.DataFrame()
 
-# Top bar
-col_title, col_date, col_regime = st.columns([3, 2, 2])
-with col_title:
+# ── Top bar: [Title + Signal Date] | [Macro Strip] | [Regime] ───────────────
+_h1, _h2, _h3 = st.columns([3, 4, 2])
+
+with _h1:
+    _sig_date_str = pd.Timestamp(signal_date).strftime("%d %b %Y")
     st.markdown(
+        # Row 1: Title + "Signal Date" label on same line
+        "<div style='display:flex;align-items:baseline;gap:20px'>"
         "<h2 style='font-family:monospace;font-size:1.3rem;color:#c9d1d9;"
-        "margin:0;padding:0;font-weight:600'>AI HEDGE FUND SIMULATOR</h2>"
-        "<p style='font-family:monospace;font-size:0.7rem;color:#8b949e;"
-        "text-transform:uppercase;letter-spacing:0.1em;margin:2px 0 0 0'>"
-        "NSE Nifty 500 · Long/Short Equity · v2</p>",
+        "margin:0;padding:0;font-weight:600;white-space:nowrap'>"
+        "AI HEDGE FUND SIMULATOR</h2>"
+        "<span style='font-family:monospace;font-size:0.65rem;color:#8b949e;"
+        "text-transform:uppercase;letter-spacing:0.1em;white-space:nowrap'>"
+        "Signal Date</span>"
+        "</div>"
+        # Row 2: Subtitle + date value on same line
+        "<div style='display:flex;align-items:baseline;gap:16px;margin-top:4px'>"
+        "<p style='font-family:monospace;font-size:0.68rem;color:#8b949e;"
+        "text-transform:uppercase;letter-spacing:0.1em;margin:0;white-space:nowrap'>"
+        "NSE Nifty 500 · Long/Short Equity · v2</p>"
+        f"<span style='font-family:monospace;font-size:1.05rem;color:#58a6ff;"
+        f"font-weight:700;white-space:nowrap'>{_sig_date_str}</span>"
+        "</div>",
         unsafe_allow_html=True
     )
-with col_date:
+
+with _h2:
+    # Macro strip — larger font, fetch FII from monthly if daily missing
+    _macro_fields = {
+        "India_VIX":   ("INDIA VIX", ""),
+        "USDINR":      ("USD/INR",   "₹"),
+        "Crude_Oil":   ("CRUDE",     "$"),
+        "Gold":        ("GOLD",      "$"),
+        "Repo_Rate":   ("REPO",      ""),
+    }
+    # FII: try all known column variants, prefer daily
+    _fii_val = None
+    _fii_label = "FII NET"
+    _fii_candidates = [
+        ("FII_Daily_Net_Cr",   "FII (D)"),
+        ("FII_Monthly_Net_Cr", "FII (M)"),
+        ("FII_Net_Buy_Cr",     "FII NET"),
+        ("FII_Net",            "FII NET"),
+        ("FII",                "FII NET"),
+    ]
+    for _fii_col, _fii_lbl in _fii_candidates:
+        if _fii_col in macro_row.index and pd.notna(macro_row.get(_fii_col)):
+            _fii_val   = macro_row[_fii_col]
+            _fii_label = _fii_lbl
+            break
+    # Debug: show available macro columns with data (remove after confirming FII works)
+    # st.write({c: macro_row[c] for c in macro_row.index if pd.notna(macro_row.get(c))})
+
+    _mstrip_parts = []
+    for _field, (_label, _unit) in _macro_fields.items():
+        _raw = macro_row.get(_field) if _field in macro_row.index else None
+        if _raw is not None and pd.notna(_raw):
+            try:
+                _v = float(_raw)
+                _display = f"{_unit}{_v:,.2f}" if abs(_v) < 1000 else f"{_unit}{_v:,.0f}"
+            except Exception:
+                _display = str(_raw)
+            if _label == "INDIA VIX":
+                _color = "#3fb950" if float(_raw) < 20 else "#f85149" if float(_raw) > 25 else "#e3b341"
+            elif _label == "REPO":
+                _display = f"{float(_raw):.2f}%"
+                _color = "#c9d1d9"
+            elif _label == "GOLD":
+                _display = f"${float(_raw):,.0f}"
+                _color = "#e3b341"
+            else:
+                _color = "#c9d1d9"
+            _mstrip_parts.append(
+                f"<div style='text-align:center;padding:0 12px'>"
+                f"<div style='font-size:0.62rem;color:#8b949e;text-transform:uppercase;"
+                f"letter-spacing:0.1em;margin-bottom:2px'>{_label}</div>"
+                f"<div style='font-size:1.0rem;color:{_color};font-weight:700;"
+                f"font-family:monospace'>{_display}</div>"
+                f"</div>"
+            )
+
+    # Add FII
+    if _fii_val is not None:
+        try:
+            _fv = float(_fii_val)
+            _fii_display = f"₹{_fv:,.0f} Cr"
+            _fii_color = "#3fb950" if _fv > 0 else "#f85149"
+        except Exception:
+            _fii_display = str(_fii_val)
+            _fii_color = "#c9d1d9"
+        _mstrip_parts.append(
+            f"<div style='text-align:center;padding:0 16px'>"
+            f"<div style='font-size:0.65rem;color:#8b949e;text-transform:uppercase;"
+            f"letter-spacing:0.1em;margin-bottom:2px'>{_fii_label}</div>"
+            f"<div style='font-size:1.1rem;color:{_fii_color};font-weight:700;"
+            f"font-family:monospace'>{_fii_display}</div>"
+            f"</div>"
+        )
+
+    if _mstrip_parts:
+        st.markdown(
+            "<div style='display:flex;align-items:center;justify-content:center;"
+            "padding:12px 0;border-left:1px solid #1e2d40;border-right:1px solid #1e2d40;"
+            "height:100%'>" + "".join(_mstrip_parts) + "</div>",
+            unsafe_allow_html=True
+        )
+
+with _h3:
     st.markdown(
-        f"<div style='text-align:right'>"
-        f"<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;"
-        f"text-transform:uppercase;letter-spacing:0.08em'>Signal Date</div>"
-        f"<div style='font-family:monospace;font-size:1.1rem;color:#58a6ff;font-weight:600'>"
-        f"{pd.Timestamp(signal_date).strftime('%d %b %Y')}</div>"
-        f"</div>",
-        unsafe_allow_html=True
-    )
-with col_regime:
-    st.markdown(
-        f"<div style='text-align:right'>"
-        f"<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;"
+        f"<div style='text-align:right;padding-top:6px'>"
+        f"<div style='font-family:monospace;font-size:0.65rem;color:#8b949e;"
         f"text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px'>Market Regime</div>"
         f"{regime_pill(regime_int)}"
         f"</div>",
@@ -664,8 +856,8 @@ st.divider()
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab5 = st.tabs([
-    "SIGNALS", "PROPOSED BOOK", "RISK", "MACRO & REGIME"
+tab1, tab2, tab3, tab4, tab6 = st.tabs([
+    "SIGNALS", "PORTFOLIO", "RISK", "GRAPHS", "RETURNS & FEES"
 ])
 
 
@@ -686,13 +878,16 @@ with tab1:
             unsafe_allow_html=True
         )
 
-        # Merge sector + company name — strip .NS for display only
+        # Merge sector + company name — always use sector_map CSV as ground truth
+        # Drop any Sector/Company_Name from signals CSV (may be Unknown from ensemble)
         df_view = signals_today.copy()
         df_view["Ticker_Display"] = df_view["Ticker"].str.replace(".NS","",regex=False)
+        df_view = df_view.drop(columns=["Sector","Company_Name"], errors="ignore")
         df_view = df_view.merge(sector_map, on="Ticker", how="left")
-        df_view["Sector"]       = df_view["Sector"].fillna("Unknown")
-        df_view["Company_Name"] = df_view.get("Company_Name",
-                                    df_view["Ticker_Display"]).fillna(df_view["Ticker_Display"])
+        df_view["Sector"] = df_view["Sector"].fillna("Unknown")
+        if "Company_Name" not in df_view.columns:
+            df_view["Company_Name"] = df_view["Ticker_Display"]
+        df_view["Company_Name"] = df_view["Company_Name"].fillna(df_view["Ticker_Display"])
         df_view["Tier"] = df_view["Data_Tier"].map(TIER_LABEL).fillna("?")
 
         # ── Filters: Signal selector + search bar (aligned) ─────────────
@@ -747,7 +942,6 @@ with tab1:
             "Ticker":       df_show["Ticker_Display"],
             "Company":      df_show["Company_Name"],
             "Sector":       df_show["Sector"],
-            "Signal":       df_show["Signal"].map({1:"BUY", -1:"SELL", 0:"NEUTRAL"}),
             "Close (₹)":    df_show["Ticker"].map(
                                 price_idx["Adj_Close"].apply(
                                     lambda v: f"{v:.2f}" if pd.notna(v) else "—"
@@ -759,6 +953,7 @@ with tab1:
                                     else (f"{int(v):,}" if pd.notna(v) else "—")
                                 )
                             ).fillna("—"),
+            "Signal":       df_show["Signal"].map({1:"BUY", -1:"SELL", 0:"NEUTRAL"}),
         })
 
         def colour_signal(val):
@@ -790,14 +985,19 @@ with tab1:
             try:
                 import plotly.graph_objects as go
                 fig = go.Figure(go.Bar(
-                    x=buys_sector["Sector"],
+                    x=[_wrap_label(s) for s in buys_sector["Sector"]],
                     y=buys_sector["Count"],
+                    text=buys_sector["Count"],
+                    textposition="outside",
+                    textfont=dict(color="#3fb950", size=10),
                     marker_color="#3fb950",
                     hovertemplate="%{x}<br>BUY signals: %{y}<extra></extra>",
+                    customdata=buys_sector["Sector"],
+                    hovertext=buys_sector["Sector"],
                 ))
                 fig.update_layout(
-                    height=260,
-                    margin=dict(l=10, r=10, t=10, b=60),
+                    height=300,
+                    margin=dict(l=10, r=10, t=30, b=20),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
@@ -831,14 +1031,18 @@ with tab1:
             try:
                 import plotly.graph_objects as go
                 fig_sell = go.Figure(go.Bar(
-                    x=sells_sector["Sector"],
+                    x=[_wrap_label(s) for s in sells_sector["Sector"]],
                     y=sells_sector["Count"],
+                    text=sells_sector["Count"],
+                    textposition="outside",
+                    textfont=dict(color="#f85149", size=10),
                     marker_color="#f85149",
                     hovertemplate="%{x}<br>SELL signals: %{y}<extra></extra>",
+                    customdata=sells_sector["Sector"],
                 ))
                 fig_sell.update_layout(
-                    height=260,
-                    margin=dict(l=10, r=10, t=10, b=60),
+                    height=300,
+                    margin=dict(l=10, r=10, t=30, b=20),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
@@ -897,22 +1101,58 @@ with tab2:
             st.markdown("<div class='section-header'>Portfolio Distribution</div>",
                         unsafe_allow_html=True)
             if not proposed_df.empty:
-                pie_labels = proposed_df["Ticker"].str.replace(".NS","",regex=False)
-                pie_values = proposed_df["Size_%NAV"]
-                pie_colors = ["#3fb950" if d=="LONG" else "#f85149"
-                              for d in proposed_df["Direction"]]
+                # Use ticker as short label inside chart, full company name on hover
+                _ticker_short = proposed_df["Ticker"].str.replace(".NS","",regex=False)
+                _pie_name     = proposed_df.get("Company_Name", _ticker_short).fillna(_ticker_short)
+                pie_values    = proposed_df["Size_%NAV"]
+
+                # High-contrast alternating greens for longs, reds for shorts
+                # Use shade variation so adjacent slices are distinguishable
+                _long_palette  = ["#2ea043","#3fb950","#56d364","#26a641","#1a7f37",
+                                   "#4ac26b","#6fdd8b","#34d058","#28a745","#218838"]
+                _short_palette = ["#da3633","#f85149","#ff6b6b","#c0392b","#e74c3c",
+                                   "#ff4444","#d63031","#b71c1c","#ff5252","#e53935"]
+                _long_idx = _short_idx = 0
+                pie_colors = []
+                for d in proposed_df["Direction"]:
+                    if d == "LONG":
+                        pie_colors.append(_long_palette[_long_idx % len(_long_palette)])
+                        _long_idx += 1
+                    else:
+                        pie_colors.append(_short_palette[_short_idx % len(_short_palette)])
+                        _short_idx += 1
+
                 fig_pie1 = go.Figure(go.Pie(
-                    labels=pie_labels, values=pie_values,
-                    marker=dict(colors=pie_colors, line=dict(color="#0a0e1a", width=1)),
-                    hovertemplate="%{label}<br>Allocation: %{value:.2f}% NAV<extra></extra>",
-                    textinfo="label+percent", textfont=dict(size=9, color="#c9d1d9"),
-                    hole=0.35,
+                    labels=_ticker_short,           # short ticker inside chart
+                    values=pie_values,
+                    customdata=list(zip(_pie_name, proposed_df["Direction"],
+                                       proposed_df["Sector"])),
+                    marker=dict(
+                        colors=pie_colors,
+                        line=dict(color="#0a0e1a", width=2)
+                    ),
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        "Direction: %{customdata[1]}<br>"
+                        "Sector: %{customdata[2]}<br>"
+                        "Allocation: %{value:.2f}% NAV"
+                        "<extra></extra>"
+                    ),
+                    # Show only percent inside slice, ticker as pull-out label
+                    textinfo="label+percent",
+                    textposition="inside",
+                    textfont=dict(size=9, color="#000000", family="JetBrains Mono, monospace"),
+                    insidetextorientation="radial",
+                    hole=0.38,
+                    pull=[0.03 if d=="SHORT" else 0 for d in proposed_df["Direction"]],
                 ))
                 fig_pie1.update_layout(
-                    height=380, margin=dict(l=0,r=0,t=20,b=0),
+                    height=480,
+                    margin=dict(l=80, r=80, t=30, b=30),
                     paper_bgcolor="rgba(0,0,0,0)",
                     showlegend=False,
-                    font=dict(family="JetBrains Mono, monospace", color="#8b949e"),
+                    font=dict(family="JetBrains Mono, monospace", color="#c9d1d9", size=10),
+                    uniformtext=dict(minsize=7, mode="hide"),
                 )
                 st.plotly_chart(fig_pie1, use_container_width=True)
 
@@ -920,19 +1160,49 @@ with tab2:
             st.markdown("<div class='section-header'>Sector Allocation (% NAV)</div>",
                         unsafe_allow_html=True)
             if not proposed_df.empty:
-                sec_nav = proposed_df.groupby("Sector")["Size_%NAV"].sum().reset_index()
+                sec_nav    = proposed_df.groupby("Sector")["Size_%NAV"].sum().reset_index()
+                sec_counts = proposed_df.groupby("Sector").size().reindex(sec_nav["Sector"]).values
+
+                # Sector pie — use distinct color palette
+                _sec_palette = [
+                    "#58a6ff","#3fb950","#e3b341","#f85149","#bc8cff",
+                    "#ff9800","#00bcd4","#e91e63","#8bc34a","#ff5722",
+                    "#9c27b0","#03a9f4","#4caf50","#ffc107","#f44336",
+                ]
                 fig_pie2 = go.Figure(go.Pie(
-                    labels=sec_nav["Sector"], values=sec_nav["Size_%NAV"],
-                    hovertemplate="%{label}<br>NAV: %{value:.2f}%<br>Count: %{customdata}<extra></extra>",
-                    customdata=proposed_df.groupby("Sector").size().reindex(sec_nav["Sector"]).values,
-                    textinfo="label+percent", textfont=dict(size=9, color="#c9d1d9"),
-                    hole=0.35,
+                    labels=sec_nav["Sector"],
+                    values=sec_nav["Size_%NAV"].round(2),
+                    customdata=sec_counts,
+                    marker=dict(
+                        colors=_sec_palette[:len(sec_nav)],
+                        line=dict(color="#0a0e1a", width=2)
+                    ),
+                    hovertemplate=(
+                        "<b>%{label}</b><br>"
+                        "NAV: %{value:.2f}%<br>"
+                        "Stocks: %{customdata}"
+                        "<extra></extra>"
+                    ),
+                    textinfo="label+percent",
+                    textposition="inside",
+                    textfont=dict(size=11, color="#000000", family="JetBrains Mono, monospace"),
+                    insidetextorientation="radial",
+                    hole=0.38,
                 ))
                 fig_pie2.update_layout(
-                    height=380, margin=dict(l=0,r=0,t=20,b=0),
+                    height=480,
+                    margin=dict(l=80, r=80, t=30, b=30),
                     paper_bgcolor="rgba(0,0,0,0)",
-                    showlegend=False,
-                    font=dict(family="JetBrains Mono, monospace", color="#8b949e"),
+                    showlegend=True,
+                    legend=dict(
+                        font=dict(color="#c9d1d9", size=10,
+                                  family="JetBrains Mono, monospace"),
+                        bgcolor="rgba(0,0,0,0)",
+                        orientation="v",
+                        x=1.02, y=0.5,
+                    ),
+                    font=dict(family="JetBrains Mono, monospace", color="#c9d1d9", size=10),
+                    uniformtext=dict(minsize=7, mode="hide"),
                 )
                 st.plotly_chart(fig_pie2, use_container_width=True)
 
@@ -1057,13 +1327,11 @@ with tab3:
                 short_pct = sec_short_pcts.get(sec, 0.0)
                 long_cap  = MAX_SECTOR_GROSS_LONG_FIN_PCT if sec in FINANCIAL_SECTOR_NAMES else MAX_SECTOR_GROSS_LONG_PCT
                 sec_rows.append({
-                    "Sector":        sec,
-                    "Long %NAV":     f"{long_pct:.1%}",
-                    "Long Cap":      f"{long_cap:.0%}",
-                    "Long Util":     f"{long_pct/long_cap:.0%}",
-                    "Short %NAV":    f"{short_pct:.1%}",
-                    "Short Cap":     f"{MAX_SECTOR_GROSS_SHORT_PCT:.0%}",
-                    "Short Util":    f"{short_pct/MAX_SECTOR_GROSS_SHORT_PCT:.0%}" if short_pct > 0 else "—",
+                    "Sector":    sec,
+                    "Long %NAV": f"{long_pct:.1%}",
+                    "Long Util": f"{long_pct/long_cap:.0%}",
+                    "Short %NAV":f"{short_pct:.1%}",
+                    "Short Util":f"{short_pct/MAX_SECTOR_GROSS_SHORT_PCT:.0%}" if short_pct > 0 else "—",
                 })
 
             st.dataframe(
@@ -1079,53 +1347,63 @@ with tab3:
 
         # ── Sector allocation charts (moved from proposed book) ───────────
         import plotly.graph_objects as go
-        sa1, sa2 = st.columns(2)
-        with sa1:
-            st.markdown("<div class='section-header'>Long Book — Sector Allocation</div>",
-                        unsafe_allow_html=True)
-            if not proposed_df.empty:
-                longs_r  = proposed_df[proposed_df["Direction"]=="LONG"]
-                if not longs_r.empty:
-                    sec_l = longs_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
-                    fig_sl = go.Figure(go.Bar(
-                        x=sec_l["Sector"], y=sec_l["Size_%NAV"],
-                        marker_color="#58a6ff",
-                        hovertemplate="%{x}<br>%{y:.2f}% NAV<extra></extra>",
-                    ))
-                    fig_sl.update_layout(
-                        height=260, margin=dict(l=10,r=10,t=10,b=60),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                        xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e"),
-                                   gridcolor="#1e2d40"),
-                        yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
-                                   gridcolor="#1e2d40"),
-                    )
-                    st.plotly_chart(fig_sl, use_container_width=True)
-        with sa2:
-            st.markdown("<div class='section-header'>Short Book — Sector Allocation</div>",
-                        unsafe_allow_html=True)
-            if not proposed_df.empty:
-                shorts_r = proposed_df[proposed_df["Direction"]=="SHORT"]
-                if not shorts_r.empty:
-                    sec_s = shorts_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
-                    fig_ss = go.Figure(go.Bar(
-                        x=sec_s["Sector"], y=sec_s["Size_%NAV"],
-                        marker_color="#f85149",
-                        hovertemplate="%{x}<br>%{y:.2f}% NAV<extra></extra>",
-                    ))
-                    fig_ss.update_layout(
-                        height=260, margin=dict(l=10,r=10,t=10,b=60),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                        xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e"),
-                                   gridcolor="#1e2d40"),
-                        yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
-                                   gridcolor="#1e2d40"),
-                    )
-                    st.plotly_chart(fig_ss, use_container_width=True)
-                else:
-                    st.info("No short positions.")
+        # Long book sector allocation
+        st.markdown("<div class='section-header'>Long Book — Sector Allocation</div>",
+                    unsafe_allow_html=True)
+        if not proposed_df.empty:
+            longs_r = proposed_df[proposed_df["Direction"]=="LONG"]
+            if not longs_r.empty:
+                sec_l = longs_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
+                fig_sl = go.Figure(go.Bar(
+                    x=[_wrap_label(s) for s in sec_l["Sector"]],
+                    y=sec_l["Size_%NAV"].round(2),
+                    text=sec_l["Size_%NAV"].round(2).astype(str) + "%",
+                    textposition="outside",
+                    textfont=dict(color="#58a6ff", size=10),
+                    marker_color="#58a6ff",
+                    hovertemplate="%{customdata}<br>%{y:.2f}% NAV<extra></extra>",
+                    customdata=sec_l["Sector"],
+                ))
+                fig_sl.update_layout(
+                    height=300, margin=dict(l=10,r=10,t=30,b=20),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+                    xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e",),
+                               tickangle=0, gridcolor="#1e2d40"),
+                    yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
+                               gridcolor="#1e2d40"),
+                )
+                st.plotly_chart(fig_sl, use_container_width=True)
+
+        # Short book sector allocation
+        st.markdown("<div class='section-header'>Short Book — Sector Allocation</div>",
+                    unsafe_allow_html=True)
+        if not proposed_df.empty:
+            shorts_r = proposed_df[proposed_df["Direction"]=="SHORT"]
+            if not shorts_r.empty:
+                sec_s = shorts_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
+                fig_ss = go.Figure(go.Bar(
+                    x=[_wrap_label(s) for s in sec_s["Sector"]],
+                    y=sec_s["Size_%NAV"].round(2),
+                    text=sec_s["Size_%NAV"].round(2).astype(str) + "%",
+                    textposition="outside",
+                    textfont=dict(color="#f85149", size=10),
+                    marker_color="#f85149",
+                    hovertemplate="%{customdata}<br>%{y:.2f}% NAV<extra></extra>",
+                    customdata=sec_s["Sector"],
+                ))
+                fig_ss.update_layout(
+                    height=300, margin=dict(l=10,r=10,t=30,b=20),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+                    xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e"),
+                               tickangle=0, gridcolor="#1e2d40"),
+                    yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
+                               gridcolor="#1e2d40"),
+                )
+                st.plotly_chart(fig_ss, use_container_width=True)
+            else:
+                st.info("No short positions.")
 
         # ── Rejected candidates ───────────────────────────────────────────
         if not rejected_df.empty:
@@ -1138,106 +1416,396 @@ with tab3:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — MACRO & REGIME
+# TAB 4 — GRAPHS
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab5:
+with tab4:
 
-    st.markdown("<div class='section-header'>Current Regime</div>", unsafe_allow_html=True)
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    r1, r2, r3 = st.columns([1, 2, 3])
-    with r1:
+    nav_df = load_nav_series()
+
+    if nav_df.empty:
+        st.warning(
+            "No NAV series file found. Download `nav_series_*.csv` from "
+            "Google Drive and place it in `exports/model_output/`."
+        )
+    else:
+        # Identify date and NAV columns
+        date_col = next((c for c in nav_df.columns if "date" in c.lower()), nav_df.columns[0])
+        nav_col  = next((c for c in nav_df.columns
+                         if c != date_col and any(k in c.lower() for k in ("nav","value","portfolio","return"))),
+                        [c for c in nav_df.columns if c != date_col][0])
+
+        nav_df[date_col] = pd.to_datetime(nav_df[date_col])
+        start_str = nav_df[date_col].min().strftime("%Y-%m-%d")
+        end_str   = nav_df[date_col].max().strftime("%Y-%m-%d")
+
+        # Normalise portfolio to base 100
+        base          = nav_df[nav_col].iloc[0]
+        nav_df["Portfolio_Idx"] = nav_df[nav_col] / base * 100
+
+        # Load Nifty benchmark
+        with st.spinner("Fetching Nifty benchmark from yfinance…"):
+            nifty_df = load_nifty_index(start_str, end_str)
+
+        if not nifty_df.empty:
+            nifty_df["Nifty_Idx"] = nifty_df["Nifty"] / nifty_df["Nifty"].iloc[0] * 100
+            merged = nav_df[[date_col, "Portfolio_Idx"]].merge(
+                nifty_df[["Date", "Nifty_Idx"]], left_on=date_col, right_on="Date", how="left"
+            )
+        else:
+            merged = nav_df[[date_col, "Portfolio_Idx"]].copy()
+            merged["Nifty_Idx"] = float("nan")
+
+        merged = merged.rename(columns={date_col: "Date"})
+
+        # ── Summary return metrics ────────────────────────────────────────
+        port_total_ret = (merged["Portfolio_Idx"].iloc[-1] / 100 - 1) * 100
+        nifty_total_ret = (merged["Nifty_Idx"].iloc[-1] / 100 - 1) * 100 if merged["Nifty_Idx"].notna().any() else None
+        n_days = (merged["Date"].iloc[-1] - merged["Date"].iloc[0]).days
+        n_years = max(n_days / 365.25, 0.001)
+        port_cagr = ((merged["Portfolio_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100
+        nifty_cagr = ((merged["Nifty_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100 if nifty_total_ret is not None else None
+
+        gm1, gm2, gm3, gm4 = st.columns(4)
+        gm1.metric("Portfolio Total Return", f"{port_total_ret:+.1f}%")
+        gm2.metric("Portfolio CAGR",         f"{port_cagr:+.1f}%")
+        if nifty_total_ret is not None and not pd.isna(nifty_total_ret):
+            gm3.metric("Nifty 500 Total Return", f"{nifty_total_ret:+.1f}%",
+                       delta=f"{port_total_ret - nifty_total_ret:+.1f}% alpha")
+            gm4.metric("Nifty 500 CAGR",
+                       f"{nifty_cagr:+.1f}%" if nifty_cagr and not pd.isna(nifty_cagr) else "—")
+        else:
+            gm3.metric("Nifty 500 Total Return", "—", help="Benchmark data unavailable for this date range")
+            gm4.metric("Nifty 500 CAGR", "—")
+
+        st.divider()
+
+        # ── Returns chart ─────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Portfolio vs Nifty 500 (Indexed to 100)</div>",
+                    unsafe_allow_html=True)
+
+        fig_ret = go.Figure()
+        fig_ret.add_trace(go.Scatter(
+            x=merged["Date"], y=merged["Portfolio_Idx"].round(2),
+            name="Portfolio", line=dict(color="#58a6ff", width=2),
+            hovertemplate="Date: %{x|%d %b %Y}<br>Portfolio: %{y:.2f}<extra></extra>",
+            fill="tozeroy", fillcolor="rgba(88,166,255,0.08)",
+        ))
+        if merged["Nifty_Idx"].notna().any():
+            fig_ret.add_trace(go.Scatter(
+                x=merged["Date"], y=merged["Nifty_Idx"].round(2),
+                name="Nifty 500", line=dict(color="#e3b341", width=1.5, dash="dot"),
+                hovertemplate="Date: %{x|%d %b %Y}<br>Nifty 500: %{y:.2f}<extra></extra>",
+            ))
+        fig_ret.update_layout(
+            height=380, margin=dict(l=10, r=10, t=10, b=40),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
+            hovermode="x unified",
+            xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
+                       tickfont=dict(color="#8b949e")),
+            yaxis=dict(title="Index (Base=100)", gridcolor="#1e2d40",
+                       linecolor="#1e2d40", tickfont=dict(color="#8b949e")),
+        )
+        st.plotly_chart(fig_ret, use_container_width=True)
+
+        st.divider()
+
+        # ── Drawdown chart ────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Portfolio Drawdown</div>",
+                    unsafe_allow_html=True)
+
+        port_series = merged["Portfolio_Idx"]
+        rolling_max = port_series.cummax()
+        drawdown    = ((port_series - rolling_max) / rolling_max * 100).round(2)
+        max_dd      = drawdown.min()
+        max_dd_date = merged["Date"].iloc[drawdown.idxmin()]
+
+        dd_metric1, dd_metric2 = st.columns(2)
+        dd_metric1.metric("Max Drawdown", f"{max_dd:.2f}%")
+        dd_metric2.metric("Max DD Date",  max_dd_date.strftime("%d %b %Y"))
+
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=merged["Date"], y=drawdown,
+            name="Drawdown", line=dict(color="#f85149", width=1.5),
+            fill="tozeroy", fillcolor="rgba(248,81,73,0.12)",
+            hovertemplate="Date: %{x|%d %b %Y}<br>Drawdown: %{y:.2f}%<extra></extra>",
+        ))
+        fig_dd.add_hline(y=0, line=dict(color="#484f58", width=1))
+        fig_dd.update_layout(
+            height=280, margin=dict(l=10, r=10, t=10, b=40),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+            hovermode="x unified",
+            xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
+                       tickfont=dict(color="#8b949e")),
+            yaxis=dict(title="Drawdown (%)", gridcolor="#1e2d40",
+                       linecolor="#1e2d40", tickfont=dict(color="#8b949e")),
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — RETURNS & FEES
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab6:
+
+    import plotly.graph_objects as go
+
+    if proposed_df.empty or opt_stats is None:
+        st.warning("No portfolio positions available. Run optimizer first.")
+    else:
+        stcg_rate, ltcg_rate = _tax_rates(signal_date)
+        budget_label = "Post-Budget 2024" if pd.Timestamp(signal_date) >= _BUDGET_2024_CUTOFF else "Pre-Budget 2024"
+
         st.markdown(
-            f"<div style='padding:20px;text-align:center'>"
-            f"{regime_pill(regime_int)}"
-            f"<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;margin-top:8px'>"
-            f"HMM State {regime_int}</div>"
+            f"<div style='font-family:monospace;font-size:0.72rem;color:#8b949e;margin-bottom:12px'>"
+            f"Tax regime: <span style='color:#c9d1d9'>{budget_label}</span> · "
+            f"STCG: <span style='color:#e3b341'>{stcg_rate:.0%}</span> · "
+            f"LTCG: <span style='color:#e3b341'>{ltcg_rate:.0%}</span> "
+            f"(₹1L annual exemption applies) · "
+            f"Transaction costs: <span style='color:#e3b341'>{_TOTAL_COST_BPS:.2f}bps</span>"
             f"</div>",
             unsafe_allow_html=True
         )
-    with r2:
-        regime_descriptions = {
-            0: ("Bull",     "Trending up. XGB/LGB momentum-weighted. Full deployment."),
-            1: ("Bear",     "Risk-off. Fundamental quality models weighted higher. Net long reduced."),
-            2: ("High Vol", "Elevated uncertainty. LSTM sequence patterns weighted up. Tighter position caps."),
-            3: ("Sideways", "Range-bound. Tree models preferred. Mean-reversion favoured."),
+
+        # ── Capital deployment summary ────────────────────────────────────
+        longs_rf  = proposed_df[proposed_df["Direction"] == "LONG"]
+        shorts_rf = proposed_df[proposed_df["Direction"] == "SHORT"]
+
+        total_deployed_rs  = proposed_df["Alloc_Rs"].sum()
+        long_deployed_rs   = longs_rf["Alloc_Rs"].sum()
+        short_deployed_rs  = shorts_rf["Alloc_Rs"].sum()
+        cash_remaining_rs  = nav_input - total_deployed_rs
+
+        # Transaction costs on entry (buy-side for longs, sell-side for shorts)
+        cost_rate = _TOTAL_COST_BPS / 10000
+        entry_costs_rs = total_deployed_rs * cost_rate
+        # Exit costs assumed same rate on exit (round-trip = 2×)
+        exit_costs_rs  = total_deployed_rs * cost_rate
+        total_costs_rs = entry_costs_rs + exit_costs_rs
+
+        st.markdown("<div class='section-header'>Capital Summary</div>", unsafe_allow_html=True)
+        cs1, cs2, cs3, cs4, cs5 = st.columns(5)
+        cs1.metric("Total NAV",          f"₹{nav_input:,.0f}")
+        cs2.metric("Total Deployed",     f"₹{total_deployed_rs:,.0f}",
+                   help="Long + Short book combined allocation")
+        cs3.metric("Long Book",          f"₹{long_deployed_rs:,.0f}")
+        cs4.metric("Short Book",         f"₹{short_deployed_rs:,.0f}")
+        cs5.metric("Cash Remaining",     f"₹{cash_remaining_rs:,.0f}")
+
+        st.divider()
+
+        # ── Transaction costs breakdown ────────────────────────────────────
+        st.markdown("<div class='section-header'>Transaction Costs (Round-Trip)</div>",
+                    unsafe_allow_html=True)
+
+        cost_items = {
+            "STT":          total_deployed_rs * 2 * (_STT_BPS / 10000),
+            "Brokerage":    total_deployed_rs * 2 * (_BROKERAGE_BPS / 10000),
+            "Stamp Duty":   total_deployed_rs * (_STAMP_DUTY_BPS / 10000),   # buy-side only
+            "Slippage":     total_deployed_rs * 2 * (_SLIPPAGE_BPS / 10000),
+            "Exchange/SEBI":total_deployed_rs * 2 * (_EXCHANGE_BPS / 10000),
         }
-        label, desc = regime_descriptions.get(regime_int, ("Unknown", "—"))
-        st.markdown(
-            f"<div style='padding:12px'>"
-            f"<div style='font-family:monospace;font-size:0.85rem;color:#c9d1d9;font-weight:600'>{label}</div>"
-            f"<div style='font-family:monospace;font-size:0.75rem;color:#8b949e;margin-top:6px;line-height:1.5'>{desc}</div>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-    with r3:
-        weights = {
-            0: {"XGBoost": 0.40, "LightGBM": 0.30, "LSTM": 0.30},
-            1: {"XGBoost": 0.35, "LightGBM": 0.35, "LSTM": 0.30},
-            2: {"XGBoost": 0.30, "LightGBM": 0.30, "LSTM": 0.40},
-            3: {"XGBoost": 0.40, "LightGBM": 0.40, "LSTM": 0.20},
-        }.get(regime_int, {"XGBoost": 0.40, "LightGBM": 0.30, "LSTM": 0.30})
+        total_fees_rs = sum(cost_items.values())
 
+        cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
+        for col, (label, val) in zip([cc1,cc2,cc3,cc4,cc5], cost_items.items()):
+            col.metric(label, f"₹{val:,.0f}")
+        cc6.metric("Total Costs", f"₹{total_fees_rs:,.0f}",
+                   help=f"{total_fees_rs/nav_input*100:.3f}% of NAV")
+
+        st.divider()
+
+        # ── Expected returns per position ─────────────────────────────────
+        st.markdown("<div class='section-header'>Expected Returns & Tax per Position</div>",
+                    unsafe_allow_html=True)
         st.markdown(
-            "<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;"
-            "text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px'>Ensemble Weights</div>",
+            "<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;margin-bottom:10px'>"
+            "Hold assumptions: Core Long = 12 months (LTCG) · Mid-Cap Long = 9 months (STCG) · "
+            "Short = 4 months (STCG). Expected return = Final_Rank × 30% max annual return proxy."
+            "</div>",
             unsafe_allow_html=True
         )
-        for model, w in weights.items():
-            st.markdown(
-                gauge_html(w, 1.0, f"{model}"),
-                unsafe_allow_html=True
+
+        # Check if calibrated returns available in signals CSV
+        _has_calib = "Projected_Return_21d" in signals_today.columns
+
+        # Merge calibrated returns onto proposed_df via ticker+date
+        if _has_calib:
+            _calib_cols = ["Ticker", "Projected_Return_21d", "Projected_Return_252d",
+                           "Band_Low_21d", "Band_High_21d"]
+            _calib_cols = [c for c in _calib_cols if c in signals_today.columns]
+            _sig_latest = signals_today[signals_today["Date"] == signals_today["Date"].max()]
+            proposed_df = proposed_df.merge(
+                _sig_latest[_calib_cols], on="Ticker", how="left"
             )
 
-    st.divider()
+        ret_rows = []
+        for _, row in proposed_df.iterrows():
+            direction  = row["Direction"]
+            alloc_rs   = row["Alloc_Rs"]
+            rank       = float(row.get("Final_Rank", 0.5))
+            is_midcap  = bool(row.get("is_midcap", False))
 
-    # Macro snapshot
-    st.markdown("<div class='section-header'>Latest Macro Snapshot</div>", unsafe_allow_html=True)
+            # Hold period and tax classification
+            if direction == "LONG":
+                hold_months  = 9 if is_midcap else 12
+                is_long_term = not is_midcap
+                hold_label   = "12 mo (LTCG)" if is_long_term else "9 mo (STCG)"
+            else:
+                hold_months  = 4
+                is_long_term = False
+                hold_label   = "4 mo (STCG)"
 
-    MACRO_DISPLAY = {
-        "India_VIX":         ("India VIX",           ""),
-        "USDINR":            ("USD/INR",              "₹"),
-        "Crude_Oil":         ("Crude Oil",            "$"),
-        "Gold":              ("Gold",                 "$"),
-        "Repo_Rate":         ("RBI Repo Rate",        "%"),
-        "GDP_India":         ("GDP India (QoQ)",      ""),
-        "CPI_India":         ("CPI India",            ""),
-        "Fed_Funds_Rate":    ("Fed Funds Rate",       "%"),
-        "US_10Y_Bond":       ("US 10Y Yield",         "%"),
-        "FII_Daily_Net_Cr":  ("FII Net Inflow (Day)", "₹Cr"),
-        "FII_Monthly_Net_Cr":("FII Net Inflow (Mon)", "₹Cr"),
-        "DII_Daily_Net_Cr":  ("DII Net Inflow (Day)", "₹Cr"),
-        "DII_Monthly_Net_Cr":("DII Net Inflow (Mon)", "₹Cr"),
-        "Forex_Reserves_USD":("Forex Reserves",       "$B"),
-    }
-
-    macro_cols = st.columns(4)
-    col_idx    = 0
-
-    for field, (label, unit) in MACRO_DISPLAY.items():
-        if field in macro_row.index and pd.notna(macro_row[field]):
-            val = macro_row[field]
-            try:
-                val_f = float(val)
-                if abs(val_f) >= 1_000:
-                    display = f"{unit}{val_f:,.1f}"
-                elif unit == "%":
-                    display = f"{val_f:.2f}%"
+            # Use calibrated return if available, else fall back to formula
+            proj_21d = row.get("Projected_Return_21d", float("nan"))
+            if _has_calib and pd.notna(proj_21d):
+                # Calibrated: annualised = 21d return × (252/21)
+                ann_ret        = float(proj_21d) * (252 / 21) * 100
+                exp_ret_period = float(proj_21d) * (hold_months * 21 / 21) * 100
+                # Cap at reasonable bounds
+                ann_ret        = max(-50.0, min(ann_ret, 100.0))
+                exp_ret_period = max(-50.0, min(exp_ret_period, 100.0))
+                source_label   = "calibrated"
+            else:
+                # Formula fallback (pre-calibration)
+                if direction == "LONG":
+                    ann_ret = (rank - 0.5) * 20 + 5   # rank 0.9→14%, rank 1.0→15%
                 else:
-                    display = f"{unit}{val_f:.2f}"
-            except (ValueError, TypeError):
-                display = str(val)
+                    ann_ret = (0.5 - rank) * 20 + 5
+                exp_ret_period = ann_ret / 12 * hold_months
+                source_label   = "formula"
 
-            macro_cols[col_idx % 4].metric(label, display)
-            col_idx += 1
+            gross_gain_rs   = alloc_rs * exp_ret_period / 100
+            applicable_rate = ltcg_rate if is_long_term else stcg_rate
+            taxable_gain    = max(0, gross_gain_rs - (_LTCG_EXEMPTION_INR if is_long_term else 0))
+            tax_rs          = taxable_gain * applicable_rate
+            net_gain_rs     = gross_gain_rs - tax_rs
+            entry_cost      = alloc_rs * cost_rate
+            net_after_costs = net_gain_rs - entry_cost * 2
 
-    if col_idx == 0:
-        st.info("Macro data not available. Run `python data/macro.py` and `python data/rbi_macro.py`.")
+            ret_rows.append({
+                "Ticker":              row["Ticker"].replace(".NS",""),
+                "Direction":           direction,
+                "Sector":              row.get("Sector","—"),
+                "Hold Period":         hold_label,
+                "Deployed (₹)":       f"₹{alloc_rs:,.0f}",
+                "Exp. Return (Period)":f"{exp_ret_period:.1f}%",
+                "Exp. Return (Ann.)":  f"{ann_ret:.1f}%",
+                "Gross Gain (₹)":      f"₹{gross_gain_rs:,.0f}",
+                "Tax Rate":            f"{applicable_rate:.0%}",
+                "Tax (₹)":             f"₹{tax_rs:,.0f}",
+                "Net Gain (₹)":        f"₹{net_after_costs:,.0f}",
+            })
 
-    # Macro date
-    if "Date" in macro_row.index and pd.notna(macro_row.get("Date")):
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;margin-top:8px'>"
-            f"Data as of: {str(macro_row['Date'])[:10]}</div>",
-            unsafe_allow_html=True
+        ret_df = pd.DataFrame(ret_rows)
+
+        def colour_direction(val):
+            if val == "LONG":  return "color: #3fb950; font-weight:600"
+            if val == "SHORT": return "color: #f85149; font-weight:600"
+            return ""
+
+        st.dataframe(
+            ret_df.style.map(colour_direction, subset=["Direction"]),
+            use_container_width=True, hide_index=True,
+            height=min(50 + len(ret_df)*38, 500),
         )
+
+        st.divider()
+
+        # ── Portfolio-level summary ────────────────────────────────────────
+        st.markdown("<div class='section-header'>Portfolio-Level Summary</div>",
+                    unsafe_allow_html=True)
+
+        total_gross_gain = sum(
+            float(r["Gross Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+        )
+        total_tax        = sum(
+            float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+        )
+        total_net        = sum(
+            float(r["Net Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+        )
+
+        ps1, ps2, ps3, ps4, ps5 = st.columns(5)
+        ps1.metric("Total Deployed",       f"₹{total_deployed_rs:,.0f}")
+        ps2.metric("Gross Expected Gain",   f"₹{total_gross_gain:,.0f}",
+                   help="Before tax and transaction costs")
+        ps3.metric("Total Transaction Costs",f"₹{total_fees_rs:,.0f}")
+        ps4.metric("Total Tax (Projected)", f"₹{total_tax:,.0f}",
+                   help="STCG + LTCG combined. LTCG includes ₹1L exemption per long position.")
+        ps5.metric("Net Expected Gain",     f"₹{total_net:,.0f}",
+                   help="After tax and round-trip transaction costs")
+
+        # ── Waterfall chart: NAV → Deployed → Costs → Tax → Net ──────────
+        st.markdown("<div class='section-header'>Capital Waterfall</div>",
+                    unsafe_allow_html=True)
+
+        # Waterfall: Starting NAV → Cash Held → Gross Gain → Costs → Tax → Final NAV
+        # cash_held = undeployed cash sitting aside (not put to work)
+        cash_held = cash_remaining_rs
+        final_nav = nav_input - cash_held + total_gross_gain - total_fees_rs - total_tax + cash_held
+        # Simplified: final_nav = nav_input + net_gain
+        final_nav = nav_input + total_net
+
+        wf_labels  = ["Starting NAV", "Cash Held", "Gross Gain",
+                      "Transaction Costs", "Tax", "Final NAV"]
+        wf_measures= ["absolute", "relative", "relative", "relative", "relative", "total"]
+        wf_values  = [
+            nav_input,           # absolute start
+            -cash_remaining_rs,  # cash held aside (reduces deployable)
+            total_gross_gain,    # expected gains from deployed capital
+            -total_fees_rs,      # transaction costs
+            -total_tax,          # projected tax
+            final_nav,           # total bar
+        ]
+
+        # Format y-axis tick labels in Cr/L for readability
+        def _fmt_inr(v):
+            a = abs(v)
+            if a >= 1e7: return f"₹{v/1e7:.1f}Cr"
+            if a >= 1e5: return f"₹{v/1e5:.1f}L"
+            return f"₹{v:,.0f}"
+
+        fig_wf = go.Figure(go.Waterfall(
+            name="Capital", orientation="v",
+            measure=wf_measures,
+            x=wf_labels, y=wf_values,
+            base=0,
+            connector=dict(
+                line=dict(color="#484f58", width=1, dash="dot"),
+                visible=True,
+            ),
+            increasing=dict(marker=dict(color="#3fb950", line=dict(width=0))),
+            decreasing=dict(marker=dict(color="#f85149", line=dict(width=0))),
+            totals=dict(marker=dict(color="#58a6ff", line=dict(width=0))),
+            text=[_fmt_inr(v) for v in wf_values],
+            textposition="outside",
+            textfont=dict(color="#c9d1d9", size=10),
+        ))
+        fig_wf.update_layout(
+            height=420, margin=dict(l=10, r=10, t=40, b=40),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(10,14,26,0.6)",
+            font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+            xaxis=dict(tickfont=dict(color="#8b949e", size=11), gridcolor="#1e2d40",
+                       linecolor="#30363d"),
+            yaxis=dict(
+                title="Amount (₹)",
+                tickfont=dict(color="#8b949e"),
+                gridcolor="#1e2d40",
+                linecolor="#30363d",
+                rangemode="tozero",
+                tickformat=",",
+            ),
+            showlegend=False,
+        )
+        # Add zero baseline
+        fig_wf.add_hline(y=0, line=dict(color="#30363d", width=1))
+        st.plotly_chart(fig_wf, use_container_width=True)
