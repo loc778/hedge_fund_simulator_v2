@@ -35,6 +35,19 @@ def _wrap_label(s, max_words=2):
     return "<br>".join(lines)
 
 
+def _mk(col, label, value, color="#c9d1d9"):
+    """Render a centered colored metric card (shared across all metric rows)."""
+    col.markdown(
+        f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
+        f"padding:12px 16px;text-align:center'>"
+        f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
+        f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
+        f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
+        f"font-family:monospace'>{value}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
 # ── Path setup ───────────────────────────────────────────────────────────────
 _DASH_DIR    = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_DASH_DIR)
@@ -98,7 +111,7 @@ st.markdown("""
 
     /* Tab styling — pill capsule navigation */
     [data-testid="stTabs"] { border-bottom: none !important; }
-    [data-testid="stTabs"] > div:first-child { border-bottom: none !important; }
+    [data-testid="stTabs"] > div:first-child { border-bottom: none !important; padding: 10px 0 10px 0 !important; }
     [role="tablist"] {
         justify-content: center !important;
         background: #0d1117 !important;
@@ -107,7 +120,7 @@ st.markdown("""
         padding: 5px 8px !important;
         gap: 2px !important;
         width: fit-content !important;
-        margin: 0 auto !important;
+        margin: 10px auto !important;
     }
     button[data-baseweb="tab"] {
         color: #8b949e !important;
@@ -857,13 +870,12 @@ st.divider()
 
 # Top KPIs
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Model BUY Signals",  n_buy)
-k2.metric("Model SELL Signals", n_sell)
-k3.metric("Neutral Signals",    n_hold)
-k4.metric("Universe",           500)
-k5.metric("Portfolio Positions",
-          opt_stats.n_total if opt_stats else "—")
-k6.metric("Simulation NAV", f"₹{nav_input/1e7:.2f} Cr")
+_mk(k1, "Model BUY Signals",   str(n_buy),                                        "#3fb950")
+_mk(k2, "Model SELL Signals",  str(n_sell),                                       "#f85149")
+_mk(k3, "Neutral Signals",     str(n_hold),                                       "#8b949e")
+_mk(k4, "Universe",            "500",                                             "#c9d1d9")
+_mk(k5, "Portfolio Positions", str(opt_stats.n_total) if opt_stats else "—",      "#58a6ff")
+_mk(k6, "Simulation NAV",      f"₹{nav_input/1e7:.2f} Cr",                        "#c9d1d9")
 
 st.divider()
 
@@ -1028,6 +1040,7 @@ with tab1:
                         tickfont=dict(color="#8b949e", size=10),
                         gridcolor="#1e2d40", linecolor="#1e2d40",
                         showticklabels=False,
+                        showgrid=False,
                         dtick=1,
                     ),
                 )
@@ -1074,6 +1087,7 @@ with tab1:
                         title=dict(text="Signal Count", font=dict(color="#8b949e", size=11)),
                         tickfont=dict(color="#8b949e", size=10),
                         gridcolor="#1e2d40", linecolor="#1e2d40",
+                        showgrid=False,
                         showticklabels=False,
                         dtick=1,
                     ),
@@ -1102,13 +1116,13 @@ with tab2:
 
         # ── Optimizer summary metrics ──────────────────────────────────────
         m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-        m1.metric("Total Positions",  opt_stats.n_total)
-        m2.metric("Longs",            opt_stats.n_longs)
-        m3.metric("Shorts",           opt_stats.n_shorts)
-        m4.metric("Gross Long",       f"{opt_stats.gross_long_pct:.1%}")
-        m5.metric("Gross Short",      f"{opt_stats.gross_short_pct:.1%}")
-        m6.metric("Net Exposure",     f"{opt_stats.net_exposure_pct:.1%}")
-        m7.metric("Cash",             f"{opt_stats.cash_pct:.1%}")
+        _mk(m1, "Total Positions", str(opt_stats.n_total),                    "#c9d1d9")
+        _mk(m2, "Longs",           str(opt_stats.n_longs),                    "#3fb950")
+        _mk(m3, "Shorts",          str(opt_stats.n_shorts),                   "#f85149")
+        _mk(m4, "Gross Long",      f"{opt_stats.gross_long_pct:.1%}",         "#58a6ff")
+        _mk(m5, "Gross Short",     f"{opt_stats.gross_short_pct:.1%}",        "#58a6ff")
+        _mk(m6, "Net Exposure",    f"{opt_stats.net_exposure_pct:.1%}",       "#ffffff")
+        _mk(m7, "Cash",            f"{opt_stats.cash_pct:.1%}",               "#ffffff")
 
         st.divider()
 
@@ -1126,7 +1140,8 @@ with tab2:
                 _raw_name     = proposed_df.get("Company_Name", _ticker_short).fillna(_ticker_short)
                 # Company_Name sometimes contains "Name,Direction,Sector" from CSV — strip after first comma
                 _pie_name     = _raw_name.astype(str).str.split(",").str[0].str.strip()
-                _pie_sector   = proposed_df.get("Sector", pd.Series(["—"]*len(proposed_df))).fillna("—")
+                # Sector: get directly from proposed_df (not from the fused Company_Name field)
+                _pie_sector   = proposed_df["Sector"].fillna("—") if "Sector" in proposed_df.columns else pd.Series(["—"]*len(proposed_df))
                 pie_values    = proposed_df["Size_%NAV"]
 
                 # High-contrast alternating greens for longs, reds for shorts
@@ -1145,23 +1160,21 @@ with tab2:
                         pie_colors.append(_short_palette[_short_idx % len(_short_palette)])
                         _short_idx += 1
 
+                # Pre-format hover text as single string per slice (avoids Plotly customdata[n] issues)
+                _hover_texts = [
+                    f"<b>{name}</b><br>{sector}<br>{val:.2f}% NAV"
+                    for name, sector, val in zip(_pie_name, _pie_sector, pie_values)
+                ]
+
                 fig_pie1 = go.Figure(go.Pie(
                     labels=_ticker_short,           # short ticker inside chart
                     values=pie_values,
-                    customdata=list(zip(
-                        _pie_name,
-                        _pie_sector,
-                    )),
+                    customdata=_hover_texts,
                     marker=dict(
                         colors=pie_colors,
                         line=dict(color="#0a0e1a", width=2)
                     ),
-                    hovertemplate=(
-                        "<b>Company:</b> %{customdata[0]}<br>"
-                        "<b>Sector:</b> %{customdata[1]}<br>"
-                        "<b>Allocation:</b> %{value:.2f}% NAV"
-                        "<extra></extra>"
-                    ),
+                    hovertemplate="%{customdata}<extra></extra>",
                     # Show only percent inside slice, ticker as pull-out label
                     textinfo="label+percent",
                     textposition="inside",
@@ -1310,7 +1323,7 @@ with tab3:
             st.markdown(
                 gauge_html(gl,  1.20,      "Gross Long (cap 120%)") +
                 gauge_html(gs,  0.20,      "Gross Short (cap 20%)") +
-                gauge_html(grs, GROSS_EXPOSURE_CAP_PCT, "Gross Exposure (cap 150%)"),
+                gauge_html(grs, 1.50, "Gross Exposure (cap 150%)"),
                 unsafe_allow_html=True
             )
 
@@ -1330,42 +1343,6 @@ with tab3:
                 f"</div>",
                 unsafe_allow_html=True
             )
-
-        st.divider()
-
-        # Sector utilisation
-        st.markdown("<div class='section-header'>Sector-Level Limits</div>", unsafe_allow_html=True)
-
-        if ps_final is not None:
-            sec_long_pcts  = ps_final.sector_long_pcts
-            sec_short_pcts = ps_final.sector_short_pcts
-            all_sectors    = sorted(set(list(sec_long_pcts.keys()) + list(sec_short_pcts.keys())))
-        else:
-            sec_long_pcts = sec_short_pcts = {}
-            all_sectors   = []
-
-        if all_sectors:
-            sec_rows = []
-            for sec in all_sectors:
-                long_pct  = sec_long_pcts.get(sec, 0.0)
-                short_pct = sec_short_pcts.get(sec, 0.0)
-                long_cap  = MAX_SECTOR_GROSS_LONG_FIN_PCT if sec in FINANCIAL_SECTOR_NAMES else MAX_SECTOR_GROSS_LONG_PCT
-                sec_rows.append({
-                    "Sector":    sec,
-                    "Long %NAV": f"{long_pct:.1%}",
-                    "Long Util": f"{long_pct/long_cap:.0%}",
-                    "Short %NAV":f"{short_pct:.1%}",
-                    "Short Util":f"{short_pct/MAX_SECTOR_GROSS_SHORT_PCT:.0%}" if short_pct > 0 else "—",
-                })
-
-            st.dataframe(
-                pd.DataFrame(sec_rows),
-                use_container_width=True,
-                hide_index=True,
-                height=min(50 + len(all_sectors)*38, 400),
-            )
-        else:
-            st.info("No proposed positions to assess sector limits against.")
 
         st.divider()
 
@@ -1411,6 +1388,7 @@ with tab3:
                     textposition="outside",
                     textfont=dict(color="#f85149", size=10),
                     marker_color="#f85149",
+                    width=[0.35] * len(sec_s),
                     hovertemplate="%{customdata}<br>%{y:.2f}% NAV<extra></extra>",
                     customdata=sec_s["Sector"],
                 ))
@@ -1418,6 +1396,7 @@ with tab3:
                     height=300, margin=dict(l=10,r=10,t=30,b=80),
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+                    bargap=0.6,
                     xaxis=dict(title="Sector", tickfont=dict(size=9,color="#8b949e"),
                                tickangle=-35, gridcolor="#1e2d40"),
                     yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
@@ -1492,32 +1471,22 @@ with tab4:
         port_cagr = ((merged["Portfolio_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100
         nifty_cagr = ((merged["Nifty_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100 if nifty_total_ret is not None else None
 
-        gm1, gm2, gm3, gm4 = st.columns(4)
-        def _colored_metric(col, label, value, color):
-            col.markdown(
-                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
-                f"padding:12px 16px'>"
-                f"<div style='font-size:0.75rem;color:#8b949e;text-transform:uppercase;"
-                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
-                f"<div style='font-size:1.4rem;font-weight:600;color:{color};"
-                f"font-family:monospace'>{value}</div></div>",
-                unsafe_allow_html=True,
-            )
-        _colored_metric(gm1, "Portfolio Total Return", f"{port_total_ret:+.1f}%", "#3fb950")
-        _colored_metric(gm2, "Portfolio CAGR",         f"{port_cagr:+.1f}%",      "#3fb950")
-        if nifty_total_ret is not None and not pd.isna(nifty_total_ret):
-            _colored_metric(gm3, "Nifty 500 Total Return", f"{nifty_total_ret:+.1f}%", "#e3b341")
-            _nifty_cagr_val = f"{nifty_cagr:+.1f}%" if nifty_cagr and not pd.isna(nifty_cagr) else "—"
-            _colored_metric(gm4, "Nifty 500 CAGR", _nifty_cagr_val, "#e3b341")
-        else:
-            _colored_metric(gm3, "Nifty 500 Total Return", "—", "#e3b341")
-            _colored_metric(gm4, "Nifty 500 CAGR", "—", "#e3b341")
-
-        st.divider()
-
         # ── Returns chart ─────────────────────────────────────────────────
-        st.markdown("<div class='section-header'>Portfolio vs Nifty 500 (Indexed to 100)</div>",
+        st.markdown("<div class='section-header'>Portfolio vs Nifty 500</div>",
                     unsafe_allow_html=True)
+
+        gm1, gm2, gm3, gm4 = st.columns(4)
+        _mk(gm1, "Portfolio Total Return", f"{port_total_ret:+.1f}%", "#3fb950")
+        _mk(gm2, "Portfolio CAGR",         f"{port_cagr:+.1f}%",      "#3fb950")
+        if nifty_total_ret is not None and not pd.isna(nifty_total_ret):
+            _mk(gm3, "Nifty 500 Total Return", f"{nifty_total_ret:+.1f}%", "#e3b341")
+            _nifty_cagr_val = f"{nifty_cagr:+.1f}%" if nifty_cagr and not pd.isna(nifty_cagr) else "—"
+            _mk(gm4, "Nifty 500 CAGR", _nifty_cagr_val, "#e3b341")
+        else:
+            _mk(gm3, "Nifty 500 Total Return", "—", "#e3b341")
+            _mk(gm4, "Nifty 500 CAGR", "—", "#e3b341")
+
+        st.markdown("<div style='margin-top: 20px'></div>", unsafe_allow_html=True)
 
         fig_ret = go.Figure()
         fig_ret.add_trace(go.Scatter(
@@ -1563,8 +1532,8 @@ with tab4:
         max_dd_date = merged["Date"].iloc[drawdown.idxmin()]
 
         _dd_l, dd_metric1, dd_metric2, _dd_r = st.columns([1, 1, 1, 1])
-        dd_metric1.metric("Max Drawdown", f"{max_dd:.2f}%")
-        dd_metric2.metric("Max DD Date",  max_dd_date.strftime("%d %b %Y"))
+        _mk(dd_metric1, "Max Drawdown", f"{max_dd:.2f}%", "#f85149")
+        _mk(dd_metric2, "Max DD Date",  max_dd_date.strftime("%d %b %Y"), "#c9d1d9")
 
         fig_dd = go.Figure()
         fig_dd.add_trace(go.Scatter(
@@ -1669,21 +1638,11 @@ with tab6:
 
         st.markdown("<div class='section-header'>Capital Summary</div>", unsafe_allow_html=True)
         cs1, cs2, cs3, cs4, cs5 = st.columns(5)
-        def _cm2(col, label, value, color):
-            col.markdown(
-                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
-                f"padding:12px 16px;text-align:center'>"
-                f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
-                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
-                f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
-                f"font-family:monospace'>{value}</div></div>",
-                unsafe_allow_html=True,
-            )
-        _cm2(cs1, "Total NAV",      f"₹{nav_input:,.0f}",          "#c9d1d9")
-        _cm2(cs2, "Total Deployed", f"₹{total_deployed_rs:,.0f}",  "#c9d1d9")
-        _cm2(cs3, "Long Book",      f"₹{long_deployed_rs:,.0f}",   "#3fb950")
-        _cm2(cs4, "Short Book",     f"₹{short_deployed_rs:,.0f}",  "#f85149")
-        _cm2(cs5, "Cash Remaining", f"₹{cash_remaining_rs:,.0f}",  "#e3b341")
+        _mk(cs1, "Total NAV",      f"₹{nav_input:,.0f}",         "#c9d1d9")
+        _mk(cs2, "Total Deployed", f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
+        _mk(cs3, "Long Book",      f"₹{long_deployed_rs:,.0f}",  "#3fb950")
+        _mk(cs4, "Short Book",     f"₹{short_deployed_rs:,.0f}", "#f85149")
+        _mk(cs5, "Cash Remaining", f"₹{cash_remaining_rs:,.0f}", "#ffffff")
 
         st.divider()
 
@@ -1710,6 +1669,29 @@ with tab6:
             proposed_df = proposed_df.merge(
                 _sig_latest[_calib_cols], on="Ticker", how="left"
             )
+
+        # Always (re-)merge Final_Rank from signals_today to ensure distinct per-ticker values.
+        # The optimizer may store rounded ranks; signals_today has the raw per-ticker values.
+        # NOTE: Ticker format must be normalised before merging (.NS suffix may differ between
+        #       proposed_df (always .NS) and signals_today (may or may not have .NS).
+        if "Final_Rank" in signals_today.columns:
+            _sig_latest = signals_today[signals_today["Date"] == signals_today["Date"].max()].copy()
+            # Normalise both sides to bare ticker (no .NS) for reliable join
+            _sig_latest["_Ticker_bare"] = _sig_latest["Ticker"].str.replace(r"\.NS$", "", regex=True)
+            _sig_latest_ranks = (
+                _sig_latest[["_Ticker_bare", "Final_Rank"]]
+                .drop_duplicates("_Ticker_bare")
+            )
+            # Keep original Final_Rank from optimizer as fallback (already distinct per ticker)
+            _orig_ranks = proposed_df[["Ticker", "Final_Rank"]].copy() if "Final_Rank" in proposed_df.columns else None
+            proposed_df["_Ticker_bare"] = proposed_df["Ticker"].str.replace(r"\.NS$", "", regex=True)
+            proposed_df = proposed_df.drop(columns=["Final_Rank"], errors="ignore")
+            proposed_df = proposed_df.merge(_sig_latest_ranks, on="_Ticker_bare", how="left")
+            proposed_df = proposed_df.drop(columns=["_Ticker_bare"], errors="ignore")
+            # If re-merge failed (all NaN), fall back to optimizer's own per-ticker ranks
+            if proposed_df["Final_Rank"].isna().all() and _orig_ranks is not None:
+                proposed_df = proposed_df.merge(_orig_ranks, on="Ticker", how="left")
+            proposed_df["Final_Rank"] = proposed_df["Final_Rank"].fillna(0.5)
 
         ret_rows = []
         for _, row in proposed_df.iterrows():
@@ -1739,11 +1721,11 @@ with tab6:
                 exp_ret_period = max(-50.0, min(exp_ret_period, 100.0))
                 source_label   = "calibrated"
             else:
-                # Formula fallback (pre-calibration)
+                # Formula fallback (pre-calibration): Final_Rank × 30% max annual return proxy
                 if direction == "LONG":
-                    ann_ret = (rank - 0.5) * 20 + 5   # rank 0.9→14%, rank 1.0→15%
+                    ann_ret = rank * 30.0   # rank 1.0 → 30%, rank 0.5 → 15%, rank 0.0 → 0%
                 else:
-                    ann_ret = (0.5 - rank) * 20 + 5
+                    ann_ret = (1.0 - rank) * 30.0   # inverse for shorts
                 exp_ret_period = ann_ret / 12 * hold_months
                 source_label   = "formula"
 
@@ -1782,7 +1764,7 @@ with tab6:
             _abs_ret_pct = ((_gross_gain_sum - _tax_sum - _tc_sum) / total_deployed_rs) * 100
             _exp_color   = "#3fb950" if _exp_ret_pct >= 0 else "#f85149"
             _header_exp_ret_placeholder.markdown(
-                f"<div style='text-align:center;padding:0 12px'>"
+                f"<div style='text-align:center;padding:0 12px;padding-top:6px'>"
                 f"<div style='font-size:0.62rem;color:#8b949e;text-transform:uppercase;"
                 f"letter-spacing:0.1em;margin-bottom:2px'>Expected Return</div>"
                 f"<div style='font-size:1.0rem;color:{_exp_color};font-weight:700;"
@@ -1827,22 +1809,14 @@ with tab6:
         )
 
         def _cm(col, label, value, color):
-            col.markdown(
-                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
-                f"padding:12px 16px;text-align:center'>"
-                f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
-                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
-                f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
-                f"font-family:monospace'>{value}</div></div>",
-                unsafe_allow_html=True,
-            )
+            _mk(col, label, value, color)
 
         ps1, ps2, ps3, ps4, ps5 = st.columns(5)
-        _cm(ps1, "Total Deployed",        f"₹{total_deployed_rs:,.0f}",  "#c9d1d9")
-        _cm(ps2, "Gross Expected Gain",   f"₹{total_gross_gain:,.0f}",   "#3fb950")
-        _cm(ps3, "Total Transaction Costs",f"₹{total_fees_rs:,.0f}",     "#f85149")
-        _cm(ps4, "Total Tax (Projected)", f"₹{total_tax:,.0f}",          "#f85149")
-        _cm(ps5, "Net Expected Gain",     f"₹{total_net:,.0f}",          "#3fb950")
+        _mk(ps1, "Total Deployed",         f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
+        _mk(ps2, "Gross Expected Gain",    f"₹{total_gross_gain:,.0f}",  "#3fb950")
+        _mk(ps3, "Total Transaction Costs",f"₹{total_fees_rs:,.0f}",     "#f85149")
+        _mk(ps4, "Total Tax (Projected)",  f"₹{total_tax:,.0f}",         "#f85149")
+        _mk(ps5, "Net Expected Gain",      f"₹{total_net:,.0f}",         "#3fb950")
 
         # ── Waterfall chart: NAV → Deployed → Costs → Tax → Net ──────────
         st.markdown("<div class='section-header'>Capital Waterfall</div>",
