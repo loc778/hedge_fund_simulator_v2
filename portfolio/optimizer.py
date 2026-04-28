@@ -1,69 +1,4 @@
-# portfolio/optimizer.py
-"""
-AI Hedge Fund Simulator v2 — Portfolio Optimizer
-=================================================
-Converts ensemble signals into a fully risk-checked, sized position book.
-
-Entry point
------------
-    result = optimize_portfolio(signals_df, nav, regime_int, engine, sector_map_df)
-
-Returns
--------
-    OptimizedPortfolio dataclass containing:
-        positions       : pd.DataFrame — final approved book
-        rejected        : pd.DataFrame — candidates rejected by risk checks
-        stats           : PortfolioStats dataclass — book-level metrics
-        portfolio_state : PortfolioState — final state after all positions added
-
-Optimization logic
-------------------
-    1. Candidate selection
-           BUY  candidates : Final_Rank >= LONG_RANK_THRESHOLD  (top decile)
-           SELL candidates : Final_Rank <= SHORT_RANK_THRESHOLD (bottom decile)
-           Sorted by rank (best first for longs, worst first for shorts)
-
-    2. Regime-aware deployment cap
-           Bull     : 92% of NAV deployed
-           Sideways : 90%
-           Bear     : 80%
-           High Vol : 75%
-
-    3. Sizing — inverse ATR_pct risk parity
-           ATR_pct  = ATR_14 / Adj_Close  (normalised, prevents low-price overweighting)
-           raw_w    = 1 / ATR_pct
-           Longs    : weights normalised so long book = LONG_TARGET_PCT of NAV
-           Shorts   : weights normalised so short book = SHORT_TARGET_PCT of NAV
-           Both     : clipped at single-position caps before normalisation
-
-    4. Position selection loop
-           Greedy: iterate candidates by rank priority, run check_position() on
-           each, apply any REDUCED size, skip REJECTED.
-           Stop when MAX_POSITIONS reached or exposure caps hit.
-
-    5. All risk rules enforced via risk_manager.check_position() — no duplicate
-       logic here. Optimizer only handles selection and sizing.
-
-Architecture constraints enforced
------------------------------------
-    MAX_POSITIONS        = 55  (hard cap, longs + shorts combined)
-    MIN_POSITIONS        = 30  (regime-dependent floor, informational warning)
-    LONG_TARGET_PCT      = 1.15 of NAV (target, not hard cap — hard cap is 1.20)
-    SHORT_TARGET_PCT     = 0.15 of NAV (target, not hard cap — hard cap is 0.20)
-    LONG_RANK_THRESHOLD  = 0.90 (top decile)
-    SHORT_RANK_THRESHOLD = 0.10 (bottom decile)
-    CASH_RESERVE_MIN     = 0.08 (floor)
-    Regime deploy caps   : Bull 0.92, Sideways 0.90, Bear 0.80, HighVol 0.75
-
-Dependencies
-------------
-    risk/risk_manager.py    — position-level and portfolio-level checks
-    nifty500_indicators     — ATR_14, Adj_Close (latest row per ticker)
-    config.py               — TABLES, SECTOR_MAP
-"""
-
 from __future__ import annotations
-
 import os
 import sys
 import warnings
@@ -94,22 +29,23 @@ from risk.risk_manager import (
 
 # ── Optimizer constants ───────────────────────────────────────────────────────
 
-MAX_POSITIONS         = 55      # hard cap: longs + shorts combined
-MIN_POSITIONS         = 30      # floor (warning only, not enforced)
-LONG_RANK_THRESHOLD   = 0.90    # Final_Rank >= this → BUY candidate
-SHORT_RANK_THRESHOLD  = 0.10    # Final_Rank <= this → SELL candidate
+MAX_POSITIONS         = 45      # hard cap: longs + shorts combined (fewer, higher conviction)
+MIN_POSITIONS         = 25      # floor (warning only, not enforced)
+LONG_RANK_THRESHOLD   = 0.82    # Final_Rank >= this → BUY candidate (slightly wider to fill slots)
+SHORT_RANK_THRESHOLD  = 0.08    # Final_Rank <= this → SELL candidate (tighter = fewer shorts)
 
-LONG_TARGET_PCT       = 1.15    # target gross long as fraction of NAV
-SHORT_TARGET_PCT      = 0.15    # target gross short as fraction of NAV
-LONG_HARD_CAP_PCT     = 1.20    # hard cap gross long
-SHORT_HARD_CAP_PCT    = 0.20    # hard cap gross short
+LONG_TARGET_PCT       = 1.30    # ↑ target gross long as fraction of NAV (was 1.15)
+SHORT_TARGET_PCT      = 0.10    # ↓ target gross short (was 0.15) — less drag, more net long
+LONG_HARD_CAP_PCT     = 1.35    # hard cap gross long
+SHORT_HARD_CAP_PCT    = 0.15    # hard cap gross short
 
 # Regime-aware maximum deployable NAV fraction (cash floor is the complement)
+# Raised across the board — the old values left too much idle cash suppressing returns
 REGIME_DEPLOY_CAP = {
-    0: 0.92,   # Bull
-    1: 0.80,   # Bear
-    2: 0.75,   # High Volatility
-    3: 0.90,   # Sideways
+    0: 0.97,   # Bull       — nearly fully deployed
+    1: 0.88,   # Bear       — more cautious but still active
+    2: 0.90,   # High Vol   — was 0.85, slight raise; ATR sizing auto-reduces anyway
+    3: 0.94,   # Sideways   — was 0.90
 }
 
 # Tier → is_midcap mapping (Tier 2 = mid-cap proxy)
@@ -270,9 +206,24 @@ def _compute_sizes(
     if candidates.empty:
         return pd.Series(dtype=float)
 
-    # Inverse-vol weights
+    # Rank-conviction-weighted inverse-vol sizing:
+    # Combine inverse ATR (risk parity) with Final_Rank signal strength.
+    # This ensures rank-0.99 names are sized up vs rank-0.85 names.
     inv_vol = 1.0 / candidates["ATR_pct"].clip(lower=0.005)
-    raw_w   = inv_vol / inv_vol.sum()
+
+    if "Final_Rank" in candidates.columns:
+        if direction == "long":
+            # For longs: rank above threshold carries conviction weight
+            conviction = candidates["Final_Rank"].clip(lower=0.0, upper=1.0)
+        else:
+            # For shorts: inverted rank (lower rank = more conviction short)
+            conviction = (1.0 - candidates["Final_Rank"]).clip(lower=0.0, upper=1.0)
+        # Blend: 60% risk-parity, 40% conviction — prevents pure vol dominance
+        combined_w = 0.60 * inv_vol + 0.40 * (conviction / conviction.sum() * len(conviction))
+    else:
+        combined_w = inv_vol
+
+    raw_w   = combined_w / combined_w.sum()
 
     # Per-position cap depends on direction and tier
     if direction == "long":
@@ -397,11 +348,12 @@ def optimize_portfolio(
         long_slots  = MAX_POSITIONS
         short_slots = 0
     else:
-        # Natural split: rank-decile proportions, but at least 5 longs if any exist
-        long_slots  = max(5, round(MAX_POSITIONS * n_long_cands / total_cands))
-        short_slots = MAX_POSITIONS - long_slots
-        long_slots  = min(long_slots,  n_long_cands)
-        short_slots = min(short_slots, n_short_cands)
+        # Bias heavily toward longs: shorts capped at 20% of MAX_POSITIONS slots
+        # This prevents a balanced signal count from wasting slots on shorts
+        max_short_slots = max(3, round(MAX_POSITIONS * 0.20))  # ≤ 20% slots to shorts
+        short_slots = min(max_short_slots, n_short_cands)
+        long_slots  = min(MAX_POSITIONS - short_slots, n_long_cands)
+        long_slots  = max(long_slots, min(5, n_long_cands))  # at least 5 longs
 
     # Take top candidates by rank within each slot budget
     long_pool  = long_cands.head(long_slots).reset_index(drop=True)

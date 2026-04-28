@@ -57,28 +57,28 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # Position-level
-MAX_SINGLE_CORE_LONG_PCT   = 0.05    # P1 — core long (Nifty 100 / large-cap)
-MAX_SINGLE_MIDCAP_LONG_PCT = 0.03    # P2 — alpha long (Nifty 101–500)
-MAX_SINGLE_SHORT_PCT       = 0.025   # P3 — any short
-LONG_STOP_LOSS_PCT         = -0.15   # P4 — -15% from entry triggers exit
-SHORT_STOP_LOSS_PCT        = 0.10    # P5 — +10% move against short triggers exit
-MIN_POSITION_SIZE_PCT      = 0.005   # P6 — 0.5% minimum new position
+MAX_SINGLE_CORE_LONG_PCT   = 0.08    # P1 — raised from 5% → 8% for large-cap conviction
+MAX_SINGLE_MIDCAP_LONG_PCT = 0.05    # P2 — raised from 3% → 5% for mid-cap alpha
+MAX_SINGLE_SHORT_PCT       = 0.025   # P3 — unchanged (shorts stay small)
+LONG_STOP_LOSS_PCT         = -0.15   # P4 — unchanged
+SHORT_STOP_LOSS_PCT        = 0.10    # P5 — unchanged
+MIN_POSITION_SIZE_PCT      = 0.005   # P6 — unchanged
 
 # Sector-level
-MAX_SECTOR_GROSS_LONG_PCT     = 0.25  # S1 — default
-MAX_SECTOR_GROSS_LONG_FIN_PCT = 0.30  # S1 exception — Financials sector
-MAX_SECTOR_GROSS_SHORT_PCT    = 0.15  # S2
-MIN_SECTOR_COUNT_LONG         = 5     # S3 — distinct sectors in long book
+MAX_SECTOR_GROSS_LONG_PCT     = 0.30  # S1 — raised from 25%; allows meaningful sector tilts
+MAX_SECTOR_GROSS_LONG_FIN_PCT = 0.35  # S1 exception — Financials sector (raised from 30%)
+MAX_SECTOR_GROSS_SHORT_PCT    = 0.15  # S2 — unchanged
+MIN_SECTOR_COUNT_LONG         = 5     # S3 — unchanged
 
 # Portfolio-level
-NET_EXPOSURE_MIN_PCT   = 0.70   # PT1 — lower bound
-NET_EXPOSURE_MAX_PCT   = 1.10   # PT1 — upper bound
-GROSS_EXPOSURE_CAP_PCT = 1.50   # PT2
-CASH_RESERVE_MIN_PCT   = 0.08   # PT3 — hard floor
-CASH_RESERVE_TEMP_PCT  = 0.05   # PT3 — temporary floor (≤10 session exception)
-MIDCAP_LONG_BOOK_MAX   = 0.35   # PT4 — mid-cap as % of long book
-DRAWDOWN_REVIEW_PCT    = -0.05  # PT5 — 21-day rolling trigger
-PEAK_TROUGH_STOP_PCT   = -0.10  # PT6 — hard stop from NAV peak
+NET_EXPOSURE_MIN_PCT   = 0.80   # PT1 — raised from 70% — enforce minimum long bias
+NET_EXPOSURE_MAX_PCT   = 1.25   # PT1 — raised from 110% to match LONG_TARGET_PCT
+GROSS_EXPOSURE_CAP_PCT = 1.60   # PT2 — raised from 150% (longs 135% + shorts 15% = 150%)
+CASH_RESERVE_MIN_PCT   = 0.05   # PT3 — reduced from 8% → 5%; was leaving too much idle
+CASH_RESERVE_TEMP_PCT  = 0.03   # PT3 — temporary floor reduced proportionally
+MIDCAP_LONG_BOOK_MAX   = 0.40   # PT4 — raised from 35%; mid-caps drive alpha
+DRAWDOWN_REVIEW_PCT    = -0.05  # PT5 — unchanged
+PEAK_TROUGH_STOP_PCT   = -0.10  # PT6 — unchanged
 
 # Seasonal
 FII_SINGLE_SESSION_SELL_CR = 5_000   # IR4 — single session net sell threshold (Crores)

@@ -96,27 +96,42 @@ st.markdown("""
     [data-testid="stMetricLabel"]  { color: #8b949e !important; font-size: 0.75rem !important; text-transform: uppercase; letter-spacing: 0.08em; }
     [data-testid="stMetricDelta"]  { font-size: 0.8rem !important; }
 
-    /* Tab styling */
-    /* Single tab bar — remove Streamlit default red underline */
+    /* Tab styling — pill capsule navigation */
     [data-testid="stTabs"] { border-bottom: none !important; }
-    [data-testid="stTabs"] > div:first-child {
-        border-bottom: 1px solid #1e2d40 !important;
+    [data-testid="stTabs"] > div:first-child { border-bottom: none !important; }
+    [role="tablist"] {
+        justify-content: center !important;
+        background: #0d1117 !important;
+        border: 1px solid #1e2d40 !important;
+        border-radius: 50px !important;
+        padding: 5px 8px !important;
+        gap: 2px !important;
+        width: fit-content !important;
+        margin: 0 auto !important;
     }
     button[data-baseweb="tab"] {
         color: #8b949e !important;
-        font-size: 0.85rem !important;
+        font-size: 0.82rem !important;
         font-family: 'JetBrains Mono', monospace !important;
         text-transform: uppercase !important;
-        letter-spacing: 0.06em !important;
-        border-bottom: 2px solid transparent !important;
+        letter-spacing: 0.05em !important;
+        border: none !important;
+        border-radius: 50px !important;
+        padding: 7px 20px !important;
         background: transparent !important;
+        white-space: nowrap !important;
+    }
+    button[data-baseweb="tab"]:hover {
+        color: #c9d1d9 !important;
+        background: #1e2d40 !important;
     }
     button[data-baseweb="tab"][aria-selected="true"] {
-        color: #58a6ff !important;
-        border-bottom: 2px solid #58a6ff !important;
+        color: #ffffff !important;
+        background: #1e2d40 !important;
+        font-weight: 600 !important;
     }
-    /* Hide the sliding red indicator */
-    [data-testid="stTabs"] [role="tablist"] > div[data-baseweb="tab-highlight"] {
+    [data-testid="stTabs"] [role="tablist"] > div[data-baseweb="tab-highlight"],
+    [data-testid="stTabs"] [role="tablist"] > div[data-baseweb="tab-border"] {
         display: none !important;
     }
 
@@ -824,29 +839,30 @@ with _h2:
         )
 
 with _h3:
-    st.markdown(
-        f"<div style='text-align:right;padding-top:6px'>"
-        f"<div style='font-family:monospace;font-size:0.65rem;color:#8b949e;"
-        f"text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px'>Market Regime</div>"
-        f"{regime_pill(regime_int)}"
-        f"</div>",
-        unsafe_allow_html=True
-    )
+    _h3_left, _h3_right = st.columns([1, 1])
+    with _h3_right:
+        _header_regime = st.empty()
+        _header_regime.markdown(
+            f"<div style='text-align:right;padding-top:6px'>"
+            f"<div style='font-family:monospace;font-size:0.62rem;color:#8b949e;"
+            f"text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px'>Market Regime</div>"
+            f"{regime_pill(regime_int)}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    with _h3_left:
+        _header_exp_ret_placeholder = st.empty()
 
 st.divider()
 
 # Top KPIs
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Model BUY Signals",  n_buy,
-          help="Stocks ranked in top 10% by ensemble. Raw model output — not all enter the portfolio.")
-k2.metric("Model SELL Signals", n_sell,
-          help="Stocks ranked in bottom 10% by ensemble. Raw model output.")
-k3.metric("Neutral Signals",    n_hold,
-          help="Stocks with no directional conviction — model rank between bottom and top decile.")
+k1.metric("Model BUY Signals",  n_buy)
+k2.metric("Model SELL Signals", n_sell)
+k3.metric("Neutral Signals",    n_hold)
 k4.metric("Universe",           500)
 k5.metric("Portfolio Positions",
-          opt_stats.n_total if opt_stats else "—",
-          help="Actual positions after optimizer + risk checks. Max 55.")
+          opt_stats.n_total if opt_stats else "—")
 k6.metric("Simulation NAV", f"₹{nav_input/1e7:.2f} Cr")
 
 st.divider()
@@ -857,7 +873,7 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 
 tab1, tab2, tab3, tab4, tab6 = st.tabs([
-    "SIGNALS", "PORTFOLIO", "RISK", "GRAPHS", "RETURNS & FEES"
+    "SIGNALS", "PORTFOLIO", "RISK", "BACKTEST GRAPHS", "RETURNS & TAXES"
 ])
 
 
@@ -996,20 +1012,22 @@ with tab1:
                     hovertext=buys_sector["Sector"],
                 ))
                 fig.update_layout(
-                    height=300,
-                    margin=dict(l=10, r=10, t=30, b=20),
+                    height=350,
+                    margin=dict(l=10, r=10, t=30, b=160),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
                     xaxis=dict(
                         title=dict(text="Sector", font=dict(color="#8b949e", size=11)),
-                        tickfont=dict(color="#8b949e", size=10),
+                        tickfont=dict(color="#8b949e", size=9),
+                        tickangle=-35,
                         gridcolor="#1e2d40", linecolor="#1e2d40",
                     ),
                     yaxis=dict(
-                        title=dict(text="Number of BUY Signals", font=dict(color="#8b949e", size=11)),
+                        title=dict(text="Signal Count", font=dict(color="#8b949e", size=11)),
                         tickfont=dict(color="#8b949e", size=10),
                         gridcolor="#1e2d40", linecolor="#1e2d40",
+                        showticklabels=False,
                         dtick=1,
                     ),
                 )
@@ -1041,20 +1059,22 @@ with tab1:
                     customdata=sells_sector["Sector"],
                 ))
                 fig_sell.update_layout(
-                    height=300,
-                    margin=dict(l=10, r=10, t=30, b=20),
+                    height=350,
+                    margin=dict(l=10, r=10, t=30, b=160),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
                     xaxis=dict(
                         title=dict(text="Sector", font=dict(color="#8b949e", size=11)),
-                        tickfont=dict(color="#8b949e", size=10),
+                        tickfont=dict(color="#8b949e", size=9),
+                        tickangle=-35,
                         gridcolor="#1e2d40", linecolor="#1e2d40",
                     ),
                     yaxis=dict(
-                        title=dict(text="Number of SELL Signals", font=dict(color="#8b949e", size=11)),
+                        title=dict(text="Signal Count", font=dict(color="#8b949e", size=11)),
                         tickfont=dict(color="#8b949e", size=10),
                         gridcolor="#1e2d40", linecolor="#1e2d40",
+                        showticklabels=False,
                         dtick=1,
                     ),
                 )
@@ -1103,7 +1123,10 @@ with tab2:
             if not proposed_df.empty:
                 # Use ticker as short label inside chart, full company name on hover
                 _ticker_short = proposed_df["Ticker"].str.replace(".NS","",regex=False)
-                _pie_name     = proposed_df.get("Company_Name", _ticker_short).fillna(_ticker_short)
+                _raw_name     = proposed_df.get("Company_Name", _ticker_short).fillna(_ticker_short)
+                # Company_Name sometimes contains "Name,Direction,Sector" from CSV — strip after first comma
+                _pie_name     = _raw_name.astype(str).str.split(",").str[0].str.strip()
+                _pie_sector   = proposed_df.get("Sector", pd.Series(["—"]*len(proposed_df))).fillna("—")
                 pie_values    = proposed_df["Size_%NAV"]
 
                 # High-contrast alternating greens for longs, reds for shorts
@@ -1125,17 +1148,18 @@ with tab2:
                 fig_pie1 = go.Figure(go.Pie(
                     labels=_ticker_short,           # short ticker inside chart
                     values=pie_values,
-                    customdata=list(zip(_pie_name, proposed_df["Direction"],
-                                       proposed_df["Sector"])),
+                    customdata=list(zip(
+                        _pie_name,
+                        _pie_sector,
+                    )),
                     marker=dict(
                         colors=pie_colors,
                         line=dict(color="#0a0e1a", width=2)
                     ),
                     hovertemplate=(
-                        "<b>%{customdata[0]}</b><br>"
-                        "Direction: %{customdata[1]}<br>"
-                        "Sector: %{customdata[2]}<br>"
-                        "Allocation: %{value:.2f}% NAV"
+                        "<b>Company:</b> %{customdata[0]}<br>"
+                        "<b>Sector:</b> %{customdata[1]}<br>"
+                        "<b>Allocation:</b> %{value:.2f}% NAV"
                         "<extra></extra>"
                     ),
                     # Show only percent inside slice, ticker as pull-out label
@@ -1365,17 +1389,15 @@ with tab3:
                     customdata=sec_l["Sector"],
                 ))
                 fig_sl.update_layout(
-                    height=300, margin=dict(l=10,r=10,t=30,b=20),
+                    height=300, margin=dict(l=10,r=10,t=30,b=80),
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                    xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e",),
-                               tickangle=0, gridcolor="#1e2d40"),
+                    xaxis=dict(title="Sector", tickfont=dict(size=9,color="#8b949e"),
+                               tickangle=-35, gridcolor="#1e2d40"),
                     yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
                                gridcolor="#1e2d40"),
                 )
                 st.plotly_chart(fig_sl, use_container_width=True)
-
-        # Short book sector allocation
         st.markdown("<div class='section-header'>Short Book — Sector Allocation</div>",
                     unsafe_allow_html=True)
         if not proposed_df.empty:
@@ -1393,11 +1415,11 @@ with tab3:
                     customdata=sec_s["Sector"],
                 ))
                 fig_ss.update_layout(
-                    height=300, margin=dict(l=10,r=10,t=30,b=20),
+                    height=300, margin=dict(l=10,r=10,t=30,b=80),
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                    xaxis=dict(title="Sector", tickfont=dict(size=10,color="#8b949e"),
-                               tickangle=0, gridcolor="#1e2d40"),
+                    xaxis=dict(title="Sector", tickfont=dict(size=9,color="#8b949e"),
+                               tickangle=-35, gridcolor="#1e2d40"),
                     yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
                                gridcolor="#1e2d40"),
                 )
@@ -1421,6 +1443,7 @@ with tab3:
 
 with tab4:
 
+    import numpy as np
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -1470,16 +1493,25 @@ with tab4:
         nifty_cagr = ((merged["Nifty_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100 if nifty_total_ret is not None else None
 
         gm1, gm2, gm3, gm4 = st.columns(4)
-        gm1.metric("Portfolio Total Return", f"{port_total_ret:+.1f}%")
-        gm2.metric("Portfolio CAGR",         f"{port_cagr:+.1f}%")
+        def _colored_metric(col, label, value, color):
+            col.markdown(
+                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
+                f"padding:12px 16px'>"
+                f"<div style='font-size:0.75rem;color:#8b949e;text-transform:uppercase;"
+                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
+                f"<div style='font-size:1.4rem;font-weight:600;color:{color};"
+                f"font-family:monospace'>{value}</div></div>",
+                unsafe_allow_html=True,
+            )
+        _colored_metric(gm1, "Portfolio Total Return", f"{port_total_ret:+.1f}%", "#3fb950")
+        _colored_metric(gm2, "Portfolio CAGR",         f"{port_cagr:+.1f}%",      "#3fb950")
         if nifty_total_ret is not None and not pd.isna(nifty_total_ret):
-            gm3.metric("Nifty 500 Total Return", f"{nifty_total_ret:+.1f}%",
-                       delta=f"{port_total_ret - nifty_total_ret:+.1f}% alpha")
-            gm4.metric("Nifty 500 CAGR",
-                       f"{nifty_cagr:+.1f}%" if nifty_cagr and not pd.isna(nifty_cagr) else "—")
+            _colored_metric(gm3, "Nifty 500 Total Return", f"{nifty_total_ret:+.1f}%", "#e3b341")
+            _nifty_cagr_val = f"{nifty_cagr:+.1f}%" if nifty_cagr and not pd.isna(nifty_cagr) else "—"
+            _colored_metric(gm4, "Nifty 500 CAGR", _nifty_cagr_val, "#e3b341")
         else:
-            gm3.metric("Nifty 500 Total Return", "—", help="Benchmark data unavailable for this date range")
-            gm4.metric("Nifty 500 CAGR", "—")
+            _colored_metric(gm3, "Nifty 500 Total Return", "—", "#e3b341")
+            _colored_metric(gm4, "Nifty 500 CAGR", "—", "#e3b341")
 
         st.divider()
 
@@ -1490,9 +1522,9 @@ with tab4:
         fig_ret = go.Figure()
         fig_ret.add_trace(go.Scatter(
             x=merged["Date"], y=merged["Portfolio_Idx"].round(2),
-            name="Portfolio", line=dict(color="#58a6ff", width=2),
+            name="Portfolio", line=dict(color="#3fb950", width=2.5, dash="dash"),
             hovertemplate="Date: %{x|%d %b %Y}<br>Portfolio: %{y:.2f}<extra></extra>",
-            fill="tozeroy", fillcolor="rgba(88,166,255,0.08)",
+            fill="tozeroy", fillcolor="rgba(63,185,80,0.06)",
         ))
         if merged["Nifty_Idx"].notna().any():
             fig_ret.add_trace(go.Scatter(
@@ -1500,6 +1532,10 @@ with tab4:
                 name="Nifty 500", line=dict(color="#e3b341", width=1.5, dash="dot"),
                 hovertemplate="Date: %{x|%d %b %Y}<br>Nifty 500: %{y:.2f}<extra></extra>",
             ))
+        _ret_max = max(
+            merged["Portfolio_Idx"].max() if not merged["Portfolio_Idx"].empty else 100,
+            merged["Nifty_Idx"].max() if merged["Nifty_Idx"].notna().any() else 100,
+        ) * 1.05
         fig_ret.update_layout(
             height=380, margin=dict(l=10, r=10, t=10, b=40),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -1508,8 +1544,9 @@ with tab4:
             hovermode="x unified",
             xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
                        tickfont=dict(color="#8b949e")),
-            yaxis=dict(title="Index (Base=100)", gridcolor="#1e2d40",
-                       linecolor="#1e2d40", tickfont=dict(color="#8b949e")),
+            yaxis=dict(title="Indexed Return (Base = 100)", gridcolor="#1e2d40",
+                       linecolor="#1e2d40", tickfont=dict(color="#8b949e"),
+                       range=[80, _ret_max]),
         )
         st.plotly_chart(fig_ret, use_container_width=True)
 
@@ -1525,7 +1562,7 @@ with tab4:
         max_dd      = drawdown.min()
         max_dd_date = merged["Date"].iloc[drawdown.idxmin()]
 
-        dd_metric1, dd_metric2 = st.columns(2)
+        _dd_l, dd_metric1, dd_metric2, _dd_r = st.columns([1, 1, 1, 1])
         dd_metric1.metric("Max Drawdown", f"{max_dd:.2f}%")
         dd_metric2.metric("Max DD Date",  max_dd_date.strftime("%d %b %Y"))
 
@@ -1549,6 +1586,56 @@ with tab4:
         )
         st.plotly_chart(fig_dd, use_container_width=True)
 
+        st.divider()
+
+        # ── Rolling Sharpe chart ──────────────────────────────────────────
+        st.markdown("<div class='section-header'>Rolling Sharpe Ratio (63-Day)</div>",
+                    unsafe_allow_html=True)
+
+        port_daily_rets = merged["Portfolio_Idx"].pct_change().dropna()
+        roll_window     = 63
+        rolling_sharpe  = (
+            port_daily_rets.rolling(roll_window).mean() /
+            port_daily_rets.rolling(roll_window).std()
+        ) * np.sqrt(252)
+        rolling_sharpe  = rolling_sharpe.reindex(merged.index)
+
+        # Drop leading NaN so chart starts flush with first valid Sharpe value
+        _first_valid    = rolling_sharpe.first_valid_index()
+        _rs_dates       = merged["Date"]
+        if _first_valid is not None:
+            _rs_mask    = merged.index >= _first_valid
+            _rs_dates   = merged.loc[_rs_mask, "Date"]
+            rolling_sharpe = rolling_sharpe.loc[_rs_mask]
+
+        fig_rs = go.Figure()
+        fig_rs.add_trace(go.Scatter(
+            x=_rs_dates, y=rolling_sharpe.round(3),
+            name="Rolling Sharpe", line=dict(color="#bc8cff", width=1.5),
+            hovertemplate="Date: %{x|%d %b %Y}<br>Sharpe: %{y:.3f}<extra></extra>",
+            fill="tozeroy", fillcolor="rgba(188,140,255,0.08)",
+        ))
+        fig_rs.add_hline(y=0,   line=dict(color="#484f58", width=1))
+        fig_rs.add_hline(y=1.0, line=dict(color="#3fb950", width=1, dash="dot"),
+                         annotation_text="Sharpe=1",
+                         annotation_font=dict(color="#3fb950", size=10))
+        fig_rs.update_layout(
+            height=280, margin=dict(l=10, r=10, t=10, b=40),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
+            hovermode="x unified",
+            xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
+                       tickfont=dict(color="#8b949e")),
+            yaxis=dict(title="Sharpe Ratio", gridcolor="#1e2d40",
+                       linecolor="#1e2d40", tickfont=dict(color="#8b949e"),
+                       zeroline=True, zerolinecolor="#484f58"),
+        )
+        st.plotly_chart(fig_rs, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — RETURNS & FEES
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — RETURNS & FEES
@@ -1563,17 +1650,6 @@ with tab6:
     else:
         stcg_rate, ltcg_rate = _tax_rates(signal_date)
         budget_label = "Post-Budget 2024" if pd.Timestamp(signal_date) >= _BUDGET_2024_CUTOFF else "Pre-Budget 2024"
-
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:0.72rem;color:#8b949e;margin-bottom:12px'>"
-            f"Tax regime: <span style='color:#c9d1d9'>{budget_label}</span> · "
-            f"STCG: <span style='color:#e3b341'>{stcg_rate:.0%}</span> · "
-            f"LTCG: <span style='color:#e3b341'>{ltcg_rate:.0%}</span> "
-            f"(₹1L annual exemption applies) · "
-            f"Transaction costs: <span style='color:#e3b341'>{_TOTAL_COST_BPS:.2f}bps</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
 
         # ── Capital deployment summary ────────────────────────────────────
         longs_rf  = proposed_df[proposed_df["Direction"] == "LONG"]
@@ -1593,33 +1669,21 @@ with tab6:
 
         st.markdown("<div class='section-header'>Capital Summary</div>", unsafe_allow_html=True)
         cs1, cs2, cs3, cs4, cs5 = st.columns(5)
-        cs1.metric("Total NAV",          f"₹{nav_input:,.0f}")
-        cs2.metric("Total Deployed",     f"₹{total_deployed_rs:,.0f}",
-                   help="Long + Short book combined allocation")
-        cs3.metric("Long Book",          f"₹{long_deployed_rs:,.0f}")
-        cs4.metric("Short Book",         f"₹{short_deployed_rs:,.0f}")
-        cs5.metric("Cash Remaining",     f"₹{cash_remaining_rs:,.0f}")
-
-        st.divider()
-
-        # ── Transaction costs breakdown ────────────────────────────────────
-        st.markdown("<div class='section-header'>Transaction Costs (Round-Trip)</div>",
-                    unsafe_allow_html=True)
-
-        cost_items = {
-            "STT":          total_deployed_rs * 2 * (_STT_BPS / 10000),
-            "Brokerage":    total_deployed_rs * 2 * (_BROKERAGE_BPS / 10000),
-            "Stamp Duty":   total_deployed_rs * (_STAMP_DUTY_BPS / 10000),   # buy-side only
-            "Slippage":     total_deployed_rs * 2 * (_SLIPPAGE_BPS / 10000),
-            "Exchange/SEBI":total_deployed_rs * 2 * (_EXCHANGE_BPS / 10000),
-        }
-        total_fees_rs = sum(cost_items.values())
-
-        cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
-        for col, (label, val) in zip([cc1,cc2,cc3,cc4,cc5], cost_items.items()):
-            col.metric(label, f"₹{val:,.0f}")
-        cc6.metric("Total Costs", f"₹{total_fees_rs:,.0f}",
-                   help=f"{total_fees_rs/nav_input*100:.3f}% of NAV")
+        def _cm2(col, label, value, color):
+            col.markdown(
+                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
+                f"padding:12px 16px;text-align:center'>"
+                f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
+                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
+                f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
+                f"font-family:monospace'>{value}</div></div>",
+                unsafe_allow_html=True,
+            )
+        _cm2(cs1, "Total NAV",      f"₹{nav_input:,.0f}",          "#c9d1d9")
+        _cm2(cs2, "Total Deployed", f"₹{total_deployed_rs:,.0f}",  "#c9d1d9")
+        _cm2(cs3, "Long Book",      f"₹{long_deployed_rs:,.0f}",   "#3fb950")
+        _cm2(cs4, "Short Book",     f"₹{short_deployed_rs:,.0f}",  "#f85149")
+        _cm2(cs5, "Cash Remaining", f"₹{cash_remaining_rs:,.0f}",  "#e3b341")
 
         st.divider()
 
@@ -1687,9 +1751,7 @@ with tab6:
             applicable_rate = ltcg_rate if is_long_term else stcg_rate
             taxable_gain    = max(0, gross_gain_rs - (_LTCG_EXEMPTION_INR if is_long_term else 0))
             tax_rs          = taxable_gain * applicable_rate
-            net_gain_rs     = gross_gain_rs - tax_rs
-            entry_cost      = alloc_rs * cost_rate
-            net_after_costs = net_gain_rs - entry_cost * 2
+            net_gain_rs     = gross_gain_rs - tax_rs   # Net = Gross - Tax
 
             ret_rows.append({
                 "Ticker":              row["Ticker"].replace(".NS",""),
@@ -1702,10 +1764,32 @@ with tab6:
                 "Gross Gain (₹)":      f"₹{gross_gain_rs:,.0f}",
                 "Tax Rate":            f"{applicable_rate:.0%}",
                 "Tax (₹)":             f"₹{tax_rs:,.0f}",
-                "Net Gain (₹)":        f"₹{net_after_costs:,.0f}",
+                "Net Gain (₹)":        f"₹{net_gain_rs:,.0f}",
             })
 
         ret_df = pd.DataFrame(ret_rows)
+
+        # ── Fill projected performance block (defined above capital summary) ──
+        if total_deployed_rs > 0 and ret_rows:
+            _gross_gain_sum = sum(
+                float(r["Gross Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+            )
+            _tax_sum = sum(
+                float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+            )
+            _tc_sum = total_deployed_rs * 2 * (_TOTAL_COST_BPS / 10000)
+            _exp_ret_pct = (_gross_gain_sum / total_deployed_rs) * 100
+            _abs_ret_pct = ((_gross_gain_sum - _tax_sum - _tc_sum) / total_deployed_rs) * 100
+            _exp_color   = "#3fb950" if _exp_ret_pct >= 0 else "#f85149"
+            _header_exp_ret_placeholder.markdown(
+                f"<div style='text-align:center;padding:0 12px'>"
+                f"<div style='font-size:0.62rem;color:#8b949e;text-transform:uppercase;"
+                f"letter-spacing:0.1em;margin-bottom:2px'>Expected Return</div>"
+                f"<div style='font-size:1.0rem;color:{_exp_color};font-weight:700;"
+                f"font-family:monospace'>{_exp_ret_pct:+.1f}%</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
         def colour_direction(val):
             if val == "LONG":  return "color: #3fb950; font-weight:600"
@@ -1721,6 +1805,14 @@ with tab6:
         st.divider()
 
         # ── Portfolio-level summary ────────────────────────────────────────
+        # Compute total_fees_rs for summary and waterfall (no display section)
+        total_fees_rs = sum([
+            total_deployed_rs * 2 * (_STT_BPS / 10000),
+            total_deployed_rs * 2 * (_BROKERAGE_BPS / 10000),
+            total_deployed_rs * (_STAMP_DUTY_BPS / 10000),
+            total_deployed_rs * 2 * (_SLIPPAGE_BPS / 10000),
+            total_deployed_rs * 2 * (_EXCHANGE_BPS / 10000),
+        ])
         st.markdown("<div class='section-header'>Portfolio-Level Summary</div>",
                     unsafe_allow_html=True)
 
@@ -1734,15 +1826,23 @@ with tab6:
             float(r["Net Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
 
+        def _cm(col, label, value, color):
+            col.markdown(
+                f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
+                f"padding:12px 16px;text-align:center'>"
+                f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
+                f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
+                f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
+                f"font-family:monospace'>{value}</div></div>",
+                unsafe_allow_html=True,
+            )
+
         ps1, ps2, ps3, ps4, ps5 = st.columns(5)
-        ps1.metric("Total Deployed",       f"₹{total_deployed_rs:,.0f}")
-        ps2.metric("Gross Expected Gain",   f"₹{total_gross_gain:,.0f}",
-                   help="Before tax and transaction costs")
-        ps3.metric("Total Transaction Costs",f"₹{total_fees_rs:,.0f}")
-        ps4.metric("Total Tax (Projected)", f"₹{total_tax:,.0f}",
-                   help="STCG + LTCG combined. LTCG includes ₹1L exemption per long position.")
-        ps5.metric("Net Expected Gain",     f"₹{total_net:,.0f}",
-                   help="After tax and round-trip transaction costs")
+        _cm(ps1, "Total Deployed",        f"₹{total_deployed_rs:,.0f}",  "#c9d1d9")
+        _cm(ps2, "Gross Expected Gain",   f"₹{total_gross_gain:,.0f}",   "#3fb950")
+        _cm(ps3, "Total Transaction Costs",f"₹{total_fees_rs:,.0f}",     "#f85149")
+        _cm(ps4, "Total Tax (Projected)", f"₹{total_tax:,.0f}",          "#f85149")
+        _cm(ps5, "Net Expected Gain",     f"₹{total_net:,.0f}",          "#3fb950")
 
         # ── Waterfall chart: NAV → Deployed → Costs → Tax → Net ──────────
         st.markdown("<div class='section-header'>Capital Waterfall</div>",
@@ -1809,3 +1909,14 @@ with tab6:
         # Add zero baseline
         fig_wf.add_hline(y=0, line=dict(color="#30363d", width=1))
         st.plotly_chart(fig_wf, use_container_width=True)
+
+        st.markdown(
+            f"<div style='font-family:monospace;font-size:0.72rem;color:#8b949e;margin-top:8px'>"
+            f"Tax regime: <span style='color:#c9d1d9'>{budget_label}</span> · "
+            f"STCG: <span style='color:#e3b341'>{stcg_rate:.0%}</span> · "
+            f"LTCG: <span style='color:#e3b341'>{ltcg_rate:.0%}</span> "
+            f"(₹1L annual exemption applies) · "
+            f"Transaction costs: <span style='color:#e3b341'>{_TOTAL_COST_BPS:.2f}bps</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
