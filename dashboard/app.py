@@ -403,13 +403,10 @@ def load_prices_on_date(tickers: tuple, as_of_date: str) -> pd.DataFrame:
 def load_pipeline_last_dates() -> dict:
     """Get last ingested date per table for the refresh panel."""
     tables_to_check = {
-        "OHLCV":         (TABLES.get("ohlcv",      "nifty500_ohlcv"),       "Date"),
-        "Indicators":    (TABLES.get("indicators",  "nifty500_indicators"),  "Date"),
-        "Fundamentals":  (TABLES.get("fundamentals","nifty500_fundamentals"),"Period"),
-        "Macro":         (TABLES.get("macro",       "macro_indicators"),     "Date"),
-        "Sentiment":     (TABLES.get("sentiment",   "nifty500_sentiment"),   "Date"),
-        "Data Quality":  (TABLES.get("data_quality","stock_data_quality"),   "Tier_Assigned_Date"),
-        "Features":      (TABLES.get("features",    "features_master"),      "Date"),
+        "OHLCV":      (TABLES.get("ohlcv",      "nifty500_ohlcv"),      "Date"),
+        "Indicators": (TABLES.get("indicators",  "nifty500_indicators"), "Date"),
+        "Macro":      (TABLES.get("macro",       "macro_indicators"),    "Date"),
+        "Features":   (TABLES.get("features",    "features_master"),     "Date"),
     }
     result = {}
     try:
@@ -561,59 +558,30 @@ with st.sidebar:
     st.markdown('<p class="section-header">Actions</p>', unsafe_allow_html=True)
 
     if st.button("⟳  Refresh Data", use_container_width=True,
-                 help="Runs daily pipeline scripts to fetch data from last stored date to today."):
-        with st.spinner("Running daily pipeline..."):
-            DAILY_SCRIPTS = [
-                ("bhavcopy_ingestion.py", []),
-                ("indicators.py",         []),
-                ("macro.py",              []),
-                ("fii_dii_stockedge.py",  []),
-                ("rbi_macro.py",          []),
-                ("sentiment.py",          ["--mode", "daily"]),
-                ("data_quality.py",       []),
-            ]
-            errors = []
-            for script, args in DAILY_SCRIPTS:
-                script_path = os.path.join(SCRIPTS_DIR, script)
-                if not os.path.exists(script_path):
-                    continue
-                ok, out = run_script(script, args)
-                if not ok:
-                    errors.append(f"{script}: {out[:200]}")
-
-            if errors:
-                st.error("Some scripts failed:\n" + "\n".join(errors))
+                 help="Runs daily_refresh.py to fetch up-to-date data."):
+        with st.spinner("Running daily refresh..."):
+            daily_refresh_path = os.path.join(_PROJECT_ROOT, "daily_refresh.py")
+            if not os.path.exists(daily_refresh_path):
+                st.error("daily_refresh.py not found in project root.")
             else:
-                st.success("Pipeline refreshed.")
-                st.cache_data.clear()
-                st.rerun()
+                try:
+                    result = subprocess.run(
+                        [sys.executable, daily_refresh_path],
+                        capture_output=True, text=True,
+                        cwd=_PROJECT_ROOT, timeout=3600
+                    )
+                    if result.returncode == 0:
+                        st.success("Pipeline refreshed.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"Refresh failed:\n{(result.stdout + result.stderr)[:500]}")
+                except subprocess.TimeoutExpired:
+                    st.error("Timed out after 60 minutes.")
+                except Exception as e:
+                    st.error(f"Refresh error: {e}")
 
-    # Setup button — stub, wires up all scripts for fresh install
-    if st.button("⚙  Setup Hedge Fund", use_container_width=True,
-                 help="Full pipeline setup for a new device. Runs all scripts from scratch. "
-                      "Warning: bhavcopy ingestion takes 30–45 minutes."):
-        st.info(
-            "Setup pipeline not yet automated. Run scripts manually in this order:\n\n"
-            "1. `python data/setup_db.py`\n"
-            "2. `python data/bhavcopy_ingestion.py`\n"
-            "3. `python data/indicators.py`\n"
-            "4. `python data/screener_fundamentals.py`\n"
-            "5. `python data/macro.py`\n"
-            "6. `python data/fii_dii_stockedge.py`\n"
-            "7. `python data/rbi_macro.py`\n"
-            "8. `python data/sentiment.py --mode backfill`\n"
-            "9. `python data/data_quality.py`\n"
-            "10. `python data/features.py`\n"
-            "11. `python data/export_features.py`\n\n"
-            "Then upload `exports/features_master_latest.parquet` to Google Colab and run the training notebooks."
-        )
 
-    st.divider()
-    st.markdown(
-        f"<div style='font-size:0.65rem;color:#484f58;font-family:monospace'>"
-        f"Last loaded: {datetime.now().strftime('%H:%M:%S')}</div>",
-        unsafe_allow_html=True
-    )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1647,28 +1615,39 @@ with tab6:
         st.divider()
 
         # ── Expected returns per position ─────────────────────────────────
-        st.markdown("<div class='section-header'>Expected Returns & Tax per Position</div>",
-                    unsafe_allow_html=True)
-        st.markdown(
-            "<div style='font-family:monospace;font-size:0.7rem;color:#8b949e;margin-bottom:10px'>"
-            "Hold assumptions: Core Long = 12 months (LTCG) · Mid-Cap Long = 9 months (STCG) · "
-            "Short = 4 months (STCG). Expected return = Final_Rank × 30% max annual return proxy."
-            "</div>",
-            unsafe_allow_html=True
-        )
-
-        # Check if calibrated returns available in signals CSV
+        # _has_calib must be defined before the description markdown references it
         _has_calib = "Projected_Return_21d" in signals_today.columns
 
-        # Merge calibrated returns onto proposed_df via ticker+date
+        st.markdown("<div class='section-header'>Expected Returns & Tax per Position</div>",
+                    unsafe_allow_html=True)
+
+        # Merge calibrated returns onto proposed_df via bare ticker (no .NS)
+        # Drop any stale calib columns first to prevent _x/_y suffix on re-renders
+        _calib_data_cols = ["Projected_Return_21d", "Projected_Return_252d",
+                            "Band_Low_21d", "Band_High_21d"]
+        proposed_df = proposed_df.drop(
+            columns=[c for c in _calib_data_cols if c in proposed_df.columns],
+            errors="ignore"
+        )
         if _has_calib:
-            _calib_cols = ["Ticker", "Projected_Return_21d", "Projected_Return_252d",
-                           "Band_Low_21d", "Band_High_21d"]
-            _calib_cols = [c for c in _calib_cols if c in signals_today.columns]
-            _sig_latest = signals_today[signals_today["Date"] == signals_today["Date"].max()]
-            proposed_df = proposed_df.merge(
-                _sig_latest[_calib_cols], on="Ticker", how="left"
+            _calib_cols = ["Ticker"] + [c for c in _calib_data_cols if c in signals_today.columns]
+            _sig_latest_calib = signals_today[
+                signals_today["Date"] == signals_today["Date"].max()
+            ][_calib_cols].copy()
+            # Normalise to bare ticker on both sides for reliable join
+            _sig_latest_calib["_Ticker_bare"] = _sig_latest_calib["Ticker"].str.replace(
+                r"\.NS$", "", regex=True
             )
+            _sig_latest_calib = (
+                _sig_latest_calib
+                .drop(columns=["Ticker"])
+                .drop_duplicates("_Ticker_bare")
+            )
+            proposed_df["_Ticker_bare"] = proposed_df["Ticker"].str.replace(
+                r"\.NS$", "", regex=True
+            )
+            proposed_df = proposed_df.merge(_sig_latest_calib, on="_Ticker_bare", how="left")
+            proposed_df = proposed_df.drop(columns=["_Ticker_bare"], errors="ignore")
 
         # Always (re-)merge Final_Rank from signals_today to ensure distinct per-ticker values.
         # The optimizer may store rounded ranks; signals_today has the raw per-ticker values.
@@ -1713,9 +1692,11 @@ with tab6:
             # Use calibrated return if available, else fall back to formula
             proj_21d = row.get("Projected_Return_21d", float("nan"))
             if _has_calib and pd.notna(proj_21d):
-                # Calibrated: annualised = 21d return × (252/21)
+                # Calibrated: proj_21d is a 21-trading-day fractional return
+                # Annualise: 252 / 21 = 12 periods per year
                 ann_ret        = float(proj_21d) * (252 / 21) * 100
-                exp_ret_period = float(proj_21d) * (hold_months * 21 / 21) * 100
+                # Period return: scale annual down to hold period (months out of 12)
+                exp_ret_period = ann_ret * hold_months / 12
                 # Cap at reasonable bounds
                 ann_ret        = max(-50.0, min(ann_ret, 100.0))
                 exp_ret_period = max(-50.0, min(exp_ret_period, 100.0))
@@ -1741,9 +1722,7 @@ with tab6:
                 "Sector":              row.get("Sector","—"),
                 "Hold Period":         hold_label,
                 "Deployed (₹)":       f"₹{alloc_rs:,.0f}",
-                "Exp. Return (Period)":f"{exp_ret_period:.1f}%",
-                "Exp. Return (Ann.)":  f"{ann_ret:.1f}%",
-                "Gross Gain (₹)":      f"₹{gross_gain_rs:,.0f}",
+                "Gross Expected Gain (₹)": f"₹{gross_gain_rs:,.0f}",
                 "Tax Rate":            f"{applicable_rate:.0%}",
                 "Tax (₹)":             f"₹{tax_rs:,.0f}",
                 "Net Gain (₹)":        f"₹{net_gain_rs:,.0f}",
@@ -1754,7 +1733,7 @@ with tab6:
         # ── Fill projected performance block (defined above capital summary) ──
         if total_deployed_rs > 0 and ret_rows:
             _gross_gain_sum = sum(
-                float(r["Gross Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+                float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
             )
             _tax_sum = sum(
                 float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
@@ -1799,7 +1778,7 @@ with tab6:
                     unsafe_allow_html=True)
 
         total_gross_gain = sum(
-            float(r["Gross Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+            float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
         total_tax        = sum(
             float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
