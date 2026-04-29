@@ -104,11 +104,6 @@ class OptimizedPortfolio:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_atr(tickers: list[str], engine) -> pd.DataFrame:
-    """
-    Query latest ATR_14 and Adj_Close from nifty500_indicators for given tickers.
-    Returns DataFrame with columns: Ticker, ATR_14, Adj_Close, ATR_pct.
-    Fills missing with ATR_PCT_FALLBACK.
-    """
     if not tickers:
         return pd.DataFrame(columns=["Ticker", "ATR_14", "Adj_Close", "ATR_pct"])
 
@@ -188,21 +183,6 @@ def _compute_sizes(
     book_target_pct: float,
     deploy_cap: float,
 ) -> pd.Series:
-    """
-    Inverse ATR_pct risk-parity sizing.
-
-    Parameters
-    ----------
-    candidates      : DataFrame with Ticker, ATR_pct, Data_Tier columns
-    direction       : 'long' or 'short'
-    nav             : portfolio NAV in Rupees
-    book_target_pct : target book size as fraction of NAV (e.g. 1.15 for long)
-    deploy_cap      : regime-aware max deployable fraction of NAV
-
-    Returns
-    -------
-    pd.Series indexed by Ticker with proposed size_nav_pct values.
-    """
     if candidates.empty:
         return pd.Series(dtype=float)
 
@@ -267,24 +247,6 @@ def optimize_portfolio(
     sector_map_df: pd.DataFrame,
     signal_date: Optional[date] = None,
 ) -> OptimizedPortfolio:
-    """
-    Build a risk-checked, sized position book from ensemble signals.
-
-    Parameters
-    ----------
-    signals_df   : ensemble output for a single date.
-                   Required columns: Ticker, Final_Rank, Signal, Data_Tier, LSTM_Vol.
-                   Signal: +1=BUY, -1=SELL, 0=HOLD.
-    nav          : simulation NAV in Rupees.
-    regime_int   : HMM regime (0=Bull, 1=Bear, 2=HighVol, 3=Sideways).
-    engine       : SQLAlchemy engine connected to hedge_v2_db.
-    sector_map_df: DataFrame with columns Ticker, Sector.
-    signal_date  : date of signals (informational, defaults to today).
-
-    Returns
-    -------
-    OptimizedPortfolio
-    """
 
     REGIME_LABELS = {0: "Bull", 1: "Bear", 2: "High Vol", 3: "Sideways"}
     regime_label  = REGIME_LABELS.get(regime_int, "Unknown")

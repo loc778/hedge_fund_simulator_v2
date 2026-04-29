@@ -3,31 +3,6 @@
 # HMM REGIME DETECTION — hedge_v2.3
 # Trains a 4-state Gaussian HMM on Nifty 50 to classify
 # daily market regimes: Bull(0) Bear(1) HighVol(2) Sideways(3)
-#
-# Run: python data/hmm.py
-#
-# OUTPUTS:
-#   MySQL : market_regimes table (upserted)
-#   Disk  : models/hmm_model_v3_YYYYMMDD.pkl
-#           models/hmm_scaler_v3_YYYYMMDD.pkl
-#           models/hmm_statemap_v3_YYYYMMDD.pkl
-#   Plots : results/hmm_v3/hmm_v3_regime_timeline_YYYYMMDD.png
-#           results/hmm_v3/hmm_v3_state_stats_YYYYMMDD.png
-#           results/hmm_v3/hmm_v3_posteriors_YYYYMMDD.png
-#
-# FIXES vs v2:
-#   FIX-L1  : Return_21d removed (21-day forward return = look-ahead leak)
-#   FIX-L2  : Tail zero-padding hack removed (no look-ahead feature)
-#   FIX-F1  : Return_5d added (5-day trailing log return, point-in-time)
-#   FIX-F2  : FII_Flow_zscore added from macro_indicators; excluded if
-#             DB unavailable or >20% null (prevents singular covariance)
-#   FIX-S1  : Bear labeling uses joint score (-return + 0.5*vix_norm)
-#             to handle crash states (low return AND high VIX)
-#   FIX-D1  : Direct MySQL upsert — no manual CSV step
-#   FIX-R1  : N_RESTARTS=75 for better convergence stability
-#   FIX-C1  : covariance_type='full' kept — 5 features/~3800 rows safe
-#   FIX-VIZ : axvspan per segment instead of fill_between on datetime
-#   FIX-P1  : Posterior probabilities (Prob_Bull etc.) written to DB
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -59,8 +34,8 @@ from data.db import get_engine
 # ═══════════════════════════════════════════════════════════
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS_DIR  = os.path.join(PROJECT_ROOT, 'results', 'hmm_v3')
-MODELS_DIR   = os.path.join(PROJECT_ROOT, 'models')
+RESULTS_DIR  = os.path.join(PROJECT_ROOT, 'ML_models', 'results')
+MODELS_DIR   = os.path.join(PROJECT_ROOT, 'ML_models')
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR,  exist_ok=True)
@@ -75,15 +50,12 @@ NIFTY_TICKER    = '^NSEI'
 VIX_TICKER      = '^INDIAVIX'
 
 N_STATES        = 4
-N_RESTARTS      = 75      # FIX-R1
+N_RESTARTS      = 75      
 N_ITER          = 300
-COVARIANCE_TYPE = 'full'  # FIX-C1: kept full — valid correlations between features
+COVARIANCE_TYPE = 'full'   
 RANDOM_SEED     = 42
 TOL             = 1e-5
 
-# FIX-L1: Return_21d excluded (forward return = leak)
-# FIX-F1: Return_5d added (trailing, point-in-time)
-# FIX-F2: FII_Flow_zscore added conditionally
 BASE_FEATURE_COLS = [
     'Nifty_Return',    # 1-day log return
     'India_VIX',       # VIX level
@@ -141,15 +113,6 @@ def fetch_price_data() -> tuple:
 
 def build_features(nifty_raw: pd.DataFrame,
                    vix_raw: pd.DataFrame) -> tuple:
-    """
-    Build point-in-time feature matrix.
-
-    FIX-F2: FII_Flow_zscore loaded from macro_indicators and appended
-    to FEATURE_COLS only if load succeeds and null% < 20.
-    If unavailable, trains on BASE_FEATURE_COLS (4 features).
-    A constant zero fallback is NOT used — it makes the covariance
-    matrix singular with covariance_type='full'.
-    """
     # Nifty features
     nifty = pd.DataFrame(index=nifty_raw.index)
     nifty['Close']          = pd.to_numeric(nifty_raw['Close'], errors='coerce')
@@ -282,17 +245,6 @@ def label_states(best_model: GaussianHMM,
                  X_scaled: np.ndarray,
                  df_train: pd.DataFrame,
                  feature_cols: list) -> tuple:
-    """
-    FIX-S1: Hardened greedy label assignment using joint score for Bear.
-
-    Step 1: Bull  = highest mean daily return
-    Step 2: Bear  = joint score: highest(-return + 0.5 * vix_normalized)
-            This handles crash states that have both low return AND high VIX.
-            Sequential assignment would give HighVol to the crash state
-            because its VIX beats all others.
-    Step 3: HighVol  = highest remaining VIX
-    Step 4: Sideways = last remaining
-    """
     raw_states            = best_model.predict(X_scaled)
     df_train              = df_train.copy()
     df_train['Raw_State'] = raw_states
@@ -378,11 +330,6 @@ def build_regime_series(best_model: GaussianHMM,
                         highvol_state: int,
                         sideways_state: int,
                         date_stamp: str) -> tuple:
-    """
-    Build final regime DataFrame with posterior probabilities.
-    FIX-L2: No tail prediction hack needed — all features are backward-looking.
-    FIX-P1: Posterior probabilities stored per date.
-    """
     ordered_raw = [bull_state, bear_state, highvol_state, sideways_state]
     prob_cols   = ['Prob_Bull', 'Prob_Bear', 'Prob_HighVol', 'Prob_Sideways']
 
@@ -422,12 +369,6 @@ def write_to_db(regime_df: pd.DataFrame,
                 prob_cols: list,
                 model_version: str,
                 date_stamp: str) -> bool:
-    """
-    FIX-D1: Direct MySQL upsert into market_regimes.
-    PRIMARY KEY (Date) in setup_db.py guarantees no duplicates.
-    Re-running is safe — existing rows are updated.
-    Also saves CSV backup regardless of DB outcome.
-    """
     # CSV backup — always
     csv_stamped = os.path.join(MODELS_DIR, f'market_regimes_{date_stamp}.csv')
     csv_latest  = os.path.join(MODELS_DIR, 'market_regimes_latest.csv')
@@ -518,12 +459,6 @@ def plot_regime_timeline(nifty_raw: pd.DataFrame,
                          regime_df: pd.DataFrame,
                          feature_cols: list,
                          date_stamp: str):
-    """
-    FIX-VIZ: Uses axvspan per contiguous regime segment.
-    fill_between on sparse datetime masks draws polygons
-    connecting non-adjacent dates — incorrect and type-unsafe.
-    axvspan draws one clean rectangle per segment.
-    """
     plot_df = pd.DataFrame({
         'Date' : pd.to_datetime(nifty_raw.index),
         'Close': pd.to_numeric(nifty_raw['Close'], errors='coerce').values,
@@ -651,10 +586,6 @@ def plot_state_stats(df_train: pd.DataFrame,
 def plot_posteriors(regime_df: pd.DataFrame,
                     prob_cols: list,
                     date_stamp: str):
-    """
-    Posterior probability time series — one subplot per state.
-    Uses .values on DatetimeIndex to avoid type issues with fill_between.
-    """
     prob_plot = regime_df.copy()
     prob_plot['Date'] = pd.to_datetime(prob_plot['Date'].astype(str))
     prob_plot = prob_plot.sort_values('Date').set_index('Date')
@@ -762,13 +693,7 @@ def run_sanity_checks(best_model, trans_reordered, df_train, regime_df,
     chk('Bull mean return positive', bull_ret > 0,
         f'{bull_ret*100:+.4f}%')
 
-    # FIX-SC1: Bear mean return check relaxed from "must be negative" to
-    # "must be lower than Bull". For Nifty 2010–2026 (secular bull market),
-    # ALL 4 HMM states can have positive mean returns — the Bear state
-    # captures the relatively worst return + highest stress environment,
-    # not an absolute negative return. Requiring bear_ret < 0 is only valid
-    # for markets with prolonged bear periods (e.g. S&P 500 post-2008).
-    # The meaningful check is that Bear is strictly worse than Bull.
+
     chk('Bear mean return < Bull mean return (relative bear regime)',
         bear_ret < bull_ret,
         f'Bull={bull_ret*100:+.4f}%  Bear={bear_ret*100:+.4f}%  '
@@ -777,12 +702,6 @@ def run_sanity_checks(best_model, trans_reordered, df_train, regime_df,
     chk('Bull return > Bear return', bull_ret > bear_ret,
         f'Bull={bull_ret*100:+.4f}%  Bear={bear_ret*100:+.4f}%')
 
-    # FIX-SC2: HighVol VIX check relaxed. The FIX-S1 joint score assigns
-    # Bear to the crash state (lowest return + high VIX) BEFORE HighVol
-    # gets assigned. In a secular bull market the crash state legitimately
-    # has both: lowest return AND highest VIX (e.g. COVID, 2022 rate shock).
-    # Bear taking the highest-VIX slot is correct — HighVol should have
-    # the second-highest VIX. The check is updated accordingly.
     bear_vix = df_train[df_train['Regime_Label'] == 'Bear']['India_VIX'].mean()
     chk(f'HighVol has 2nd highest mean VIX (Bear={bear_vix:.2f} > HighVol={hv_vix:.2f})',
         hv_vix > df_train[df_train['Regime_Label'] == 'Sideways']['India_VIX'].mean(),
@@ -893,11 +812,7 @@ def main():
     print(f'\nPlots saved to : {RESULTS_DIR}')
     print(f'Models saved to: {MODELS_DIR}')
     print()
-    print('NEXT STEPS')
-    print('  1. python data/features.py')
-    print('  2. python data/export_features.py')
-    print('  3. Upload Parquet to Google Drive')
-    print('  4. Re-run hedge_fund_xgboost_v5.ipynb')
+    
 
 
 if __name__ == '__main__':

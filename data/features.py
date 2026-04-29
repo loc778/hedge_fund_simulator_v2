@@ -1,122 +1,3 @@
-# data/features.py — hedge_v2.3
-# ═══════════════════════════════════════════════════════════
-# FEATURE ENGINEERING PIPELINE
-#
-# Combines all raw data layers into features_master — the single
-# unified table consumed by all ML training notebooks.
-#
-# INPUTS (must be populated):
-#   nifty500_ohlcv            ~1.28M rows
-#   nifty500_indicators       ~1.15M rows (computed on Adj_Close)
-#   nifty500_fundamentals     ~4,000 rows (annual, leakage-free)
-#   macro_indicators          ~4,246 rows (daily, ffilled at ingest)
-#   nifty500_sentiment        ~152,826 rows (daily aggregate)
-#   stock_data_quality        500 rows (Tier A/B/C/X classification)
-#   market_regimes            ~4,000+ rows (daily regime labels)
-#
-# OUTPUTS (TRUNCATED and rebuilt on every run):
-#   features_master               ~1.2-1.5M rows, 76 columns
-#   sector_fundamentals_median    ~200-500 rows (Sector × Period)
-#
-# EXECUTION:
-#   python data/features.py
-#
-# CHANGES v2.3 (IC fix — Fix A + Fix B):
-#
-#   Fix A — Cross-sectional momentum rank features (Phase 2 + Phase 3.5):
-#     Mom_12_1              : Return_252d - Return_21d (raw, per-ticker)
-#     Mom_6_1               : Return_126d - Return_21d (raw, per-ticker)
-#     Mom_1M_Rank           : CS percentile rank of Return_21d per date
-#     Mom_12_1_Rank         : CS percentile rank of Mom_12_1 per date
-#     Mom_6_1_Rank          : CS percentile rank of Mom_6_1 per date
-#     RS_21d_Rank           : CS percentile rank of RS_21d per date
-#   Root cause addressed: raw returns are not cross-sectional signals.
-#   A stock's Return_21d = +8% means nothing in isolation; being in the
-#   top 10% of all stocks that month is the actionable signal. Momentum
-#   rank consistently contributes IC 0.04–0.07 in Indian equity cross-section.
-#
-#   Fix B — Within-sector fundamental rank features (Phase 3.5):
-#     ROA_Sector_Rank              : within-sector pct rank of ROA per date
-#     EBITDA_Margin_Sector_Rank    : within-sector pct rank of EBITDA_Margin
-#     Revenue_Growth_Sector_Rank   : within-sector pct rank of Revenue_YoY_Growth
-#   Root cause addressed: annual fundamental ratios forward-filled for
-#   up to 400 days are effectively static labels. ROA = 0.12 is a different
-#   quality signal in Financials vs Pharma vs Manufacturing. Sector rank
-#   converts static snapshot into cross-sectionally meaningful quality factor.
-#   Minimum 3 tickers in sector with non-NULL value required; else NULL.
-#
-#   Implementation: Phase 3.5 (new) runs after Phase 3 (rank pass).
-#   Both Fix A and Fix B are batch cross-sectional operations — they cannot
-#   be computed in the per-ticker Phase 2 loop and must be applied as a
-#   post-processing pass over the full features_master table.
-#
-# ARCHITECTURAL RULES:
-#   - Tier X tickers excluded (from stock_data_quality, not hardcoded)
-#   - Tier A+B+C included; Tier C rows get NULL ranks (not trained on)
-#   - Target_Rank_21d computed cross-sectionally on Tier A+B only
-#   - Fundamental availability lag = 60 days after fiscal year-end
-#   - Sector median fallback requires ≥3 tickers with actual data
-#   - All NULLs flow through — XGBoost handles natively, flags carry info
-#   - No z-score normalization here — done in Colab per walk-forward fold
-#   - Targets NULL for rows where forward window > max available date
-#   - Sentiment joined with 1-day lag (t-1) to prevent same-day leakage
-#
-# FEATURE DESIGN PRINCIPLES (v2.3 — clean DB, no dead columns):
-#   Every column stored in features_master is directly usable for training.
-#   No DB-only columns, no raw price levels, no non-stationary series.
-#
-#   PRICE BLOCK:
-#     - Raw OHLCV, Adj_Close, Volume, VWAP_Daily removed — non-stationary.
-#     - Returns (1d/5d/21d/60d), log return, vol-20d kept — stationary.
-#     - Volume_Ratio_20d kept (relative, stationary). ADV_20d_Cr removed
-#       (absolute liquidity size — not an alpha signal).
-#     - RS_21d / RS_60d added — relative strength vs Nifty500 benchmark.
-#
-#   MOMENTUM BLOCK (Fix A — NEW in v2.3):
-#     - Mom_12_1 / Mom_6_1: standard price momentum signals (raw).
-#     - *_Rank variants: cross-sectional percentile per date — the model
-#       consumes both raw and ranked versions for complementary signal.
-#
-#   TECHNICAL BLOCK:
-#     - Raw SMA/EMA levels removed — replaced by Price_to_SMA20/50/200 ratios.
-#     - Raw BB_Upper/Middle/Lower removed — replaced by BB_Width + BB_PctB.
-#     - Raw OBV removed — replaced by OBV_Change_5d (5d pct change).
-#     - MACD + MACD_Signal removed — MACD_Hist is the actionable delta.
-#     - Stoch_D removed — smoothed/lagged duplicate of Stoch_K.
-#     - Price_to_52W_High / Price_to_52W_Low added.
-#
-#   FUNDAMENTAL BLOCK:
-#     - EPS_Basic removed (non-comparable raw level across tickers).
-#     - Added: Gross_Profit_Margin (banking-aware), Gross_Margin_Is_Proxy,
-#              Debt_to_Assets, OCF_to_Net_Income, Delta_ROA, Delta_DebtEquity,
-#              Rel_ROA, Rel_EBITDA_Margin.
-#     - Within-sector rank columns (Fix B — NEW in v2.3):
-#              ROA_Sector_Rank, EBITDA_Margin_Sector_Rank,
-#              Revenue_Growth_Sector_Rank.
-#
-#   SENTIMENT BLOCK:
-#     - Sentiment_Score (same-day) removed — replaced by Sentiment_Score_Lag1.
-#     - News_Sentiment_Score, Positive_Score, Negative_Score removed —
-#       highly correlated with Sentiment_Score_Lag1; Announcement_Score
-#       kept as it captures discrete event signal.
-#
-#   MACRO BLOCK:
-#     - Raw India_VIX, USDINR, Crude_Oil, Gold removed — cross-sectionally
-#       identical for all stocks on a date; betas capture stock-specific
-#       sensitivity to each factor far more effectively.
-#     - FII_Momentum_5d / DII_Momentum_5d removed — low-cardinality ±1
-#       signals; Beta_to_FII and Beta_to_DII are strictly superior.
-#     - RepoRate_x_DebtEquity removed — interaction on a level variable
-#       (Repo_Rate) has same cross-sectional flatness problem as raw levels.
-#     - Repo_Rate_Change added — first-difference captures policy shift events.
-#     - Beta_to_DII added — DII often contrarian to FII; independent signal.
-#     - Regime_Int added — joined from market_regimes (0-3 state).
-#
-#   COLUMN COUNT:
-#     Previous (v2.2): 67 columns
-#     This version  : 76 columns — 9 new (Fix A: 6, Fix B: 3)
-# ═══════════════════════════════════════════════════════════
-
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -145,7 +26,7 @@ TARGET_HORIZON         = FEATURES["target_horizon_days"]                        
 TARGET_VOL_WINDOW      = FEATURES["target_vol_window_days"]                     # 5
 TRADING_DAYS_PER_YEAR  = FEATURES["trading_days_per_year"]                      # 252
 
-# Minimum sector size for Fix B sector rank computation.
+# Minimum sector size for sector rank computation.
 # Requires at least this many tickers with non-NULL values before
 # computing a percentile rank (otherwise rank is meaningless).
 SECTOR_RANK_MIN_TICKERS = 3
@@ -250,7 +131,7 @@ FEATURES_COLUMNS = [
     "Rel_ROA",
     "Rel_EBITDA_Margin",
 
-    # ── Within-sector fundamental rank features (Fix B — new in v2.3) ─
+    # ── Within-sector fundamental rank features 
     "ROA_Sector_Rank",            # within-sector percentile rank of ROA
     "EBITDA_Margin_Sector_Rank",  # within-sector percentile rank of EBITDA_Margin
     "Revenue_Growth_Sector_Rank", # within-sector percentile rank of Revenue_YoY_Growth
@@ -346,10 +227,6 @@ def truncate_output_tables():
 
 
 def load_tier_map() -> dict:
-    """
-    Load stock_data_quality → {Ticker: Data_Tier_numeric}.
-    Tier X tickers excluded from returned dict.
-    """
     df = pd.read_sql(
         f"SELECT Ticker, Data_Tier FROM {TABLES['data_quality']}",
         con=engine,
@@ -368,10 +245,6 @@ def load_tier_map() -> dict:
 
 
 def load_sector_map() -> dict:
-    """
-    Load {Ticker: Sector} for all tickers in features_master scope.
-    Used by Phase 3.5 to assign sector to each ticker for within-sector rank.
-    """
     df = pd.read_sql(
         f"SELECT Ticker, Data_Tier FROM {TABLES['data_quality']}",
         con=engine,
@@ -388,30 +261,6 @@ def load_sector_map() -> dict:
 # ═══════════════════════════════════════════════════════════
 
 def load_macro() -> pd.DataFrame:
-    """
-    Load macro_indicators and compute all derived series needed downstream.
-
-    Returns a daily DataFrame with intermediate columns used only for
-    computation (Ret_*, Nifty500_Return_*, USDINR_1d_Return, FII_Flow_Best,
-    Ret_FII, Ret_DII). These are never written to features_master — they
-    are consumed by compute_macro_sensitivities() and compute_relative_strength().
-
-    Only Repo_Rate_Change reaches features_master as a stored column.
-
-    DESIGN DECISIONS:
-    - Raw India_VIX, USDINR, Crude_Oil, Gold NOT stored in features_master.
-      Betas (Beta_to_VIX, Beta_to_USDINR etc.) capture stock-specific
-      sensitivity to these factors, which is cross-sectionally meaningful.
-      Raw levels are identical for every stock on a given date — zero
-      discriminative power in cross-sectional training.
-    - Beta_to_FII uses FII flow LEVEL (not pct_change). Monthly flow is a
-      level signal (large positive = FII net buyer). pct_change on a flat
-      forward-filled monthly series produces near-zero variance, collapsing
-      beta to NaN for all historical rows.
-    - Repo_Rate_Change (diff) is zero on most days; nonzero only on cut/hike
-      dates. This is cross-sectionally valid — all stocks experience the same
-      policy shock, but react differently via their Beta_to_Nifty50 etc.
-    """
     df = pd.read_sql(
         f"""
         SELECT Date, India_VIX, USDINR, Crude_Oil, Gold,
@@ -470,19 +319,6 @@ def load_macro() -> pd.DataFrame:
 
 
 def load_sentiment() -> pd.DataFrame:
-    """
-    Load nifty500_sentiment aggregate (one row per Ticker+Date).
-
-    Only Announcement_Score and Sentiment_Score are loaded:
-      - Announcement_Score: discrete NSE event signal, kept same-day (point-in-time)
-      - Sentiment_Score: will be shifted by 1 trading day inside process_ticker()
-        to become Sentiment_Score_Lag1 — prevents same-day leakage
-
-    News_Sentiment_Score, Positive_Score, Negative_Score are excluded:
-      - Highly correlated with Sentiment_Score
-      - Their marginal information is already captured by Sentiment_Score_Lag1
-      - Dropping them reduces feature redundancy and collinearity
-    """
     df = pd.read_sql(
         f"""
         SELECT Ticker, Date, Announcement_Score, Sentiment_Score
@@ -496,12 +332,6 @@ def load_sentiment() -> pd.DataFrame:
 
 
 def load_market_regimes() -> pd.DataFrame:
-    """
-    Load market_regimes → daily Regime_Int per Date.
-    Regime_Int: 0=Bear, 1=Bull, 2=HighVol, 3=Sideways.
-    Cross-sectionally valid — same regime for all stocks on a date.
-    Fails gracefully: returns empty DataFrame; Regime_Int will be NULL.
-    """
     try:
         df = pd.read_sql(
             "SELECT Date, Regime_Int FROM market_regimes ORDER BY Date",
@@ -516,27 +346,6 @@ def load_market_regimes() -> pd.DataFrame:
 
 
 def compute_fundamental_ratios(fund_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute all annual-derived ratios from raw fundamentals.
-
-    INPUT COLUMNS REQUIRED:
-      Ticker, Period, Revenue, Gross_Profit, EBITDA, Net_Income,
-      Free_Cash_Flow, Total_Assets, Total_Debt, Operating_CF,
-      ROA, Debt_to_Equity
-
-    EPS_Basic is excluded — raw EPS is non-comparable across tickers
-    (MRF ~₹80,000 vs a PSU bank at ₹5). Delta_ROA captures profitability
-    trajectory without the scale problem.
-
-    BANKING/NBFC GROSS MARGIN:
-      Gross_Profit is structurally NULL for banks and NBFCs (no COGS).
-      Fallback: use Net_Income as numerator (closest analogue to net
-      interest margin). Gross_Margin_Is_Proxy=1 flags these rows.
-
-    DELTA COLUMNS:
-      Computed as period-over-period diff within each ticker (sorted by
-      Period ascending). First period per ticker is NaN — correct behaviour.
-    """
     df = fund_df.copy()
     df["Period"] = pd.to_datetime(df["Period"])
     df = df.sort_values(["Ticker", "Period"]).reset_index(drop=True)
@@ -601,13 +410,6 @@ def compute_fundamental_ratios(fund_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_sector_medians(ratios_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute per (Sector, Period) median of each ratio column.
-    Uses only tickers with actual (non-NaN) values.
-    Returns NaN for a column if < SECTOR_MED_MIN_TICKERS tickers have data.
-
-    Gross_Margin_Is_Proxy excluded from aggregation (it is a flag, not a ratio).
-    """
     print("\n📊 Computing sector medians...")
 
     agg_cols = [c for c in RATIO_COLS if c != "Gross_Margin_Is_Proxy"]
@@ -630,10 +432,6 @@ def compute_sector_medians(ratios_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_sector_median_lookup(med_df: pd.DataFrame) -> dict:
-    """
-    Build {Sector: DataFrame(Period, SecMed_*)} sorted by Period.
-    Used for fast merge_asof-based fallback and Rel_* computation.
-    """
     agg_cols = [c for c in RATIO_COLS if c != "Gross_Margin_Is_Proxy"]
     lookup   = {}
     for sector, group in med_df.groupby("Sector"):
@@ -650,13 +448,6 @@ def build_sector_median_lookup(med_df: pd.DataFrame) -> dict:
 # ═══════════════════════════════════════════════════════════
 
 def load_ticker_ohlcv(ticker: str) -> pd.DataFrame:
-    """
-    Load OHLCV for one ticker.
-    High and Low are needed for Price_to_52W_High/Low computation.
-    Adj_Close is needed for all return and ratio computations.
-    Raw Open/High/Low/Close/Adj_Close/Volume/VWAP_Daily are NOT written
-    to features_master — they are used here only as computation inputs.
-    """
     df = pd.read_sql(
         f"""
         SELECT Date, Ticker, High, Low, Adj_Close, Volume, VWAP_Daily
@@ -672,14 +463,6 @@ def load_ticker_ohlcv(ticker: str) -> pd.DataFrame:
 
 
 def load_ticker_indicators(ticker: str) -> pd.DataFrame:
-    """
-    Load indicators for one ticker.
-    Raw SMA/EMA/BB/OBV levels are fetched because they are needed to compute
-    the stationary derived features (Price_to_SMA*, BB_PctB, OBV_Change_5d).
-    The raw levels themselves are NOT written to features_master.
-    MACD and MACD_Signal fetched to verify MACD_Hist; only Hist stored.
-    Stoch_D fetched but discarded — only Stoch_K stored.
-    """
     df = pd.read_sql(
         f"""
         SELECT Date,
@@ -704,32 +487,6 @@ def safe_ratio(num: pd.Series, den: pd.Series) -> pd.Series:
 
 
 def compute_price_derived(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute all stationary price-derived features from OHLCV + indicator inputs.
-
-    All computations use Adj_Close (split-adjusted). Raw price levels
-    (Adj_Close, High, Low, Volume) are used only as intermediate inputs
-    and are dropped from the returned DataFrame via FEATURES_COLUMNS selection
-    in process_ticker().
-
-    WHAT IS COMPUTED:
-      Returns      : 1d, 5d, 21d, 60d pct_change + log return
-      Volatility   : annualized 20d realized vol from log returns
-      Volume       : Volume_Ratio_20d (relative — stationary)
-      Trend ratios : Price_to_SMA20/50/200 (stationary: ratio to moving average)
-      Momentum     : Price_to_52W_High, Price_to_52W_Low (252d rolling)
-      Bollinger    : BB_Width (bandwidth) + BB_PctB (position within band)
-      OBV          : OBV_Change_5d (5d pct change — stationary)
-
-    Fix A (v2.3) — Momentum raw signals:
-      Mom_12_1     : Return_252d - Return_21d (12-1 month momentum)
-      Mom_6_1      : Return_126d - Return_21d (6-1 month momentum)
-      These are raw per-ticker values. Cross-sectional ranks (Mom_12_1_Rank etc.)
-      are computed in Phase 3.5 after all tickers are written to features_master.
-
-    NOTE: RS_21d / RS_60d need Nifty500 benchmark from macro_df and are
-          computed in process_ticker() after the macro join.
-    """
     df   = df.copy()
     adj  = pd.to_numeric(df["Adj_Close"], errors="coerce")
     vol  = pd.to_numeric(df["Volume"],    errors="coerce")
@@ -743,11 +500,10 @@ def compute_price_derived(df: pd.DataFrame) -> pd.DataFrame:
     df["Return_60d"]    = adj.pct_change(60)
     df["Log_Return_1d"] = np.log(adj / adj.shift(1))
 
-    # ── Fix A: raw momentum signals (cross-sectional ranks in Phase 3.5) ─
+    # raw momentum signals (cross-sectional ranks in Phase 3.5) ─
     # Return_252d: 12-month trailing return
     # Return_126d: 6-month trailing return
-    # Mom_12_1 = 12m return - 1m return (skips most recent month,
-    #             standard momentum construction to avoid short-term reversal)
+    # Mom_12_1 = 12m return - 1m return 
     # Mom_6_1  = 6m return - 1m return (same logic, shorter horizon)
     df["_Return_252d"] = adj.pct_change(252)
     df["_Return_126d"] = adj.pct_change(126)
@@ -798,13 +554,6 @@ def compute_price_gap_flag(df: pd.DataFrame) -> pd.Series:
 
 
 def compute_targets(df: pd.DataFrame, max_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    Compute forward-looking targets. NULLed where window extends past max_date.
-
-    Target_Return_21d : (Adj_Close[t+21] / Adj_Close[t]) - 1
-    Target_Vol_5d     : annualized std of log_returns[t+1..t+5], ddof=1
-    Rank targets      : computed in Phase 3 (cross-sectional, needs all tickers)
-    """
     df  = df.copy()
     adj = pd.to_numeric(df["Adj_Close"], errors="coerce")
 
@@ -826,23 +575,6 @@ def merge_fundamentals(ticker_df: pd.DataFrame,
                        ticker: str,
                        ratios_df: pd.DataFrame,
                        sector_lookup: dict) -> pd.DataFrame:
-    """
-    Attach fundamental ratios to ticker's daily rows using merge_asof.
-
-    STEP 1 — Ticker's own fundamentals:
-      Find the latest Effective_Date <= row Date. If stale
-      (> FUND_MAX_FFILL_DAYS since period end) treat as missing.
-
-    STEP 2 — Sector median fallback:
-      For rows with no valid own-fundamental, use sector median
-      at the equivalent period. Fundamentals_Available stays 0.
-
-    STEP 3 — Sector-relative features:
-      Rel_ROA = ROA - SecMed_ROA at matched period.
-      Rel_EBITDA_Margin = EBITDA_Margin - SecMed_EBITDA_Margin.
-      For rows using sector-median fallback, Rel_* = 0
-      (stock value equals sector median by construction).
-    """
     df = ticker_df.copy()
 
     tick_funds = ratios_df[ratios_df["Ticker"] == ticker].copy()
@@ -946,24 +678,12 @@ def merge_fundamentals(ticker_df: pd.DataFrame,
 
 def rolling_beta(stock_ret: pd.Series, factor: pd.Series,
                  window: int = 252, min_periods: int = 63) -> pd.Series:
-    """
-    Rolling OLS beta: cov(stock, factor) / var(factor).
-    window=252 (1 year), min_periods=63 (1 quarter) — NULL below threshold.
-    """
     cov  = stock_ret.rolling(window, min_periods=min_periods).cov(factor)
     var  = factor.rolling(window, min_periods=min_periods).var()
     return (cov / var.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
 
 def compute_macro_sensitivities(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute rolling macro betas and USDINR interaction term.
-    Called after macro_df has been left-joined onto df.
-
-    Betas are stock-specific — the same VIX level affects a high-beta
-    stock very differently from a low-beta stock. This cross-sectional
-    variation is what makes betas useful where raw macro levels are not.
-    """
     stock_ret = pd.to_numeric(df["Return_1d"], errors="coerce")
 
     for beta_col, factor_col in [
@@ -991,11 +711,6 @@ def compute_macro_sensitivities(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_relative_strength(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    RS_21d = stock Return_21d - Nifty500 Return_21d
-    RS_60d = stock Return_60d - Nifty500 Return_60d
-    Called after macro_df join (which carries Nifty500_Return_21d/60d).
-    """
     s21 = pd.to_numeric(df["Return_21d"], errors="coerce")
     s60 = pd.to_numeric(df["Return_60d"], errors="coerce")
     i21 = pd.to_numeric(df["Nifty500_Return_21d"], errors="coerce") if "Nifty500_Return_21d" in df.columns else pd.Series(np.nan, index=df.index)
@@ -1014,30 +729,7 @@ def process_ticker(ticker: str,
                    sentiment_df: pd.DataFrame,
                    regime_df: pd.DataFrame,
                    dataset_max_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    Build the complete feature row set for one ticker.
-
-    Processing order (order is important — later steps depend on earlier ones):
-      1.  Load OHLCV (High, Low, Adj_Close, Volume for computation only)
-      2.  Load indicators (SMA/BB/OBV levels for ratio computation)
-      3.  Merge OHLCV + indicators on Date
-      4.  Compute all stationary price-derived features (incl. Mom_12_1, Mom_6_1)
-      5.  Set availability flags
-      6.  Compute forward targets
-      7.  Merge fundamentals (ticker own → sector fallback → Rel_ features)
-      8.  Join macro_df (brings Ret_* series, Nifty500 benchmarks, Repo_Rate_Change)
-      9.  Compute macro betas + USDINR interaction
-      10. Compute RS_21d / RS_60d (needs macro benchmark)
-      11. Merge sentiment (Sentiment_Score shifted to Sentiment_Score_Lag1)
-      12. Merge Regime_Int
-      13. Finalize: column selection, type-casting, return
-
-    Fix A rank columns (Mom_1M_Rank, Mom_12_1_Rank, Mom_6_1_Rank, RS_21d_Rank)
-    and Fix B rank columns (ROA_Sector_Rank, EBITDA_Margin_Sector_Rank,
-    Revenue_Growth_Sector_Rank) are NOT computed here — they require
-    cross-sectional groupby across all tickers and are computed in Phase 3.5.
-    They are initialized to NaN here and filled by Phase 3.5.
-    """
+    
     # ── 1-3. OHLCV + Indicators ──────────────────────────────────────────
     ohlcv = load_ticker_ohlcv(ticker)
     if ohlcv.empty:
@@ -1136,17 +828,6 @@ def process_ticker(ticker: str,
 # ═══════════════════════════════════════════════════════════
 
 def compute_and_write_ranks():
-    """
-    Cross-sectional percentile rank of Target_Return_21d across
-    Tier A+B (Data_Tier IN (1,2)) per Date.
-
-    Writes back to features_master via temp-table JOIN UPDATE:
-      - Target_Rank_21d          (percentile 0–1)
-      - Target_Direction_Median  (1 if rank > 0.5 else 0)
-      - Target_Direction_Tertile (1=top third, 0=bottom third, NULL=middle)
-
-    Tier C rows remain NULL — not included in ranking universe.
-    """
     print("\n🎯 Phase 3 — cross-sectional rank pass (target ranks)...")
 
     df = pd.read_sql(
@@ -1224,29 +905,6 @@ def compute_and_write_ranks():
 # ═══════════════════════════════════════════════════════════
 
 def compute_and_write_feature_ranks(sector_map: dict):
-    """
-    Fix A — Cross-sectional momentum ranks (all tickers, per Date):
-      Mom_1M_Rank   : percentile rank of Return_21d per date
-      Mom_12_1_Rank : percentile rank of Mom_12_1 per date
-      Mom_6_1_Rank  : percentile rank of Mom_6_1 per date
-      RS_21d_Rank   : percentile rank of RS_21d per date
-
-    Fix B — Within-sector fundamental ranks (per Sector × Date):
-      ROA_Sector_Rank            : percentile rank of ROA within sector per date
-      EBITDA_Margin_Sector_Rank  : percentile rank of EBITDA_Margin within sector per date
-      Revenue_Growth_Sector_Rank : percentile rank of Revenue_YoY_Growth within sector per date
-
-    All rank columns use method='average', pct=True → values in [0, 1].
-    NULL where < SECTOR_RANK_MIN_TICKERS have non-NULL values in a group.
-    Computed via temp-table JOIN UPDATE — not per-row SQL updates.
-
-    DESIGN:
-    - Fix A ranks are computed across ALL tickers on each date (Tier A+B+C
-      all participate, making the rank more stable with ~380–400 stocks).
-    - Fix B sector ranks are computed within each (Sector, Date) group.
-      A minimum of SECTOR_RANK_MIN_TICKERS=3 non-NULL values is required.
-    - Both fixes use the same temp-table pattern as Phase 3 for efficiency.
-    """
     print("\n🎯 Phase 3.5 — feature rank pass (Fix A: momentum ranks, Fix B: sector ranks)...")
 
     # ── Load relevant columns from features_master ────────────────────────
@@ -1286,10 +944,6 @@ def compute_and_write_feature_ranks(sector_map: dict):
     print("  📊 Computing Fix B: within-sector fundamental ranks...")
 
     def sector_rank_with_min(series: pd.Series) -> pd.Series:
-        """
-        Percentile rank within group.
-        Returns NaN for entire group if < SECTOR_RANK_MIN_TICKERS have non-NULL values.
-        """
         valid_count = series.notna().sum()
         if valid_count < SECTOR_RANK_MIN_TICKERS:
             return pd.Series(np.nan, index=series.index)

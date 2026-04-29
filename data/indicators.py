@@ -1,21 +1,3 @@
-# data/indicators.py — hedge_v2
-# ═══════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS — hedge_v2
-# Reads nifty500_ohlcv, computes 20 indicators per ticker,
-# saves to nifty500_indicators.
-#
-# KEY CORRECTNESS RULES:
-#   - All price-based indicators use Adj_Close (C1 fix)
-#   - ATR / Stochastic / ADX use raw High/Low/Close (range-based — correct)
-#   - Strict warmup filter: rows dropped until SMA_200 valid (200+ days)
-#   - No indicator computed on < 30 rows
-#
-# OPERATIONAL:
-#   - Resume support: skips tickers already in nifty500_indicators
-#   - Batch save every 50 tickers to avoid RAM buildup
-#   - Tier X tickers excluded
-# ═══════════════════════════════════════════════════════════
-
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,11 +33,6 @@ def get_already_computed() -> set:
 # ═══════════════════════════════════════════════════════════
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Computes all technical indicators for a single ticker DataFrame.
-    All price-based indicators use Adj_Close (C1 fix).
-    Range-based indicators (ATR, Stochastic, ADX) use raw OHLC — correct.
-    """
     df = df.sort_values("Date").reset_index(drop=True)
 
     price = df["Adj_Close"]   # C1 fix — never use raw Close for price indicators
@@ -105,7 +82,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ADX_14"] = ta.trend.adx(df["High"], df["Low"], df["Close"], window=14)
 
     # ── Volume: OBV ───────────────────────────────────────────────────
-    # Uses raw Close for direction signal — M10 audit note (minor).
     # OBV accumulates across splits creating discontinuities but this
     # is a medium-severity issue, not a blocker for initial training.
     df["OBV"] = ta.volume.on_balance_volume(df["Close"], df["Volume"])
@@ -119,11 +95,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def process_ticker(df: pd.DataFrame, ticker: str):
-    """
-    Computes indicators for one ticker.
-    Returns (result_df, error_string).
-    error_string is None on success.
-    """
     if len(df) < 30:
         return None, f"only {len(df)} rows — skipping"
 

@@ -155,23 +155,6 @@ def is_fo_eligible(ticker: str) -> bool:
 
 @dataclass
 class OpenPosition:
-    """
-    Represents a single open position in the portfolio.
-
-    Fields
-    ------
-    ticker          : NSE ticker string (e.g. "RELIANCE.NS")
-    direction       : "long" or "short"
-    size_nav_pct    : current allocation as fraction of NAV (e.g. 0.04 = 4%)
-    entry_price     : price at entry (used for stop-loss calculation)
-    current_price   : latest mark-to-market price
-    entry_date      : date position was opened
-    sector          : sector string (must match SECTOR_MAP values in config.py)
-    is_midcap       : True if stock is ranked 101–500 by market cap (Nifty 101-500)
-    lower_circuit_hits_90d : number of lower-circuit events in last 90 trading days
-                             (set to 0 if data unavailable — IR5 stub)
-    market_cap_cr   : market capitalisation in Crores (set to None if unknown)
-    """
     ticker                  : str
     direction               : str           # "long" | "short"
     size_nav_pct            : float
@@ -186,47 +169,6 @@ class OpenPosition:
 
 @dataclass
 class PortfolioState:
-    """
-    Complete snapshot of portfolio state at a single point in time.
-    Pass this to check_position() on every pre-trade call.
-
-    Fields
-    ------
-    as_of_date          : date of this snapshot
-    nav                 : current total NAV in Rupees
-    peak_nav            : highest NAV recorded (for PT6 drawdown check)
-    cash                : uninvested cash in Rupees
-    positions           : dict of ticker → OpenPosition for all open positions
-    fii_net_today_cr    : FII net equity flow today in Crores (negative = selling)
-                          Use None if data not yet available for today
-    fii_consecutive_neg : number of consecutive sessions of negative FII net flow
-    nav_return_21d      : portfolio return over last 21 trading days (fraction)
-                          e.g. -0.04 means -4% over 21 days. None if < 21 days history.
-    is_budget_period    : True between Jan 15 and Union Budget day (typically Feb 1)
-    is_fo_expiry_week   : True during the F&O expiry week (last week of month,
-                          specifically Mon–Wed before Thursday expiry)
-    regime              : current HMM regime int (0=Bull,1=Bear,2=HighVol,3=Sideways)
-                          Used for informational context; not a hard limit gate.
-
-    Helper properties (computed, do not set manually)
-    --------------------------------------------------
-    gross_long_nav_pct  : sum of all long position sizes as % of NAV
-    gross_short_nav_pct : sum of all short position sizes as % of NAV
-    net_exposure_pct    : (gross_long - gross_short) / NAV
-    gross_exposure_pct  : (gross_long + gross_short) / NAV
-    cash_pct            : cash / NAV
-    midcap_long_pct     : mid-cap allocation as % of total long book
-    sector_long_pcts    : dict of sector → gross long % of NAV
-    sector_short_pcts   : dict of sector → gross short % of NAV
-    long_sector_count   : number of distinct sectors in long book
-
-    Class method
-    ------------
-    PortfolioState.from_db(engine, nav, peak_nav, fii_today, fii_consec,
-                            nav_21d, is_budget, is_expiry_week, regime)
-        Reads portfolio_positions table and constructs the object.
-        Stub implementation included — fill in SQL query when positions go live.
-    """
     as_of_date          : date
     nav                 : float
     peak_nav            : float
@@ -317,24 +259,7 @@ class PortfolioState:
         regime: int,
         as_of_date: Optional[date] = None,
     ) -> "PortfolioState":
-        """
-        Build PortfolioState by reading open positions from portfolio_positions table.
-
-        TODO: implement SQL query when portfolio_positions is being written.
-        Currently returns an empty positions dict (safe — all size checks pass
-        against zero-filled book).
-
-        Expected query:
-            SELECT Ticker, Entry_Date, Entry_Price, NAV_Weight_At_Entry,
-                   Position_Class, Sector
-            FROM portfolio_positions
-            WHERE Exit_Date IS NULL
-        Then for each row, construct OpenPosition with:
-            - current_price from latest nifty500_ohlcv Adj_Close
-            - is_midcap from nifty500_sectors or config SECTOR_MAP
-            - lower_circuit_hits_90d from nifty500_ohlcv circuit analysis (TODO)
-            - market_cap_cr from nifty500_fundamentals or external source (TODO)
-        """
+        
         positions: Dict[str, OpenPosition] = {}
         # ── STUB: no active positions yet ────────────────────────────────────
         # Uncomment and implement when portfolio_positions is live:
@@ -404,10 +329,6 @@ def _check_position_limits(
     is_midcap: bool,
     ps: PortfolioState,
 ) -> Optional[RiskDecision]:
-    """
-    P1–P6 position-level checks.
-    Returns a RiskDecision if a limit is triggered, else None (pass).
-    """
 
     # P6 — minimum size
     if size < MIN_POSITION_SIZE_PCT:
@@ -531,10 +452,6 @@ def _check_sector_limits(
                 approved_size=headroom,
             )
 
-        # S3 — if this is a new sector for the long book, check minimum diversity
-        # (S3 is a minimum — adding a new sector only improves diversity, never rejects)
-        # S3 blocks positions that would *reduce* sector count (i.e. exiting last
-        # position in a sector when already at minimum). Not applicable here (entry).
 
     elif direction == "short":
         current_sector_short = ps.sector_short_pcts.get(sector, 0.0)
@@ -742,12 +659,7 @@ def _check_seasonal_rules(
             approved_size=reduced,
         )
 
-    # IR3 — Earnings blackout: STUB — no results calendar table yet
-    # TODO: Query earnings_calendar table for ticker's next result date.
-    #       If (next_result_date - as_of_date) <= 21 calendar days AND direction == "short":
-    #           return REJECTED with limit="IR3"
-    #       For existing shorts: reduce to 50% of current size in the 21-day window.
-    #       Implement once earnings_calendar table is built.
+    
 
     # IR4 — FII sell-off protocol (long positions only affected)
     if direction == "long":
@@ -827,30 +739,7 @@ def check_position(
     market_cap_cr: Optional[float] = None,
     lower_circuit_hits_90d: int = 0,
 ) -> RiskDecision:
-    """
-    Pre-trade risk check. Call before every new position or position increase.
-
-    Parameters
-    ----------
-    ticker               : NSE ticker string, e.g. "RELIANCE.NS"
-    direction            : "long" or "short"
-    size_nav_pct         : proposed allocation as fraction of NAV, e.g. 0.03 = 3%
-    sector               : sector string matching config.py SECTOR_MAP values
-    portfolio_state      : PortfolioState snapshot as of today
-    is_midcap            : True if Nifty 101–500 stock
-    market_cap_cr        : market cap in Crores (used for IR5 short check)
-    lower_circuit_hits_90d : lower-circuit events in last 90 days (IR5)
-
-    Returns
-    -------
-    RiskDecision with status APPROVED / REDUCED / REJECTED.
-    On REDUCED, approved_size is the maximum allowable size.
-    On REJECTED, approved_size is 0.0.
-
-    Check order (first failure returns immediately)
-    -----------------------------------------------
-    P6 → P1/P2/P3 → P4/P5 → F&O eligibility → S1/S2 → PT6 → PT5 → PT3 → PT2 → PT1 → PT4 → IR1 → IR2 → IR3 → IR4 → IR5
-    """
+    
 
     # ── Validate inputs ──────────────────────────────────────────────────────
     if direction not in ("long", "short"):
@@ -923,7 +812,7 @@ def check_position(
             )
             midcap_pct_after = (midcap_nav_current + effective_size) / total_long_after
             if midcap_pct_after > MIDCAP_LONG_BOOK_MAX:
-                # How much mid-cap can we add without breaching the cap?
+        
                 # midcap_pct_after = (midcap_nav_current + x) / (long_book + x) = MIDCAP_MAX
                 # Solving: x = (MIDCAP_MAX * long_book - midcap_nav_current) / (1 - MIDCAP_MAX)
                 long_book = portfolio_state.gross_long_nav_pct
@@ -988,18 +877,6 @@ def screen_signals(
     signals: list[dict],
     portfolio_state: PortfolioState,
 ) -> list[dict]:
-    """
-    Run check_position() over a list of candidate signals and return only
-    APPROVED or REDUCED ones, with their approved sizes attached.
-
-    Each signal dict must contain:
-        ticker, direction, size_nav_pct, sector
-    Optional:
-        is_midcap, market_cap_cr, lower_circuit_hits_90d
-
-    Returns list of approved signals with 'approved_size' and 'risk_decision' added.
-    Signals are returned in the same order; rejected signals are excluded.
-    """
     approved = []
     for sig in signals:
         decision = check_position(

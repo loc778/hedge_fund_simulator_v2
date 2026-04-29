@@ -1,13 +1,5 @@
 # config.py
 # ═══════════════════════════════════════════════════════════
-# CENTRAL CONFIGURATION — hedge_v2 (scaled production version)
-# Change values here to scale up/modify behaviour
-#
-# CHANGES (Apr 2026):
-#   - TABLES key renamed: "sector_fundamentals_med" → "sector_median"
-#     (consistent naming, shorter key)
-#   - Added FEATURES config block for features.py tunable parameters
-# ═══════════════════════════════════════════════════════════
 
 import os
 import pandas as pd
@@ -454,8 +446,6 @@ FEATURES = {
     # Indian equity markets: ~250 trading days/year.
     "trading_days_per_year": 252,
 
-    # Export directory for features_master.parquet.
-    # Path is relative to PROJECT_ROOT.
-    # export_features.py writes here; upload to Google Drive for Colab.
+
     "export_dir": "exports",
 }

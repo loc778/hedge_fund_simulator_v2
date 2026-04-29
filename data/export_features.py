@@ -1,36 +1,8 @@
-# data/export_features.py — hedge_v2
 
-# Full export — all tiers (recommended first run)
-#python data/export_features.py
-
-# Tier A+B only (for Colab training, skip Tier C)
-#python data/export_features.py --tier AB
-
-# Tier A only (for LSTM which needs clean long history)
-#python data/export_features.py --tier A
-# ═══════════════════════════════════════════════════════════
-# FEATURE EXPORT — Parquet for Google Colab
-#
-# Reads features_master from MySQL, drops the DB id column,
-# writes a single Parquet file to the exports/ directory.
-#
-# OUTPUT:
-#   exports/features_master_YYYYMMDD_HHMMSS.parquet
-#   exports/features_master_latest.parquet  (symlink-style overwrite)
-#
-# UPLOAD TO COLAB:
-#   Upload features_master_latest.parquet to Google Drive.
-#   In Colab: df = pd.read_parquet('/content/drive/MyDrive/.../features_master_latest.parquet')
-#
-# RE-EXPORT:
-#   Re-run this script after any features.py run.
-#   Timestamped file keeps a history; _latest always points to current.
-#
 # USAGE:
 #   python data/export_features.py             # full export
 #   python data/export_features.py --tier A    # Tier A only
 #   python data/export_features.py --tier AB   # Tier A+B only
-# ═══════════════════════════════════════════════════════════
 
 import sys
 import os
@@ -58,7 +30,6 @@ TIER_FILTER = {
 
 
 def get_row_count(tier_filter: list | None) -> int:
-    """Quick count before loading full DataFrame."""
     where = ""
     if tier_filter:
         tiers = ", ".join(str(t) for t in tier_filter)
@@ -72,12 +43,6 @@ def get_row_count(tier_filter: list | None) -> int:
 
 
 def load_features(tier_filter: list | None) -> pd.DataFrame:
-    """
-    Load features_master from MySQL.
-    Drops the auto-increment id column.
-    Applies optional tier filter.
-    Chunked read to avoid memory spike on 1.3M × 75 col table.
-    """
     where = ""
     params = {}
     if tier_filter:
@@ -149,7 +114,6 @@ def export_parquet(df: pd.DataFrame, tier_label: str) -> tuple[str, str]:
 
 
 def print_summary(df: pd.DataFrame, timestamped_path: str, latest_path: str):
-    """Print export summary."""
     file_size_mb = os.path.getsize(latest_path) / (1024 ** 2)
 
     print("\n" + "=" * 60)

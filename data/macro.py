@@ -4,15 +4,6 @@
 # Sources:
 #   yfinance  — India VIX, USDINR, Crude Oil, Gold (daily)
 #   FRED API  — GDP India, CPI India, Fed Rate, US CPI, US 10Y Bond
-#
-# Writes to macro_indicators table.
-# FII/DII and RBI columns written by fii_dii.py and rbi_macro.py.
-#
-# C6 FIX — UPSERT RESUME:
-# Previous version used INSERT IGNORE on resume, meaning stale or
-# preliminary FRED values (e.g. revised GDP) were never corrected.
-# Fixed: resume window uses ON DUPLICATE KEY UPDATE so revised
-# values overwrite stale ones on re-run.
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -35,7 +26,6 @@ fred   = Fred(api_key=os.getenv("FRED_API_KEY"))
 
 
 def get_latest_date_in_db() -> str:
-    """Returns latest date in macro_indicators, or DATA_START if empty."""
     try:
         result = pd.read_sql(
             f"SELECT MAX(Date) as max_date FROM {TABLES['macro']}",
@@ -82,11 +72,6 @@ def download_yfinance(symbol: str, start: str, retries: int = 3) -> pd.Series | 
 
 
 def upsert_macro_rows(df: pd.DataFrame):
-    """
-    Inserts new rows and updates existing ones (UPSERT).
-    For the overlap window: revised FRED values overwrite stale ones.
-    FII/DII and RBI columns are NOT touched — written by their own scripts.
-    """
     import math
 
     yf_cols     = list(MACRO_YFINANCE.keys())

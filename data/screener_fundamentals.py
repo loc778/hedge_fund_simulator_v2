@@ -1,4 +1,4 @@
-# data/screener_fundamentals.py — hedge_v2 (v6)
+# data/screener_fundamentals.py — hedge_v2 
 # ═══════════════════════════════════════════════════════════
 # WHAT THIS SCRIPT DOES:
 #   Scrapes annual fundamental data from Screener.in for all
@@ -10,29 +10,6 @@
 #   Cash, Total_Debt, Book_Value_PS, Operating_CF, Capex,
 #   Free_Cash_Flow, Debt_to_Equity, ROCE, PE_Ratio,
 #   Dividend_Yield, ROE, ROA
-#
-# COLUMNS LEFT NULL HERE (populated elsewhere):
-#   FCF_Yield   → features.py  (needs Close price from OHLCV)
-#   PB_Ratio    → features.py  (needs Close price from OHLCV)
-#   EV_EBITDA   → not computed (needs live market cap)
-#   FII_Holding → fii_dii.py
-#   DII_Holding → fii_dii.py
-#
-# C2 FIX (audit — look-ahead leak):
-#   PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS are
-#   current-snapshot values from screener's .company-ratios box.
-#   Writing them onto every historical year row encodes future
-#   information into historical training data.
-#   FIX: these columns are NULL for all periods except the LATEST
-#   period per ticker. The latest period gets the snapshot value.
-#
-# CHANGES FROM v4:
-#   - C2 fix applied to records dict (snapshot cols NULL except latest)
-#   - BANKING_TICKERS imported from config.py (single source of truth)
-#   - fetch_company_page: v4 page-validity check restored (profit-loss
-#     section exists is sufficient — v5 added table check which broke
-#     pages where screener renders the table outside the section)
-#   - All other logic identical to v4 (page fetch, parsing, resume)
 # ═══════════════════════════════════════════════════════════
 
 import sys
@@ -237,12 +214,6 @@ def parse_company_ratios(soup: BeautifulSoup) -> dict:
 
 
 def get_val(table_data: dict, keywords: list, year: str) -> float | None:
-    """
-    Finds first row matching any keyword, returns value for that year.
-    Pass 1: exact match. Pass 2: substring match.
-    Two-pass prevents 'Interest' from matching 'Net Interest Income'
-    before 'Interest Expenses'.
-    """
     for row_name, values in table_data.items():
         if any(kw.lower() == row_name.lower() for kw in keywords):
             v = values.get(year)
@@ -257,17 +228,6 @@ def get_val(table_data: dict, keywords: list, year: str) -> float | None:
 
 
 def get_years(tables: list) -> list:
-    """
-    Returns sorted list of clean 'Mon YYYY' year strings across all tables.
-
-    Handles screener quirks:
-      'Mar 20169m'  -> 'Mar 2016'  (9-month transition period label)
-      'Mar 202415m' -> 'Mar 2024'  (15-month period label)
-      'TTM'         -> skipped     (trailing twelve months = duplicate)
-
-    Without this, HCLTECH (Jun year-end) and NESTLEIND (Dec year-end)
-    lose 1-2 years of data silently.
-    """
     years    = set()
     pattern  = re.compile(
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$"
@@ -304,14 +264,6 @@ def get_years(tables: list) -> list:
 # ═══════════════════════════════════════════════════════════
 
 def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
-    """
-    Extracts fundamentals from a screener company page.
-    Returns list of dicts — one per annual period.
-
-    C2 FIX: snapshot columns (PE_Ratio, ROE, ROCE, Dividend_Yield,
-    Book_Value_PS) are set to NULL for all periods except the latest.
-    The latest period gets the current snapshot value.
-    """
     is_bank = ticker in BANKING_TICKERS
 
     pl  = parse_section_table(soup, "profit-loss")
@@ -435,7 +387,7 @@ def parse_screener_page(soup: BeautifulSoup, ticker: str) -> list[dict]:
         def cr(val):
             return int(val * 1e7) if val is not None else None
 
-        # ── C2 FIX: snapshot columns ──────────────────────────────────
+        
         # PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS are today's
         # snapshot. Only the most recent period row gets these values.
         # All prior year rows get NULL to prevent look-ahead leakage.

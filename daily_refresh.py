@@ -35,13 +35,15 @@ log = logging.getLogger(__name__)
 # ── Pipeline definition ───────────────────────────────────────────────────────
 # Each entry: (display_name, script_path, extra_args, skip_if_missing)
 PIPELINE = [
-    ("OHLCV Ingestion",         "data/bhavcopy_ingestion.py",      [], False),
-    ("Technical Indicators",    "data/indicators.py",              [], False),
-    ("Macro Data",              "data/macro.py",                   [], False),
-    ("FII/DII Data",            "data/fii_dii_stockedge.py",       [], False),
-    ("RBI Macro",               "data/rbi_macro.py",               [], False),
-    ("Feature Engineering",     "data/features.py",                [], True),   # skip if missing
-    ("Export Features",         "data/export_features.py",         [], True),   # skip if missing
+    ("OHLCV Ingestion",         "data/bhavcopy_ingestion.py",              [], False),
+    ("Technical Indicators",    "data/indicators.py",                      [], False),
+    ("Macro Data",              "data/macro.py",                           [], False),
+    ("FII/DII Data",            "data/fii_dii_stockedge.py",               [], False),
+    ("RBI Macro",               "data/rbi_macro.py",                       [], False),
+    ("HMM Regime Detection",    "ML_scripts/hmm.py",                       [], False),
+    ("Feature Engineering",     "data/features.py",                        [], False),
+    ("Export Features",         "data/export_features.py",                 [], False),
+    ("Ensemble",                "ML_scripts/ensemble_final.py",            [], False),
 ]
 
 # ── Runner ────────────────────────────────────────────────────────────────────

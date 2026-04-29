@@ -61,10 +61,6 @@ def load_fo_set(path: str) -> set:
 # ── Load OHLCV from DB ────────────────────────────────────────────────────────
 
 def load_ohlcv(engine) -> pd.DataFrame:
-    """
-    Pulls Date, Ticker, Close, Volume from nifty500_ohlcv.
-    Only columns needed for coverage + ADV calculation.
-    """
     query = f"SELECT Date, Ticker, Close, Volume FROM {TABLE_OHLCV} ORDER BY Ticker, Date"
     print("[OHLCV] Loading from DB...")
     df = pd.read_sql(query, engine, parse_dates=["Date"])
@@ -75,11 +71,6 @@ def load_ohlcv(engine) -> pd.DataFrame:
 # ── Expected trading days estimator ──────────────────────────────────────────
 
 def expected_trading_days(start: pd.Timestamp, end: pd.Timestamp) -> int:
-    """
-    Approximates expected NSE trading days between two dates.
-    Uses 252 trading days/year ratio (standard Indian market assumption).
-    Calendar days × (252/365) gives a close enough estimate for gap% calculation.
-    """
     calendar_days = (end - start).days
     return max(1, round(calendar_days * 252 / 365))
 
@@ -87,9 +78,6 @@ def expected_trading_days(start: pd.Timestamp, end: pd.Timestamp) -> int:
 # ── Per-ticker classification ─────────────────────────────────────────────────
 
 def classify_ticker(symbol: str, df_ticker: pd.DataFrame, fo_set: set) -> dict:
-    """
-    Given a single ticker's OHLCV rows, compute all quality metrics and assign tier.
-    """
     df_ticker = df_ticker.sort_values("Date").reset_index(drop=True)
 
     trading_days_total = len(df_ticker)

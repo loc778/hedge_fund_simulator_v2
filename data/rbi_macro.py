@@ -116,11 +116,6 @@ def get_repo_rate() -> pd.Series:
 # ══════════════════════════════════════════════════════════════════════
 
 def get_iip_growth() -> pd.Series | None:
-    """
-    India industrial production index from FRED.
-    Fetches from 2009 to compute YoY % from Jan 2010.
-    Returns monthly series.
-    """
     try:
         from fredapi import Fred
         fred = Fred(api_key=os.getenv("FRED_API_KEY"))
@@ -149,11 +144,6 @@ def get_iip_growth() -> pd.Series | None:
 # ══════════════════════════════════════════════════════════════════════
 
 def get_forex_reserves() -> pd.Series | None:
-    """
-    India total reserves excl. gold from FRED (IMF/IFS series).
-    Unit in FRED: USD millions → divide by 1000 = USD billions.
-    Returns monthly series.
-    """
     try:
         from fredapi import Fred
         fred = Fred(api_key=os.getenv("FRED_API_KEY"))

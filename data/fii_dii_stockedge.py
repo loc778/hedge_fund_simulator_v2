@@ -1,40 +1,12 @@
 """
 fii_dii_stockedge.py
 ---------------------
-Fetches FII and DII data from StockEdge's public API and writes directly
-into macro_indicators in hedge_v2_db.
-
 TWO MODES — both run on every execution:
-
-  MODE 1 — MONTHLY (historical backfill + monthly refresh)
-    Endpoint: TimeSpan=M
-    Coverage: Jan 2008 → present
-    Columns:  FII_Monthly_Net_Cr, DII_Monthly_Net_Cr
-    Logic:    Each monthly total is stamped on every trading day in that month.
-    Run:      Monthly (first trading day of each month picks up prior month).
-
-  MODE 2 — DAILY (recent actuals)
-    Endpoint: TimeSpan=D
-    Coverage: Last ~50 trading days
-    Columns:  FII_Daily_Net_Cr, DII_Daily_Net_Cr
-    Logic:    One actual daily value per trading date. Overwrites monthly
-              values for those dates — daily is more granular and more accurate.
-    Run:      Daily after market close.
 
 FII_Source_Flag tells features.py which resolution each row has:
   'monthly' = only monthly total available (historical)
   'daily'   = actual daily value available (recent ~50 days)
 
-DB schema additions required (run once in MySQL Workbench before first run):
-  ALTER TABLE macro_indicators
-      ADD COLUMN IF NOT EXISTS FII_Monthly_Net_Cr  DECIMAL(20,2) DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS DII_Monthly_Net_Cr  DECIMAL(20,2) DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS FII_Daily_Net_Cr    DECIMAL(20,2) DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS DII_Daily_Net_Cr    DECIMAL(20,2) DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS FII_Source_Flag     VARCHAR(10)   DEFAULT NULL;
-
-Run order: after macro.py, before data_quality.py
-Replaces:  fii_dii.py and fii_dii_historical.py (both retired)
 """
 
 import os
@@ -139,13 +111,6 @@ def parse_daily(raw: list) -> pd.DataFrame:
     Parses TimeSpan=D response.
     DateText format: "Apr 16" — NO year. Year inferred by walking backwards
     from today: when the month rolls back past the current month, decrement year.
-
-    Example sequence starting today Apr 17 2026:
-      "Apr 16" → 2026-04-16
-      "Apr 15" → 2026-04-15
-      "Mar 30" → 2026-03-30   (month went back, same year)
-      "Feb 27" → 2026-02-27
-      "Dec 31" → 2025-12-31   (month jumped forward → year decremented)
     """
     rows = []
     today      = date.today()
