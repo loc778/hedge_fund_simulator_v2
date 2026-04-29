@@ -1,55 +1,57 @@
 # ═══════════════════════════════════════════════════════════
 # requirements.txt — hedge_v2
+# Python 3.11
 # Install all: pip install -r requirements.txt
 # ═══════════════════════════════════════════════════════════
 
 # ── Database ──────────────────────────────────────────────
-sqlalchemy
-mysql-connector-python
+SQLAlchemy==2.0.49
+mysql-connector-python==9.6.0
 
 # ── Data Collection ───────────────────────────────────────
-yfinance
-fredapi
-newsapi-python
-feedparser
-requests
-python-dateutil
-beautifulsoup4
-lxml
+yfinance==1.2.2
+fredapi==0.5.2
+newsapi-python==0.2.7
+feedparser==6.0.12
+requests==2.33.1
+python-dateutil==2.9.0.post0
+beautifulsoup4==4.14.3
+lxml==6.0.3
 
 # ── Data Processing ───────────────────────────────────────
-pandas
-numpy
+pandas==3.0.2
+numpy==2.4.4
+pyarrow==23.0.1
 
 # ── Technical Indicators ──────────────────────────────────
-ta
+ta==0.11.0
 
 # ── Sentiment & NLP ───────────────────────────────────────
-vaderSentiment
-rapidfuzz
-brotli
+vaderSentiment==3.3.2
+RapidFuzz==3.14.5
+brotli==1.2.0
 
 # ── Environment & Config ──────────────────────────────────
-python-dotenv
-pyarrow
+python-dotenv==1.2.2
 
 # ── ML Models ─────────────────────────────────────────────
-scikit-learn
-xgboost
-lightgbm
-hmmlearn
-matplotlib
+scikit-learn==1.8.0
+xgboost==3.2.0
+lightgbm==4.6.0
+hmmlearn==0.3.3
+matplotlib==3.10.9
+
 # ── Deep Learning ─────────────────────────────────────────
-tensorflow
-keras
+tensorflow==2.21.0
+keras==3.14.0
 
 # ── Portfolio Optimization ────────────────────────────────
-scipy
+scipy==1.17.1
 # cvxpy        ← uncomment when portfolio optimizer is built
 
 # ── Dashboard ─────────────────────────────────────────────
-streamlit>=1.32.0
-plotly>=5.20.0
-joblib
+streamlit==1.56.0
+plotly==6.6.0
+joblib==1.5.3
 
 # ── ADD NEW LIBRARIES BELOW THIS LINE ─────────────────────
