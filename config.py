@@ -213,8 +213,6 @@ TABLES = {
     "indicators"               : "nifty500_indicators",
     "fundamentals"             : "nifty500_fundamentals",
     "macro"                    : "macro_indicators",
-    "sentiment"                : "nifty500_sentiment",
-    "sentiment_raw"            : "nifty500_sentiment_raw",
     "features"                 : "features_master",
     "data_quality"             : "stock_data_quality",
     "portfolio_positions"      : "portfolio_positions",
@@ -319,25 +317,6 @@ MACRO_RBI = {
 
 # ── Fundamentals Source ───────────────────────────────────────────────
 FUNDAMENTALS_SOURCE = "screener"
-
- # ── Sentiment Config ──────────────────────────────────────────────────
-    # Data source strategy (see project_context_architecture.txt Layer 3B):
-    #   1. NSE Corporate Announcements (structured, 2022-present, rule-scored)
-    #      Full historical depth since SENTIMENT_START_DATE.
-    #   2. Moneycontrol RSS (unstructured, today-forward only)
-    #      RSS feeds are current snapshot; no historical backfill possible.
-    # FinBERT scoring runs in separate Colab notebook (reads Raw_Text,
-    # writes FinBERT_Score/FinBERT_Label back to nifty500_sentiment_raw).
-
-SENTIMENT_START_DATE = "2022-01-01"
- 
-SENTIMENT = {
-        "sources"                 : ["nse_announcement", "moneycontrol"],
-        "model"                   : "ProsusAI/finbert",
-        "daily_lookback_days"     : 2,
-        "backfill_window_days"    : 50,
-        "fuzzy_match_threshold"   : 85,
-    }
  
     # NSE corporate announcements API (public, no auth, rate-limited)
 NSE_ANNOUNCEMENT_URL = (

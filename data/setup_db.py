@@ -137,49 +137,6 @@ TABLES = {
         )
     """,
 
-    # ── Layer 3B: Sentiment Data — Daily Aggregate ────────────────────
-    
-    "nifty500_sentiment": """
-        CREATE TABLE IF NOT EXISTS nifty500_sentiment (
-            id                    INT AUTO_INCREMENT PRIMARY KEY,
-            Date                  DATE            NOT NULL,
-            Ticker                VARCHAR(20)     NOT NULL,
-            Announcement_Score    DECIMAL(10,4),
-            News_Sentiment_Score  DECIMAL(10,4),
-            Sentiment_Score       DECIMAL(10,4),
-            Positive_Score        DECIMAL(10,4),
-            Negative_Score        DECIMAL(10,4),
-            Neutral_Score         DECIMAL(10,4),
-            Events_Count          INT DEFAULT 0,
-            Headlines_Count       INT DEFAULT 0,
-            Has_Announcement      TINYINT DEFAULT 0,
-            Has_News              TINYINT DEFAULT 0,
-            Last_Updated          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                                          ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_ticker_date (Ticker, Date)
-        )
-    """,
-
-    # ── Layer 3B: Sentiment Raw Events ────────────────────────────────
-   
-    "nifty500_sentiment_raw": """
-        CREATE TABLE IF NOT EXISTS nifty500_sentiment_raw (
-            id              INT AUTO_INCREMENT PRIMARY KEY,
-            Date            DATE            NOT NULL,
-            Ticker          VARCHAR(20)     NOT NULL,
-            Source          VARCHAR(30)     NOT NULL,
-            Event_Category  VARCHAR(50),
-            Headline        TEXT,
-            Raw_Text        TEXT,
-            Rule_Score      DECIMAL(5,2),
-            FinBERT_Score   DECIMAL(5,4),
-            FinBERT_Label   VARCHAR(20),
-            URL             VARCHAR(500),
-            Ingested_At     TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_event (Ticker, Date, Source, Headline(200))
-        )
-    """,
-
     # ── Stock Data Quality Classification ─────────────────────────────
     "stock_data_quality": """
         CREATE TABLE IF NOT EXISTS stock_data_quality (
@@ -262,8 +219,6 @@ TABLES = {
             ROA_Sector_Rank             DECIMAL(10,6),  
             EBITDA_Margin_Sector_Rank   DECIMAL(10,6),  
             Revenue_Growth_Sector_Rank  DECIMAL(10,6),  
-            Announcement_Score          DECIMAL(10,4),
-            Sentiment_Score_Lag1        DECIMAL(10,4),
             Regime_Int                  TINYINT,
             Beta_to_Nifty50             DECIMAL(10,6),
             Beta_to_Nifty500            DECIMAL(10,6),
@@ -280,7 +235,6 @@ TABLES = {
             SMA50_Available             TINYINT DEFAULT 0,
             ADX14_Available             TINYINT DEFAULT 0,
             Volatility20d_Available     TINYINT DEFAULT 0,
-            Sentiment_Available         TINYINT DEFAULT 0,
             Fundamentals_Available      TINYINT DEFAULT 0,
             Data_Tier                   TINYINT DEFAULT 3,
             Target_Return_21d           DECIMAL(10,6),

@@ -9,7 +9,7 @@ from sqlalchemy import text
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-from config import TABLES, SENTIMENT_START_DATE, FEATURES, get_sector
+from config import TABLES,FEATURES, get_sector
 from data.db import get_engine, save_to_db
 
 engine = get_engine()
@@ -136,12 +136,6 @@ FEATURES_COLUMNS = [
     "EBITDA_Margin_Sector_Rank",  # within-sector percentile rank of EBITDA_Margin
     "Revenue_Growth_Sector_Rank", # within-sector percentile rank of Revenue_YoY_Growth
 
-    # ── Sentiment (t-1 lagged — leakage-free) ────────────────────────
-    "Announcement_Score",    # NSE point-in-time event score (kept same-day — discrete)
-                             # TIMING ASSUMPTION: prediction made after market close (EOD).
-                             # If used in pre-open prediction, shift(-1) must be applied here.
-    "Sentiment_Score_Lag1",  # Composite sentiment score shifted 1 trading day back
-
     # ── Macro regime ──────────────────────────────────────────────────
     "Regime_Int",            # 0=Bear 1=Bull 2=HighVol 3=Sideways (from market_regimes)
 
@@ -167,7 +161,6 @@ FEATURES_COLUMNS = [
     "SMA50_Available",
     "ADX14_Available",
     "Volatility20d_Available",
-    "Sentiment_Available",
     "Fundamentals_Available",
     "Data_Tier",
 
@@ -191,7 +184,6 @@ def validate_inputs() -> bool:
         "indicators"    : "nifty500_indicators",
         "fundamentals"  : "nifty500_fundamentals",
         "macro"         : "macro_indicators",
-        "sentiment"     : "nifty500_sentiment",
         "data_quality"  : "stock_data_quality",
         "market_regimes": "market_regimes",
     }
@@ -316,20 +308,6 @@ def load_macro() -> pd.DataFrame:
 
     print(f"  ✅ Macro: {len(df):,} rows | {df['Date'].min().date()} → {df['Date'].max().date()}")
     return df
-
-
-def load_sentiment() -> pd.DataFrame:
-    df = pd.read_sql(
-        f"""
-        SELECT Ticker, Date, Announcement_Score, Sentiment_Score
-        FROM {TABLES['sentiment']}
-        """,
-        con=engine,
-    )
-    df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
-    print(f"  ✅ Sentiment: {len(df):,} rows | {df['Date'].min().date()} → {df['Date'].max().date()}")
-    return df
-
 
 def load_market_regimes() -> pd.DataFrame:
     try:
@@ -726,7 +704,6 @@ def process_ticker(ticker: str,
                    ratios_df: pd.DataFrame,
                    sector_lookup: dict,
                    macro_df: pd.DataFrame,
-                   sentiment_df: pd.DataFrame,
                    regime_df: pd.DataFrame,
                    dataset_max_date: pd.Timestamp) -> pd.DataFrame:
     
@@ -762,22 +739,6 @@ def process_ticker(ticker: str,
 
     # ── 10. Relative strength ────────────────────────────────────────────
     df = compute_relative_strength(df)
-
-    # ── 11. Sentiment (t-1 lag) ──────────────────────────────────────────
-    tick_sent = (
-        sentiment_df[sentiment_df["Ticker"] == ticker]
-        .drop(columns=["Ticker"])
-        .sort_values("Date")
-        .copy()
-    )
-    tick_sent["Sentiment_Score_Lag1"] = tick_sent["Sentiment_Score"].shift(1)
-    tick_sent.drop(columns=["Sentiment_Score"], inplace=True)
-    df = df.merge(tick_sent, on="Date", how="left")
-
-    df["Sentiment_Available"] = (
-        (df["Date"] >= pd.Timestamp(SENTIMENT_START_DATE))
-        & (df["Announcement_Score"].notna() | df["Sentiment_Score_Lag1"].notna())
-    ).astype("int8")
 
     # ── 12. Market regime ────────────────────────────────────────────────
     if not regime_df.empty:
@@ -1086,14 +1047,14 @@ def print_verification():
             SELECT
                 SUM(Price_Gap_Flag), SUM(SMA200_Available), SUM(SMA50_Available),
                 SUM(ADX14_Available), SUM(Volatility20d_Available),
-                SUM(Sentiment_Available), SUM(Fundamentals_Available)
+                SUM(Fundamentals_Available)
             FROM {TABLES['features']}
         """)).fetchone()
         print("\nFlag distributions (rows = 1):")
         for name, val in zip(
             ["Price_Gap_Flag", "SMA200_Available", "SMA50_Available",
              "ADX14_Available", "Volatility20d_Available",
-             "Sentiment_Available", "Fundamentals_Available"], fl
+             "Fundamentals_Available"], fl
         ):
             print(f"  {name:<28}: {val:>12,}")
 
@@ -1170,7 +1131,6 @@ def main():
 
     print("\n📥 Phase 1 — pre-computation...")
     macro_df  = load_macro()
-    sent_df   = load_sentiment()
     regime_df = load_market_regimes()
 
     print("\n📊 Loading and computing fundamental ratios...")
@@ -1209,7 +1169,7 @@ def main():
             tier = tier_map[ticker]
             df   = process_ticker(
                 ticker, tier, ratios_df, sector_lookup,
-                macro_df, sent_df, regime_df, dataset_max_date,
+                macro_df, regime_df, dataset_max_date,
             )
 
             if df.empty:
