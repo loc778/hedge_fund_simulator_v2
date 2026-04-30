@@ -501,7 +501,161 @@ def run_script(script_name: str, args: list[str] = None) -> tuple[bool, str]:
         return False, "Timed out after 60 minutes."
     except Exception as e:
         return False, str(e)
+def persist_portfolio(
+    proposed_df: pd.DataFrame,
+    signal_date,
+    nav: float,
+    engine,
+) -> str:
+    """
+    Persist optimizer output to portfolio_positions.
 
+    - If signal_date already has open rows → skip (idempotent on refresh).
+    - New tickers not in the open book → INSERT as new open positions.
+    - Open tickers no longer in proposed_df → close them (EXIT_Date, Exit_Price, Exit_Reason).
+
+    Returns a status string for display.
+    """
+    from sqlalchemy import text as _text
+    import pandas as pd
+
+    sig_date_str = pd.Timestamp(signal_date).strftime("%Y-%m-%d")
+
+    try:
+        with engine.connect() as conn:
+            # ── Idempotency check ─────────────────────────────────────────
+            already = conn.execute(_text(
+                "SELECT COUNT(*) FROM portfolio_positions "
+                "WHERE Signal_Date = :sd AND Status = 'open'"
+            ), {"sd": sig_date_str}).scalar()
+            if already and already > 0:
+                return f"skipped — signal date {sig_date_str} already committed ({already} positions)"
+
+            # ── Current open positions ────────────────────────────────────
+            open_rows = pd.read_sql(
+                "SELECT id, Ticker, Direction FROM portfolio_positions "
+                "WHERE Status = 'open'",
+                conn,
+            )
+            open_tickers = set(open_rows["Ticker"].tolist()) if not open_rows.empty else set()
+
+            # ── Proposed tickers from optimizer ──────────────────────────
+            if proposed_df.empty:
+                new_tickers = set()
+                proposed_tickers = set()
+            else:
+                proposed_df = proposed_df.copy()
+                proposed_df["_Ticker_norm"] = proposed_df["Ticker"].str.replace(
+                    r"\.NS$", "", regex=True
+                )
+                proposed_tickers = set(proposed_df["Ticker"].tolist())
+
+            # Normalise open_tickers to .NS for comparison
+            open_tickers_ns = {
+                t if t.endswith(".NS") else t + ".NS" for t in open_tickers
+            }
+
+            # ── 1. Close exits ────────────────────────────────────────────
+            exits = open_tickers_ns - proposed_tickers
+            n_closed = 0
+            for ticker in exits:
+                # Fetch latest price from ohlcv as exit price
+                price_row = conn.execute(_text(
+                    "SELECT Adj_Close FROM nifty500_ohlcv "
+                    "WHERE Ticker = :t AND Date <= :d "
+                    "ORDER BY Date DESC LIMIT 1"
+                ), {"t": ticker, "d": sig_date_str}).fetchone()
+                exit_price = float(price_row[0]) if price_row and price_row[0] else None
+
+                conn.execute(_text(
+                    "UPDATE portfolio_positions SET "
+                    "Status = 'closed', "
+                    "Exit_Date = :ed, "
+                    "Exit_Price = :ep, "
+                    "Exit_Reason = :er "
+                    "WHERE Ticker = :t AND Status = 'open'"
+                ), {
+                    "ed": sig_date_str,
+                    "ep": exit_price,
+                    "er": "signal_dropped",
+                    "t":  ticker,
+                })
+                n_closed += 1
+
+            # ── 2. Insert new positions ───────────────────────────────────
+            new_tickers = proposed_tickers - open_tickers_ns
+            n_inserted  = 0
+
+            if not proposed_df.empty:
+                # Load entry prices for new tickers
+                new_list = ", ".join(f"'{t}'" for t in new_tickers) if new_tickers else "''"
+                price_df = pd.read_sql(
+                    f"""
+                    SELECT o.Ticker, o.Adj_Close
+                    FROM nifty500_ohlcv o
+                    INNER JOIN (
+                        SELECT Ticker, MAX(Date) AS d
+                        FROM nifty500_ohlcv
+                        WHERE Ticker IN ({new_list}) AND Date <= '{sig_date_str}'
+                        GROUP BY Ticker
+                    ) m ON o.Ticker = m.Ticker AND o.Date = m.d
+                    """,
+                    conn,
+                ) if new_tickers else pd.DataFrame(columns=["Ticker", "Adj_Close"])
+                price_idx = price_df.set_index("Ticker")["Adj_Close"].to_dict()
+
+                for _, row in proposed_df.iterrows():
+                    ticker = row["Ticker"]
+                    if ticker not in new_tickers:
+                        continue
+
+                    direction  = row["Direction"].lower()
+                    size_pct   = float(row["Size_%NAV"]) / 100
+                    alloc_rs   = float(row["Alloc_Rs"])
+                    sector     = str(row.get("Sector", "Unknown") or "Unknown")
+                    is_midcap  = 1 if str(row.get("Tier", "A")) in ("B", "C") else 0
+                    entry_price= float(price_idx.get(ticker, 0))
+                    shares     = int(alloc_rs / entry_price) if entry_price > 0 else 0
+                    pos_class  = (
+                        "short"      if direction == "short"
+                        else "alpha_long" if is_midcap
+                        else "core_long"
+                    )
+                    stop_loss  = (
+                        round(entry_price * (1 - 0.15), 4) if direction == "long" and entry_price > 0
+                        else round(entry_price * (1 + 0.10), 4) if direction == "short" and entry_price > 0
+                        else None
+                    )
+
+                    conn.execute(_text("""
+                        INSERT IGNORE INTO portfolio_positions
+                        (Ticker, Signal_Date, Entry_Date, Entry_Price, Direction,
+                         Position_Class, Sector, Is_Midcap, Stop_Loss_Price,
+                         NAV_Weight_At_Entry, Shares, Status)
+                        VALUES
+                        (:ticker, :sd, :ed, :ep, :dir,
+                         :pc, :sector, :imc, :sl,
+                         :nav_w, :shares, 'open')
+                    """), {
+                        "ticker":  ticker,
+                        "sd":      sig_date_str,
+                        "ed":      sig_date_str,
+                        "ep":      entry_price if entry_price > 0 else None,
+                        "dir":     direction,
+                        "pc":      pos_class,
+                        "sector":  sector,
+                        "imc":     is_midcap,
+                        "sl":      stop_loss,
+                        "nav_w":   round(size_pct, 6),
+                        "shares":  shares if shares > 0 else None,
+                    })
+                    n_inserted += 1
+
+            conn.commit()
+            return f"committed — {n_inserted} new, {n_closed} closed (signal {sig_date_str})"
+
+    except Exception as e:
+        return f"error — {e}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -690,6 +844,25 @@ macro_row = load_macro_latest(as_of_date=pd.Timestamp(signal_date).strftime("%Y-
 # ─────────────────────────────────────────────────────────────────────────────
 
 opt_result = run_optimization(signals_today, sector_map, nav_input, regime_int)
+
+# ── Auto-persist to portfolio_positions (idempotent on refresh) ──────────────
+if opt_result is not None and not opt_result.positions.empty and RISK_AVAILABLE:
+    _persist_status = persist_portfolio(
+        proposed_df = opt_result.positions,
+        signal_date = signal_date,
+        nav         = nav_input,
+        engine      = get_engine(),
+    )
+    # Surface in sidebar so it's visible without taking up main area
+    with st.sidebar:
+        _color = "#3fb950" if "committed" in _persist_status else "#8b949e" if "skipped" in _persist_status else "#f85149"
+        st.markdown(
+            f"<div style='font-family:monospace;font-size:0.68rem;color:{_color};"
+            f"padding:6px 0;border-top:1px solid #1e2d40;margin-top:4px'>"
+            f"📒 {_persist_status}</div>",
+            unsafe_allow_html=True,
+        )
+
 if opt_result is not None:
     proposed_df = opt_result.positions
     # Always re-merge sector + company from sector_map CSV (ground truth)
@@ -852,8 +1025,8 @@ st.divider()
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab6 = st.tabs([
-    "SIGNALS", "PORTFOLIO", "RISK", "BACKTEST GRAPHS", "RETURNS & TAXES"
+tab1, tab2, tab4, tab6 = st.tabs([
+    "SIGNALS", "PORTFOLIO", "BACKTEST GRAPHS", "RETURNS & TAXES"
 ])
 
 
@@ -1264,125 +1437,11 @@ with tab2:
             st.dataframe(short_table, use_container_width=True, hide_index=True,
                          height=min(50 + len(shorts)*38, 300))
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — RISK
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab3:
-
-    if not RISK_AVAILABLE:
-        st.error("Risk manager not available.")
-    else:
-        st.markdown("<div class='section-header'>Portfolio-Level Limits</div>", unsafe_allow_html=True)
-
-        if ps_final is not None:
-            gl  = ps_final.gross_long_nav_pct
-            gs  = ps_final.gross_short_nav_pct
-            net = ps_final.net_exposure_pct
-            grs = ps_final.gross_exposure_pct
-            csh = ps_final.cash_pct
-        else:
-            gl = gs = net = grs = csh = 0.0
-
-        rc1, rc2 = st.columns(2)
-
-        with rc1:
-            st.markdown(
-                gauge_html(gl,  1.20,      "Gross Long (cap 120%)") +
-                gauge_html(gs,  0.20,      "Gross Short (cap 20%)") +
-                gauge_html(grs, 1.50, "Gross Exposure (cap 150%)"),
-                unsafe_allow_html=True
-            )
-
-        with rc2:
-            # Net exposure: show position within [70%, 110%] band
-            net_util = (net - NET_EXPOSURE_MIN_PCT) / (NET_EXPOSURE_MAX_PCT - NET_EXPOSURE_MIN_PCT)
-            net_util = max(0.0, min(net_util, 1.0))
-            st.markdown(
-                gauge_html(csh, 1.0, f"Cash (floor {CASH_RESERVE_MIN_PCT:.0%})") +
-                f"<div style='margin-bottom:10px'>"
-                f"<div style='display:flex;justify-content:space-between;margin-bottom:3px'>"
-                f"<span style='font-size:0.72rem;color:#8b949e;font-family:monospace'>Net Exposure (range 70%–110%)</span>"
-                f"<span style='font-size:0.72rem;color:#58a6ff;font-family:monospace'>{net:.1%}</span>"
-                f"</div>"
-                f"<div class='gauge-bg'><div class='gauge-fill' "
-                f"style='width:{net_util*100:.1f}%;background:#58a6ff'></div></div>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-
-        st.divider()
-
-        # ── Sector allocation charts (moved from proposed book) ───────────
-        import plotly.graph_objects as go
-        # Long book sector allocation
-        st.markdown("<div class='section-header'>Long Book — Sector Allocation</div>",
-                    unsafe_allow_html=True)
-        if not proposed_df.empty:
-            longs_r = proposed_df[proposed_df["Direction"]=="LONG"]
-            if not longs_r.empty:
-                sec_l = longs_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
-                fig_sl = go.Figure(go.Bar(
-                    x=[_wrap_label(s) for s in sec_l["Sector"]],
-                    y=sec_l["Size_%NAV"].round(2),
-                    text=sec_l["Size_%NAV"].round(2).astype(str) + "%",
-                    textposition="outside",
-                    textfont=dict(color="#58a6ff", size=10),
-                    marker_color="#58a6ff",
-                    hovertemplate="%{customdata}<br>%{y:.2f}% NAV<extra></extra>",
-                    customdata=sec_l["Sector"],
-                ))
-                fig_sl.update_layout(
-                    height=300, margin=dict(l=10,r=10,t=30,b=80),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                    xaxis=dict(title="Sector", tickfont=dict(size=9,color="#8b949e"),
-                               tickangle=-35, gridcolor="#1e2d40"),
-                    yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
-                               gridcolor="#1e2d40"),
-                )
-                st.plotly_chart(fig_sl, use_container_width=True)
-        st.markdown("<div class='section-header'>Short Book — Sector Allocation</div>",
-                    unsafe_allow_html=True)
-        if not proposed_df.empty:
-            shorts_r = proposed_df[proposed_df["Direction"]=="SHORT"]
-            if not shorts_r.empty:
-                sec_s = shorts_r.groupby("Sector")["Size_%NAV"].sum().sort_values(ascending=False).reset_index()
-                fig_ss = go.Figure(go.Bar(
-                    x=[_wrap_label(s) for s in sec_s["Sector"]],
-                    y=sec_s["Size_%NAV"].round(2),
-                    text=sec_s["Size_%NAV"].round(2).astype(str) + "%",
-                    textposition="outside",
-                    textfont=dict(color="#f85149", size=10),
-                    marker_color="#f85149",
-                    width=[0.35] * len(sec_s),
-                    hovertemplate="%{customdata}<br>%{y:.2f}% NAV<extra></extra>",
-                    customdata=sec_s["Sector"],
-                ))
-                fig_ss.update_layout(
-                    height=300, margin=dict(l=10,r=10,t=30,b=80),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
-                    bargap=0.6,
-                    xaxis=dict(title="Sector", tickfont=dict(size=9,color="#8b949e"),
-                               tickangle=-35, gridcolor="#1e2d40"),
-                    yaxis=dict(title="% of NAV", tickfont=dict(size=10,color="#8b949e"),
-                               gridcolor="#1e2d40"),
-                )
-                st.plotly_chart(fig_ss, use_container_width=True)
-            else:
-                st.info("No short positions.")
-
         # ── Rejected candidates ───────────────────────────────────────────
         if not rejected_df.empty:
             st.divider()
             with st.expander(f"Rejected candidates ({len(rejected_df)})", expanded=False):
                 st.dataframe(rejected_df, use_container_width=True, hide_index=True)
-
-
-
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — GRAPHS
@@ -1568,11 +1627,6 @@ with tab4:
                        zeroline=True, zerolinecolor="#484f58"),
         )
         st.plotly_chart(fig_rs, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — RETURNS & FEES
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — RETURNS & FEES

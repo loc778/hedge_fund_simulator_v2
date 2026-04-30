@@ -260,27 +260,39 @@ class PortfolioState:
         as_of_date: Optional[date] = None,
     ) -> "PortfolioState":
         
+        import pandas as pd
         positions: Dict[str, OpenPosition] = {}
-        # ── STUB: no active positions yet ────────────────────────────────────
-        # Uncomment and implement when portfolio_positions is live:
-        #
-        # import pandas as pd
-        # with engine.connect() as conn:
-        #     rows = pd.read_sql(
-        #         "SELECT * FROM portfolio_positions WHERE Exit_Date IS NULL",
-        #         conn
-        #     )
-        # for _, row in rows.iterrows():
-        #     positions[row['Ticker']] = OpenPosition(
-        #         ticker        = row['Ticker'],
-        #         direction     = 'long' if 'long' in row['Position_Class'] else 'short',
-        #         size_nav_pct  = row['NAV_Weight_At_Entry'],
-        #         entry_price   = row['Entry_Price'],
-        #         current_price = _fetch_latest_price(engine, row['Ticker']),
-        #         entry_date    = row['Entry_Date'],
-        #         sector        = row.get('Sector', 'Unknown'),
-        #         is_midcap     = row.get('Is_Midcap', False),
-        #     )
+        try:
+            with engine.connect() as conn:
+                rows = pd.read_sql(
+                    "SELECT p.Ticker, p.Direction, p.NAV_Weight_At_Entry, "
+                    "p.Entry_Price, p.Entry_Date, p.Sector, p.Is_Midcap, "
+                    "o.Adj_Close AS Current_Price "
+                    "FROM portfolio_positions p "
+                    "LEFT JOIN ( "
+                    "    SELECT Ticker, Adj_Close FROM nifty500_ohlcv o "
+                    "    INNER JOIN (SELECT Ticker AS t, MAX(Date) AS d "
+                    "                FROM nifty500_ohlcv GROUP BY Ticker) m "
+                    "    ON o.Ticker = m.t AND o.Date = m.d "
+                    ") o ON o.Ticker = p.Ticker "
+                    "WHERE p.Status = 'open'",
+                    conn,
+                )
+            for _, row in rows.iterrows():
+                ticker = str(row["Ticker"])
+                positions[ticker] = OpenPosition(
+                    ticker        = ticker,
+                    direction     = str(row["Direction"]),
+                    size_nav_pct  = float(row["NAV_Weight_At_Entry"] or 0),
+                    entry_price   = float(row["Entry_Price"] or 0),
+                    current_price = float(row["Current_Price"]) if pd.notna(row.get("Current_Price")) else float(row["Entry_Price"] or 0),
+                    entry_date    = row["Entry_Date"] if isinstance(row["Entry_Date"], date) else date.fromisoformat(str(row["Entry_Date"])),
+                    sector        = str(row["Sector"] or "Unknown"),
+                    is_midcap     = bool(row["Is_Midcap"]),
+                )
+        except Exception as e:
+            import warnings
+            warnings.warn(f"[PortfolioState.from_db] Could not load open positions: {e}")
 
         return cls(
             as_of_date          = as_of_date or date.today(),

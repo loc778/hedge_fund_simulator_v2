@@ -331,10 +331,26 @@ def optimize_portfolio(
     approved_positions: dict[str, dict] = {}
     rejected_records:   list[dict]      = []
 
+    # NEW
+    # Load incumbent open positions from DB once before the risk-check loop.
+    # This ensures risk limits (sector caps, gross exposure) account for
+    # positions already on the book from prior signal runs.
+    try:
+        _incumbent_ps = PortfolioState.from_db(
+            engine=engine, nav=nav, peak_nav=nav, cash=nav,
+            fii_net_today_cr=None, fii_consecutive_neg=0,
+            nav_return_21d=None, is_budget_period=False,
+            is_fo_expiry_week=False, regime=regime_int, as_of_date=as_of,
+        )
+        _incumbent_positions: dict = dict(_incumbent_ps.positions)
+    except Exception:
+        _incumbent_positions = {}
+
     def _current_ps() -> PortfolioState:
-        """Build PortfolioState from approved_positions so far."""
-        pos_map = {
-            t: OpenPosition(
+        """Build PortfolioState from incumbent DB positions + newly approved positions."""
+        pos_map = dict(_incumbent_positions)  # start from open book
+        for t, d in approved_positions.items():
+            pos_map[t] = OpenPosition(
                 ticker        = t,
                 direction     = d["direction"],
                 size_nav_pct  = d["size_nav_pct"],
@@ -344,9 +360,7 @@ def optimize_portfolio(
                 sector        = d["sector"],
                 is_midcap     = d["is_midcap"],
             )
-            for t, d in approved_positions.items()
-        }
-        cash_used = sum(d["size_nav_pct"] * nav for d in approved_positions.values())
+        cash_used = sum(p.size_nav_pct * nav for p in pos_map.values())
         return PortfolioState(
             as_of_date          = as_of,
             nav                 = nav,
