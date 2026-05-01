@@ -40,10 +40,8 @@ def _mk(col, label, value, color="#c9d1d9"):
     col.markdown(
         f"<div style='background:#0d1117;border:1px solid #1e2d40;border-radius:6px;"
         f"padding:12px 16px;text-align:center'>"
-        f"<div style='font-size:0.72rem;color:#8b949e;text-transform:uppercase;"
-        f"letter-spacing:0.08em;font-family:monospace'>{label}</div>"
-        f"<div style='font-size:1.3rem;font-weight:600;color:{color};"
-        f"font-family:monospace'>{value}</div></div>",
+        f"<div class='kpi-label'>{label}</div>"
+        f"<div class='kpi-value' style='color:{color}'>{value}</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -188,6 +186,23 @@ st.markdown("""
         font-family:'JetBrains Mono',monospace; font-size:0.8rem; font-weight:600;
     }
 
+    /* Macro strip — full width row, evenly spaced, never wraps */
+    .macro-strip-wrap {
+        display:flex; align-items:center; justify-content:space-evenly;
+        padding:10px 0; border-top:1px solid #1e2d40; border-bottom:1px solid #1e2d40;
+        margin: 8px 0;
+    }
+    .macro-strip-item { text-align:center; flex:1; }
+    .macro-strip-sep  { width:1px; height:32px; background:#1e2d40; flex-shrink:0; }
+    .macro-strip-label { font-size:0.62rem; color:#8b949e; text-transform:uppercase;
+                         letter-spacing:0.1em; margin-bottom:2px; font-family:monospace; }
+    .macro-strip-value { font-size:1.05rem; font-weight:700; font-family:monospace; }
+
+    /* KPI cards */
+    .kpi-label { font-size:0.72rem; color:#8b949e; text-transform:uppercase;
+                 letter-spacing:0.08em; font-family:monospace; }
+    .kpi-value { font-size:1.3rem; font-weight:600; font-family:monospace; }
+
     /* Risk gauge bar */
     .gauge-wrap { margin: 4px 0 10px 0; }
     .gauge-bg   { background:#1e2d40; border-radius:4px; height:8px; width:100%; }
@@ -222,6 +237,11 @@ st.markdown("""
 
     /* Divider */
     hr { border-color: #1e2d40 !important; }
+
+    /* Reduce Streamlit top padding so header can move */
+    .block-container {
+        padding-top: 1rem !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -887,127 +907,122 @@ else:
     opt_stats   = None
     rejected_df = pd.DataFrame()
 
-# ── Top bar: [Title + Signal Date] | [Macro Strip] | [Regime] ───────────────
-_h1, _h2, _h3 = st.columns([3, 4, 2])
+# ── Row 1: Title | Market Regime + Expected Return ───────────────────────────
+_h1, _h3 = st.columns([5, 3])
 
 with _h1:
     _sig_date_str = pd.Timestamp(signal_date).strftime("%d %b %Y")
     st.markdown(
-        # Row 1: Title + "Signal Date" label on same line
-        "<div style='display:flex;align-items:baseline;gap:20px'>"
+        "<div style='display:flex;align-items:center;gap:20px;margin-top:28px'>"
+        "<div style='display:flex;flex-direction:column;gap:2px'>"
         "<h2 style='font-family:monospace;font-size:1.3rem;color:#c9d1d9;"
         "margin:0;padding:0;font-weight:600;white-space:nowrap'>"
         "AI HEDGE FUND SIMULATOR</h2>"
-        "<span style='font-family:monospace;font-size:0.65rem;color:#8b949e;"
+        "<div style='font-family:monospace;font-size:0.68rem;color:#8b949e;"
+        "text-transform:uppercase;letter-spacing:0.1em;margin:0;white-space:nowrap'>"
+        "NSE Nifty 500 · Long/Short Equity · v2</div>"
+        "</div>"
+        "<div style='display:flex;flex-direction:column;align-items:center;gap:2px'>"
+        "<span style='font-family:monospace;font-size:0.85rem;color:#8b949e;"
         "text-transform:uppercase;letter-spacing:0.1em;white-space:nowrap'>"
         "Signal Date</span>"
-        "</div>"
-        # Row 2: Subtitle + date value on same line
-        "<div style='display:flex;align-items:baseline;gap:16px;margin-top:4px'>"
-        "<p style='font-family:monospace;font-size:0.68rem;color:#8b949e;"
-        "text-transform:uppercase;letter-spacing:0.1em;margin:0;white-space:nowrap'>"
-        "NSE Nifty 500 · Long/Short Equity · v2</p>"
-        f"<span style='font-family:monospace;font-size:1.05rem;color:#58a6ff;"
+        f"<span style='font-family:monospace;font-size:0.95rem;color:#58a6ff;"
         f"font-weight:700;white-space:nowrap'>{_sig_date_str}</span>"
+        "</div>"
         "</div>",
         unsafe_allow_html=True
     )
 
-with _h2:
-    # Macro strip — larger font, fetch FII from monthly if daily missing
-    _macro_fields = {
-        "India_VIX":   ("INDIA VIX", ""),
-        "USDINR":      ("USD/INR",   "₹"),
-        "Crude_Oil":   ("CRUDE",     "$"),
-        "Gold":        ("GOLD",      "$"),
-        "Repo_Rate":   ("REPO",      ""),
-    }
-    # FII: try all known column variants, prefer daily
-    _fii_val = None
-    _fii_label = "FII NET"
-    _fii_candidates = [
-        ("FII_Daily_Net_Cr",   "FII (D)"),
-        ("FII_Monthly_Net_Cr", "FII (M)"),
-        ("FII_Net_Buy_Cr",     "FII NET"),
-        ("FII_Net",            "FII NET"),
-        ("FII",                "FII NET"),
-    ]
-    for _fii_col, _fii_lbl in _fii_candidates:
-        if _fii_col in macro_row.index and pd.notna(macro_row.get(_fii_col)):
-            _fii_val   = macro_row[_fii_col]
-            _fii_label = _fii_lbl
-            break
-    # Debug: show available macro columns with data (remove after confirming FII works)
-    # st.write({c: macro_row[c] for c in macro_row.index if pd.notna(macro_row.get(c))})
-
-    _mstrip_parts = []
-    for _field, (_label, _unit) in _macro_fields.items():
-        _raw = macro_row.get(_field) if _field in macro_row.index else None
-        if _raw is not None and pd.notna(_raw):
-            try:
-                _v = float(_raw)
-                _display = f"{_unit}{_v:,.2f}" if abs(_v) < 1000 else f"{_unit}{_v:,.0f}"
-            except Exception:
-                _display = str(_raw)
-            if _label == "INDIA VIX":
-                _color = "#3fb950" if float(_raw) < 20 else "#f85149" if float(_raw) > 25 else "#e3b341"
-            elif _label == "REPO":
-                _display = f"{float(_raw):.2f}%"
-                _color = "#c9d1d9"
-            elif _label == "GOLD":
-                _display = f"${float(_raw):,.0f}"
-                _color = "#e3b341"
-            else:
-                _color = "#c9d1d9"
-            _mstrip_parts.append(
-                f"<div style='text-align:center;padding:0 12px'>"
-                f"<div style='font-size:0.62rem;color:#8b949e;text-transform:uppercase;"
-                f"letter-spacing:0.1em;margin-bottom:2px'>{_label}</div>"
-                f"<div style='font-size:1.0rem;color:{_color};font-weight:700;"
-                f"font-family:monospace'>{_display}</div>"
-                f"</div>"
-            )
-
-    # Add FII
-    if _fii_val is not None:
-        try:
-            _fv = float(_fii_val)
-            _fii_display = f"₹{_fv:,.0f} Cr"
-            _fii_color = "#3fb950" if _fv > 0 else "#f85149"
-        except Exception:
-            _fii_display = str(_fii_val)
-            _fii_color = "#c9d1d9"
-        _mstrip_parts.append(
-            f"<div style='text-align:center;padding:0 16px'>"
-            f"<div style='font-size:0.65rem;color:#8b949e;text-transform:uppercase;"
-            f"letter-spacing:0.1em;margin-bottom:2px'>{_fii_label}</div>"
-            f"<div style='font-size:1.1rem;color:{_fii_color};font-weight:700;"
-            f"font-family:monospace'>{_fii_display}</div>"
-            f"</div>"
-        )
-
-    if _mstrip_parts:
-        st.markdown(
-            "<div style='display:flex;align-items:center;justify-content:center;"
-            "padding:12px 0;border-left:1px solid #1e2d40;border-right:1px solid #1e2d40;"
-            "height:100%'>" + "".join(_mstrip_parts) + "</div>",
-            unsafe_allow_html=True
-        )
-
 with _h3:
-    _h3_left, _h3_right = st.columns([1, 1])
+    st.markdown("<div style='display:flex;justify-content:flex-end;align-items:center;gap:0;height:100%;margin-top:28px'>", unsafe_allow_html=True)
+    _h3_gap, _h3_left, _h3_right = st.columns([1, 2, 2])
+    with _h3_left:
+        _header_exp_ret_placeholder = st.empty()
     with _h3_right:
         _header_regime = st.empty()
         _header_regime.markdown(
-            f"<div style='text-align:right;padding-top:6px'>"
+            f"<div style='text-align:center'>"
             f"<div style='font-family:monospace;font-size:0.62rem;color:#8b949e;"
             f"text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px'>Market Regime</div>"
             f"{regime_pill(regime_int)}"
             f"</div>",
             unsafe_allow_html=True
         )
-    with _h3_left:
-        _header_exp_ret_placeholder = st.empty()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── Row 2: Full-width macro strip ────────────────────────────────────────────
+_macro_fields = {
+    "India_VIX":   ("INDIA VIX", ""),
+    "USDINR":      ("USD/INR",   "₹"),
+    "Crude_Oil":   ("CRUDE",     "$"),
+    "Gold":        ("GOLD",      "$"),
+    "Repo_Rate":   ("REPO",      ""),
+}
+_fii_val = None
+_fii_label = "FII NET"
+_fii_candidates = [
+    ("FII_Daily_Net_Cr",   "FII (D)"),
+    ("FII_Monthly_Net_Cr", "FII (M)"),
+    ("FII_Net_Buy_Cr",     "FII NET"),
+    ("FII_Net",            "FII NET"),
+    ("FII",                "FII NET"),
+]
+for _fii_col, _fii_lbl in _fii_candidates:
+    if _fii_col in macro_row.index and pd.notna(macro_row.get(_fii_col)):
+        _fii_val   = macro_row[_fii_col]
+        _fii_label = _fii_lbl
+        break
+
+_mstrip_parts = []
+for _field, (_label, _unit) in _macro_fields.items():
+    _raw = macro_row.get(_field) if _field in macro_row.index else None
+    if _raw is not None and pd.notna(_raw):
+        try:
+            _v = float(_raw)
+            _display = f"{_unit}{_v:,.2f}" if abs(_v) < 1000 else f"{_unit}{_v:,.0f}"
+        except Exception:
+            _display = str(_raw)
+        if _label == "INDIA VIX":
+            _color = "#3fb950" if float(_raw) < 20 else "#f85149" if float(_raw) > 25 else "#e3b341"
+        elif _label == "REPO":
+            _display = f"{float(_raw):.2f}%"
+            _color = "#c9d1d9"
+        elif _label == "GOLD":
+            _display = f"${float(_raw):,.0f}"
+            _color = "#e3b341"
+        else:
+            _color = "#c9d1d9"
+        if _mstrip_parts:
+            _mstrip_parts.append("<div class='macro-strip-sep'></div>")
+        _mstrip_parts.append(
+            f"<div class='macro-strip-item'>"
+            f"<div class='macro-strip-label'>{_label}</div>"
+            f"<div class='macro-strip-value' style='color:{_color}'>{_display}</div>"
+            f"</div>"
+        )
+
+if _fii_val is not None:
+    try:
+        _fv = float(_fii_val)
+        _fii_display = f"₹{_fv:,.0f} Cr"
+        _fii_color = "#3fb950" if _fv > 0 else "#f85149"
+    except Exception:
+        _fii_display = str(_fii_val)
+        _fii_color = "#c9d1d9"
+    if _mstrip_parts:
+        _mstrip_parts.append("<div class='macro-strip-sep'></div>")
+    _mstrip_parts.append(
+        f"<div class='macro-strip-item'>"
+        f"<div class='macro-strip-label'>{_fii_label}</div>"
+        f"<div class='macro-strip-value' style='color:{_fii_color}'>{_fii_display}</div>"
+        f"</div>"
+    )
+
+if _mstrip_parts:
+    st.markdown(
+        "<div class='macro-strip-wrap'>" + "".join(_mstrip_parts) + "</div>",
+        unsafe_allow_html=True
+    )
 
 st.divider()
 
@@ -1799,11 +1814,11 @@ with tab6:
             _abs_ret_pct = ((_gross_gain_sum - _tax_sum - _tc_sum) / total_deployed_rs) * 100
             _exp_color   = "#3fb950" if _exp_ret_pct >= 0 else "#f85149"
             _header_exp_ret_placeholder.markdown(
-                f"<div style='text-align:center;padding:0 12px;padding-top:6px'>"
-                f"<div style='font-size:0.62rem;color:#8b949e;text-transform:uppercase;"
-                f"letter-spacing:0.1em;margin-bottom:2px'>Expected Return</div>"
-                f"<div style='font-size:1.0rem;color:{_exp_color};font-weight:700;"
-                f"font-family:monospace'>{_exp_ret_pct:+.1f}%</div>"
+                f"<div style='text-align:center'>"
+                f"<div style='font-family:monospace;font-size:0.62rem;color:#8b949e;"
+                f"text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px'>Expected Return</div>"
+                f"<div style='font-size:1.05rem;color:{_exp_color};font-weight:700;"
+                f"font-family:monospace;text-align:center'>{_exp_ret_pct:+.1f}%</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
