@@ -271,11 +271,11 @@ print(f"Date range   : {df_full[DATE_COL].min().date()} → {df_full[DATE_COL].m
 
 # ── HMM Regimes ───────────────────────────────────────────────────────────────
 print("\nLoading pre-computed HMM regimes ...")
-regimes_path_full = os.path.join(BASE_DIR, 'exports', 'market_regimes.csv')
-if not os.path.exists(regimes_path_full):
-    raise FileNotFoundError(f"market_regimes.csv not found at {regimes_path_full}")
-
-regimes_all = pd.read_csv(regimes_path_full)
+engine = get_engine()
+regimes_all = pd.read_sql(
+    "SELECT Date, Regime_Label FROM market_regimes ORDER BY Date",
+    engine
+)
 regimes_all['Date'] = pd.to_datetime(regimes_all['Date'])
 regimes_df  = regimes_all[regimes_all['Date'] >= holdout_start_dt].copy()
 regimes_df  = regimes_df.sort_values('Date').reset_index(drop=True)
