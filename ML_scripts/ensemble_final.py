@@ -74,6 +74,10 @@ RESULTS_DIR  = os.path.join(BASE_DIR, 'exports', 'model_output')
 PARQUET_PATH = os.path.join(BASE_DIR, 'exports', 'features_master_latest.parquet')
 PRICES_PATH  = os.path.join(BASE_DIR, 'exports', 'backtest_prices.csv')
 
+import sys
+sys.path.insert(0, os.path.join(BASE_DIR, 'data'))
+from db import get_engine
+
 os.makedirs(RESULTS_DIR, exist_ok=True)
 DATE_STAMP = datetime.today().strftime('%Y%m%d')
 print(f"Date stamp     : {DATE_STAMP}")
@@ -270,7 +274,7 @@ print(f"Tickers      : {df_full[TICKER_COL].nunique()}")
 print(f"Date range   : {df_full[DATE_COL].min().date()} → {df_full[DATE_COL].max().date()}")
 
 # ── HMM Regimes ───────────────────────────────────────────────────────────────
-print("\nLoading pre-computed HMM regimes ...")
+print("\nLoading pre-computed HMM regimes from DB ...")
 engine = get_engine()
 regimes_all = pd.read_sql(
     "SELECT Date, Regime_Label FROM market_regimes ORDER BY Date",
@@ -297,8 +301,18 @@ df_bt = df_full[
 ].copy()
 print(f"\nInference rows : {len(df_bt):,}  |  Dates: {df_bt[DATE_COL].nunique()}")
 
-df_bt['XGB_Score'] = xgb_model.predict(df_bt[XGB_FEATURES].copy())
-df_bt['LGB_Score'] = lgb_model.predict(df_bt[LGB_FEATURES].copy())
+_SENTINEL_COLS = ['Announcement_Score', 'Sentiment_Score_Lag1']
+for _col in _SENTINEL_COLS:
+    if _col not in df_bt.columns:
+        df_bt[_col] = 0.0
+
+_xgb_input = df_bt[XGB_FEATURES].copy()
+_xgb_input = _xgb_input[XGB_FEATURES]
+df_bt['XGB_Score'] = xgb_model.predict(_xgb_input)
+
+_lgb_input = df_bt[LGB_FEATURES].copy()
+_lgb_input = _lgb_input[LGB_FEATURES]
+df_bt['LGB_Score'] = lgb_model.predict(_lgb_input)
 df_bt['XGB_Rank']  = df_bt.groupby(DATE_COL)['XGB_Score'].rank(pct=True)
 df_bt['LGB_Rank']  = df_bt.groupby(DATE_COL)['LGB_Score'].rank(pct=True)
 print("XGB + LGB predictions + cross-sectional ranking done.")
@@ -597,7 +611,6 @@ def apply_sector_cap(candidates: pd.DataFrame, sizes: pd.Series,
                     adjusted[t] *= scale
     return adjusted
 
-print("All helper functions defined.")
 
 
 # =============================================================================

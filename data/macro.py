@@ -192,8 +192,6 @@ def main():
     print("\n💾 Upserting into macro_indicators...")
     upsert_macro_rows(combined)
 
-    print("\n📋 Next: python data/fii_dii.py")
-
 
 if __name__ == "__main__":
     main()

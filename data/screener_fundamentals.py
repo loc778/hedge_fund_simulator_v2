@@ -535,16 +535,8 @@ def main():
 
             ref = records[-2] if len(records) > 1 else records[-1]
             print(
-                f"OK {len(records)} yrs | "
-                f"Rev={'Y' if ref['Revenue'] else 'N'} "
-                f"GP={'Y' if ref['Gross_Profit'] else 'N'} "
-                f"NI={'Y' if ref['Net_Income'] else 'N'} "
-                f"FCF={'Y' if ref['Free_Cash_Flow'] else 'N'} "
-                f"Cash={'Y' if ref['Cash'] else 'N'} "
-                f"PE={'Y' if records[-1]['PE_Ratio'] else 'N'} "
-                f"ROE={'Y' if records[-1]['ROE'] else 'N'} "
-                f"ROA={'Y' if ref['ROA'] else 'N'} "
-                f"D/E={'Y' if ref['Debt_to_Equity'] else 'N'}"
+                f" {len(records)} yrs  "
+                
             )
 
         except Exception as e:
@@ -581,8 +573,6 @@ COMPLETE
         print(f"No data  : {no_data}")
     if failed:
         print(f"Errors   : {failed}")
-
-    print("\nNext: python data/macro.py")
 
 
 if __name__ == "__main__":

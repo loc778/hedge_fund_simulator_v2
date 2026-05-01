@@ -1206,7 +1206,6 @@ def main():
     print("\n" + "=" * 60)
     print(f"DONE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
-    print("\n📋 Next: python data/export_features.py")
 
 
 if __name__ == "__main__":

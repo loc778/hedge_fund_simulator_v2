@@ -214,8 +214,6 @@ COMPLETE
     if skipped:
         print(f"Skipped : {skipped}")
 
-    print("\nNext: python data/screener_fundamentals.py")
-
 
 if __name__ == "__main__":
     main()
