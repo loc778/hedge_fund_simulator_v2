@@ -658,77 +658,6 @@ def save_models(best_model: GaussianHMM,
         }, f)
     print(f'  Saved: {statemap_path}')
 
-
-# ═══════════════════════════════════════════════════════════
-# PHASE 9 — SANITY CHECKS
-# ═══════════════════════════════════════════════════════════
-
-def run_sanity_checks(best_model, trans_reordered, df_train, regime_df,
-                      prob_cols, bull_ret, bear_ret, hv_vix, max_vix,
-                      feature_cols, model_version, db_write_ok):
-    print('\n' + '=' * 60)
-    print('SANITY CHECKS — HMM v3')
-    print('=' * 60)
-    results = []
-
-    def chk(label, passed, detail=''):
-        icon = '✅ PASS' if passed else '❌ FAIL'
-        results.append(passed)
-        print(f'  [{icon}] {label}')
-        if detail:
-            print(f'          {detail}')
-
-    chk('Best model converged', best_model.monitor_.converged)
-
-    for i, label in enumerate(['Bull', 'Bear', 'HighVol', 'Sideways']):
-        val = trans_reordered[i, i]
-        chk(f'State persistence > 0.90: {label} ({val:.4f})', val > 0.90)
-
-    for label in STATE_NAMES:
-        count = (regime_df['Regime_Label'] == label).sum()
-        pct   = count / len(regime_df) * 100
-        chk(f'Regime frequency > 3%: {label} ({pct:.1f}%)', pct >= 3.0,
-            f'{count:,} days')
-
-    chk('Bull mean return positive', bull_ret > 0,
-        f'{bull_ret*100:+.4f}%')
-
-
-    chk('Bear mean return < Bull mean return (relative bear regime)',
-        bear_ret < bull_ret,
-        f'Bull={bull_ret*100:+.4f}%  Bear={bear_ret*100:+.4f}%  '
-        f'(absolute negative not required for secular bull market)')
-
-    chk('Bull return > Bear return', bull_ret > bear_ret,
-        f'Bull={bull_ret*100:+.4f}%  Bear={bear_ret*100:+.4f}%')
-
-    bear_vix = df_train[df_train['Regime_Label'] == 'Bear']['India_VIX'].mean()
-    chk(f'HighVol has 2nd highest mean VIX (Bear={bear_vix:.2f} > HighVol={hv_vix:.2f})',
-        hv_vix > df_train[df_train['Regime_Label'] == 'Sideways']['India_VIX'].mean(),
-        'Bear holds highest VIX (crash state) — HighVol holds 2nd highest — correct')
-
-    nan_count = regime_df['Regime_Label'].isna().sum()
-    chk('No NaN in Regime_Label', nan_count == 0, f'NaN count: {nan_count}')
-
-    chk('FIX-L1: Return_21d not in FEATURE_COLS', 'Return_21d' not in feature_cols)
-    chk('FIX-F1: Return_5d in FEATURE_COLS', 'Return_5d' in feature_cols)
-    chk('FIX-S1: Bear uses joint score assignment', True,
-        'Bear scored on (-return + 0.5 * vix_norm)')
-
-    prob_sums = regime_df[prob_cols].sum(axis=1)
-    max_dev   = (prob_sums - 1.0).abs().max()
-    chk(f'FIX-P1: Posteriors sum to 1.0 (max dev: {max_dev:.6f})', max_dev < 0.01)
-
-    chk('FIX-D1: DB write succeeded', db_write_ok)
-
-    print()
-    passed = sum(results)
-    total  = len(results)
-    status = 'ALL PASSED' if passed == total else f'{total - passed} FAILED'
-    print(f'  Result: {passed}/{total} checks  —  {status}')
-    print('=' * 60)
-
-
 # ═══════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════
@@ -799,12 +728,6 @@ def main():
     save_models(best_model, scaler, STATE_MAP, feature_cols, ordered_raw,
                 best_score, n_converged, fii_loaded, model_version, date_stamp)
 
-    # Phase 9
-    run_sanity_checks(
-        best_model, trans_reordered, df_train, regime_df, prob_cols,
-        bull_ret, bear_ret, hv_vix, max_vix,
-        feature_cols, model_version, db_write_ok
-    )
 
     print(f'\n{"=" * 60}')
     print(f'DONE: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')

@@ -611,7 +611,6 @@ def apply_sector_cap(candidates: pd.DataFrame, sizes: pd.Series,
                     adjusted[t] *= scale
     return adjusted
 
-print("All helper functions defined.")
 
 
 # =============================================================================

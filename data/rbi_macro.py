@@ -284,7 +284,6 @@ def main():
     except Exception as e:
         print(f"  ⚠️  Verification failed: {e}")
 
-    print("\n📋 Next: python data/sentiment.py (home laptop only)")
 
 
 if __name__ == "__main__":
