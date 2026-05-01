@@ -55,8 +55,9 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 # ── Config import ─────────────────────────────────────────────────────────────
 try:
+    from urllib.parse import quote_plus
     import config as cfg
-    DB_URL       = f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST', 'localhost')}/{os.getenv('DB_NAME', 'hedge_v2_db')}"
+    DB_URL       = f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{quote_plus(os.getenv('DB_PASSWORD', ''))}@{os.getenv('DB_HOST', 'localhost')}/{os.getenv('DB_NAME', 'hedge_v2_db')}"
     TABLES       = cfg.TABLES
     SECTORS_CSV  = os.path.join(_PROJECT_ROOT, "files", "nifty500_sectors.csv")
     SIGNALS_DIR  = os.path.join(_PROJECT_ROOT, "exports", "model_output")
@@ -232,11 +233,12 @@ st.markdown("""
 @st.cache_resource(show_spinner=False)
 def get_engine():
     from sqlalchemy import create_engine
+    from urllib.parse import quote_plus
     from dotenv import load_dotenv
     load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
     url = (
         f"mysql+mysqlconnector://"
-        f"{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
+        f"{os.getenv('DB_USER')}:{quote_plus(os.getenv('DB_PASSWORD', ''))}"
         f"@{os.getenv('DB_HOST','localhost')}/{os.getenv('DB_NAME','hedge_v2_db')}"
     )
     return create_engine(url, pool_pre_ping=True)
