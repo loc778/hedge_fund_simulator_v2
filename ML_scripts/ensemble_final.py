@@ -1,8 +1,3 @@
-# =============================================================================
-# BLOCK A — ENVIRONMENT SETUP
-# =============================================================================
-
-# Run manually if needed: pip install xgboost lightgbm pyarrow tensorflow hmmlearn
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 print("GPU disabled — CPU only")
@@ -72,7 +67,6 @@ BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR   = os.path.join(BASE_DIR, 'ML_models')
 RESULTS_DIR  = os.path.join(BASE_DIR, 'exports', 'model_output')
 PARQUET_PATH = os.path.join(BASE_DIR, 'exports', 'features_master_latest.parquet')
-PRICES_PATH  = os.path.join(BASE_DIR, 'exports', 'backtest_prices.csv')
 
 import sys
 sys.path.insert(0, os.path.join(BASE_DIR, 'data'))
@@ -82,19 +76,16 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 DATE_STAMP = datetime.today().strftime('%Y%m%d')
 print(f"Date stamp     : {DATE_STAMP}")
 print(f"Parquet exists : {os.path.exists(PARQUET_PATH)}")
-print(f"Prices exists  : {os.path.exists(PRICES_PATH)}")
 
 
 # =============================================================================
 # BLOCK B — CONFIGURATION
 # =============================================================================
 
-# ── Shared time-range config ──────────────────────────────────────────────────
 HOLDOUT_START = '2024-01-01'
 TRAIN_END     = '2023-12-31'
 BACKTEST_END  = datetime.today().strftime('%Y-%m-%d')
 
-# ── Model file patterns ───────────────────────────────────────────────────────
 XGB_PATTERN          = 'xgboost_v*.pkl'
 LGB_PATTERN          = 'lightgbm_v*.pkl'
 LSTM_KERAS_PATTERN   = 'lstm_v*.keras'
@@ -103,7 +94,6 @@ HMM_MODEL_PATTERN    = 'hmm_model_v*.pkl'
 HMM_SCALER_PATTERN   = 'hmm_scaler_v*.pkl'
 HMM_STATEMAP_PATTERN = 'hmm_statemap_v*.pkl'
 
-# ── Ensemble score weights by regime ─────────────────────────────────────────
 REGIME_WEIGHTS = {
     0: {'xgb': 0.571, 'lgb': 0.429},
     1: {'xgb': 0.500, 'lgb': 0.500},
@@ -111,29 +101,20 @@ REGIME_WEIGHTS = {
     3: {'xgb': 0.500, 'lgb': 0.500},
 }
 
-# ── Tier multiplier (used in ensemble score calc) ─────────────────────────────
 TIER_MULT = {1: 1.00, 2: 1.00, 3: 1.00}
 
-# ── Signal thresholds (used in signal generation for df_signals) ─────────────
-# NOTE: BUY_THRESHOLD / SELL_THRESHOLD here are only for the signal-generation
-#       step (df_signals['Signal'] column).  The backtest engine uses
-#       BUY_THRESHOLD_ENH / SELL_THRESHOLD_ENH for trade decisions.
 BUY_THRESHOLD  = 0.80
 SELL_THRESHOLD = 0.20
 
-# ── Shared column names ───────────────────────────────────────────────────────
 DATE_COL   = 'Date'
 TICKER_COL = 'Ticker'
 TIER_COL   = 'Data_Tier'
 TARGET_COL = 'Target_Rank_21d'
 
-# ── LSTM sequence length (default; may be overridden from model meta) ─────────
 SEQ_LEN = 60
 
-# ── Starting NAV ──────────────────────────────────────────────────────────────
 STARTING_NAV = 10_000_000
 
-# ── Backtest engine parameters ────────────────────────────────────────────────
 LONG_TOP_K          = 20
 SHORT_TOP_K_ENH     = 6
 MAX_POSITIONS_ENH   = 36
@@ -161,9 +142,7 @@ MAX_SHORT_BOOK_ENH  = 0.10
 COST_BPS            = 19.5
 COST_RATE_ENH       = COST_BPS / 10_000
 
-# ── normalise any Timestamp to tz-naive date Timestamp ──────
 def _ts(t):
-    """Strip time and timezone — makes rank_pivot.index comparable to daily dates."""
     return pd.Timestamp(t).normalize().tz_localize(None)
 
 print("Configuration loaded.")
@@ -237,7 +216,6 @@ REGIME_LABEL_MAP = hmm_statemap.get('label_map', {0:'Bull',1:'Bear',2:'HighVol',
 print(f"    HMM features  : {HMM_FEATURES}")
 print("\nAll models loaded successfully.")
 
-# ── Parquet ───────────────────────────────────────────────────────────────────
 print(f"\nLoading parquet: {PARQUET_PATH}")
 df_raw = pd.read_parquet(PARQUET_PATH)
 df_raw[DATE_COL] = pd.to_datetime(df_raw[DATE_COL])
@@ -252,7 +230,7 @@ for col in df_raw.columns:
 holdout_start_dt = pd.Timestamp(HOLDOUT_START)
 pre_holdout = df_raw[DATE_COL] < holdout_start_dt
 if pre_holdout.sum() > 0:
-    print(f"⚠️  Dropping {pre_holdout.sum():,} rows before {HOLDOUT_START}")
+    print(f"Dropping {pre_holdout.sum():,} rows before {HOLDOUT_START}")
     df_raw = df_raw[~pre_holdout].copy()
 
 seq_buffer_start = holdout_start_dt - pd.tseries.offsets.BDay(SEQ_LEN + 10)
@@ -271,9 +249,8 @@ del df_raw; gc.collect()
 
 print(f"Holdout rows : {len(df_full[df_full[DATE_COL] >= holdout_start_dt]):,}")
 print(f"Tickers      : {df_full[TICKER_COL].nunique()}")
-print(f"Date range   : {df_full[DATE_COL].min().date()} → {df_full[DATE_COL].max().date()}")
+print(f"Date range   : {df_full[DATE_COL].min().date()} -> {df_full[DATE_COL].max().date()}")
 
-# ── HMM Regimes ───────────────────────────────────────────────────────────────
 print("\nLoading pre-computed HMM regimes from DB ...")
 engine = get_engine()
 regimes_all = pd.read_sql(
@@ -294,7 +271,6 @@ for label, cnt in regimes_df['Regime_Label'].value_counts().items():
     ri = LABEL_TO_INT.get(label, '?')
     print(f"  {label:<12}: {cnt:4d} days ({cnt/len(regimes_df)*100:.1f}%)  [int={ri}]")
 
-# ── XGB + LGB Predictions ─────────────────────────────────────────────────────
 df_bt = df_full[
     (df_full[DATE_COL] >= holdout_start_dt) &
     (df_full[TIER_COL].isin([1, 2, 3]))
@@ -317,7 +293,6 @@ df_bt['XGB_Rank']  = df_bt.groupby(DATE_COL)['XGB_Score'].rank(pct=True)
 df_bt['LGB_Rank']  = df_bt.groupby(DATE_COL)['LGB_Score'].rank(pct=True)
 print("XGB + LGB predictions + cross-sectional ranking done.")
 
-# ── LSTM Vol Predictions ───────────────────────────────────────────────────────
 print("\nGenerating LSTM vol predictions (Head 2) ...")
 lstm_records = []
 tickers_all  = df_bt[TICKER_COL].unique()
@@ -360,7 +335,6 @@ lstm_vol_df = (pd.DataFrame(lstm_records) if lstm_records
 print(f"LSTM vol done : {len(lstm_vol_df):,} rows  ok={n_ok}  skip={n_skip}")
 del lstm_records; gc.collect()
 
-# ── Combine Ensemble Signals ───────────────────────────────────────────────────
 df_signals = df_bt.merge(lstm_vol_df[[TICKER_COL, DATE_COL, 'LSTM_Vol']],
                          on=[TICKER_COL, DATE_COL], how='left')
 
@@ -392,9 +366,6 @@ df_signals.loc[tier_c, 'Ensemble_Score'] = (
 
 df_signals['Final_Rank'] = df_signals.groupby(DATE_COL)['Ensemble_Score'].rank(pct=True)
 
-
-
-# Signal column: used for output CSV only; backtest engine uses Final_Rank directly.
 df_signals['Signal'] = 0
 df_signals.loc[df_signals['Final_Rank'] >= BUY_THRESHOLD,  'Signal'] =  1
 df_signals.loc[df_signals['Final_Rank'] <= SELL_THRESHOLD, 'Signal'] = -1
@@ -422,13 +393,13 @@ try:
         df_signals[col] = df_signals['Final_Rank'].apply(lambda r: get_calib(r, src))
     print("Calibration applied.")
 except Exception as e:
-    print(f"⚠️  Calibration not applied: {e}")
+    print(f"Calibration not applied: {e}")
     for col in ['Projected_Return_21d','Projected_Return_63d','Projected_Return_252d',
                 'Band_Low_21d','Band_High_21d']:
         df_signals[col] = np.nan
 
 print(f"\nEnsemble signals : {len(df_signals):,} rows")
-print(f"Date range       : {df_signals[DATE_COL].min().date()} → {df_signals[DATE_COL].max().date()}")
+print(f"Date range       : {df_signals[DATE_COL].min().date()} -> {df_signals[DATE_COL].max().date()}")
 
 OUTPUT_COLS = [c for c in [TICKER_COL,DATE_COL,'Final_Rank','Signal','Regime_Int',
                TIER_COL,'Sector','LSTM_Vol','XGB_Rank','LGB_Rank',
@@ -436,11 +407,9 @@ OUTPUT_COLS = [c for c in [TICKER_COL,DATE_COL,'Final_Rank','Signal','Regime_Int
                'Band_Low_21d','Band_High_21d'] if c in df_signals.columns]
 df_signals[OUTPUT_COLS].to_csv(os.path.join(RESULTS_DIR, f'signals_{DATE_STAMP}.csv'), index=False)
 
-# ── Snapshot BEFORE any mutation ──────────────────────────────────────────────
 df_signals_clean = df_signals.copy()
 print(f"df_signals_clean snapshot: {df_signals_clean.shape}")
 
-# ── DIAGNOSTIC: rank distribution ────────────────────────────────────────────
 rank_sample = df_signals_clean['Final_Rank']
 print(f"\nFinal_Rank distribution:")
 print(f"  min={rank_sample.min():.4f}  p10={rank_sample.quantile(0.10):.4f}  "
@@ -453,11 +422,15 @@ print(f"  Unique signal dates: {df_signals_clean[DATE_COL].nunique()}")
 
 
 # =============================================================================
-# BLOCK D — PRICE DATA
+# BLOCK D — PRICE DATA (from DB)
 # =============================================================================
 
-print("\nLoading backtest prices ...")
-prices = pd.read_csv(PRICES_PATH, parse_dates=[DATE_COL])
+print("\nLoading backtest prices from DB ...")
+engine = get_engine()
+prices = pd.read_sql(
+    "SELECT Ticker, Date, Adj_Close FROM nifty500_ohlcv ORDER BY Ticker, Date",
+    engine
+)
 prices[DATE_COL]    = pd.to_datetime(prices[DATE_COL])
 prices['Adj_Close'] = pd.to_numeric(prices['Adj_Close'], errors='coerce')
 prices = prices.sort_values([TICKER_COL, DATE_COL]).reset_index(drop=True)
@@ -465,7 +438,7 @@ prices['Daily_Ret'] = prices.groupby(TICKER_COL)['Adj_Close'].pct_change().clip(
 daily_ret_pivot     = prices.pivot(index=DATE_COL, columns=TICKER_COL, values='Daily_Ret')
 
 print(f"Price rows  : {len(prices):,}  |  Tickers: {prices[TICKER_COL].nunique()}")
-print(f"Price range : {prices[DATE_COL].min().date()} → {prices[DATE_COL].max().date()}")
+print(f"Price range : {prices[DATE_COL].min().date()} -> {prices[DATE_COL].max().date()}")
 dr = prices['Daily_Ret'].dropna()
 print(f"Daily ret   : mean={dr.mean()*100:.3f}%  std={dr.std()*100:.3f}%")
 
@@ -475,14 +448,13 @@ fo_df['SYMBOL'] = fo_df['SYMBOL'].str.strip()
 FO_TICKERS      = set(fo_df['SYMBOL'].dropna().str.strip())
 print(f"F&O tickers : {len(FO_TICKERS)}")
 
-# ── DIAGNOSTIC: date alignment check ─────────────────────────────────────────
 sig_dates   = set(df_signals_clean[DATE_COL].dt.normalize())
 price_dates = set(daily_ret_pivot.index.normalize())
 overlap_d   = sig_dates & price_dates
 print(f"\nDate alignment: {len(sig_dates)} signal dates, {len(price_dates)} price dates, "
       f"{len(overlap_d)} overlap")
 if len(overlap_d) == 0:
-    print("⚠️  CRITICAL: zero date overlap between signals and prices!")
+    print("CRITICAL: zero date overlap between signals and prices!")
     print(f"   Signal dates sample : {sorted(sig_dates)[:3]}")
     print(f"   Price dates sample  : {sorted(price_dates)[:3]}")
 else:
@@ -509,7 +481,7 @@ def compute_metrics(nav_df, rf_rate=0.065):
     calmar    = cagr / abs(max_dd) if max_dd != 0 else 0
     win_rate  = (rets > 0).mean()
     return {
-        'Period'        : f"{nav_df.index[0].date()} → {nav_df.index[-1].date()}",
+        'Period'        : f"{nav_df.index[0].date()} -> {nav_df.index[-1].date()}",
         'Total Return'  : f"{total_ret*100:.2f}%",
         'CAGR'          : f"{cagr*100:.2f}%",
         'Ann Volatility': f"{vol_ann*100:.2f}%",
@@ -524,10 +496,10 @@ print("compute_metrics() defined.")
 
 
 def compute_atr_from_prices(ret_pivot: pd.DataFrame, window: int = 14) -> pd.Series:
-    """ATR-proxy: rolling std of daily returns per ticker."""
     recent  = ret_pivot.tail(window + 1)
     atr_pct = recent.std(axis=0).fillna(ATR_FALLBACK).clip(lower=0.005)
     return atr_pct
+
 
 
 def compute_position_sizes(
@@ -542,8 +514,7 @@ def compute_position_sizes(
     if candidates.empty:
         return pd.Series(dtype=float)
 
-    # Reset index so numpy ops stay aligned
-    cands = candidates.reset_index(drop=True)
+    cands   = candidates.reset_index(drop=True)
     tickers = cands[TICKER_COL].values
 
     atr_pct = cands[TICKER_COL].map(atr_series).fillna(ATR_FALLBACK).clip(lower=0.005)
@@ -561,7 +532,6 @@ def compute_position_sizes(
     effective_target = min(book_target_pct, deploy_cap)
     raw_sizes        = raw_w * effective_target
 
-    # BUG 3 FIX: explicit column access + reset index guarantees alignment
     if direction == 'long':
         if TIER_COL in cands.columns:
             is_midcap = cands[TIER_COL].isin([2, 3]).values
@@ -573,10 +543,8 @@ def compute_position_sizes(
 
     clipped = np.minimum(raw_sizes, caps)
 
-    # BUG 4 FIX: compare annualised vol; cap downscale at 0.5× not 0.0×
     if LSTM_VOL_SCALING and lstm_vol_col in cands.columns:
         lstm_vol_raw = cands[lstm_vol_col].fillna(TARGET_VOL_ANN_ENH / np.sqrt(252)).values
-        # Head 2 predicts daily vol → annualise for comparison
         lstm_vol_ann = lstm_vol_raw * np.sqrt(252)
         vol_scale    = (TARGET_VOL_ANN_ENH / lstm_vol_ann.clip(min=0.01)).clip(0.5, 1.5)
         clipped      = np.minimum(clipped * vol_scale, caps)
@@ -586,14 +554,12 @@ def compute_position_sizes(
         scale   = min(effective_target / total, 1.0)
         clipped = np.minimum(clipped * scale, caps)
 
-    # Floor: only drop truly negligible positions (< 0.3% NAV)
     clipped = np.where(clipped >= 0.003, clipped, np.nan)
     return pd.Series(clipped, index=tickers).dropna()
 
 
 def apply_sector_cap(candidates: pd.DataFrame, sizes: pd.Series,
                      max_sector_pct: float = MAX_SECTOR_PCT) -> pd.Series:
-    """Trim positions so no sector > max_sector_pct of long book."""
     if candidates.empty or sizes.empty:
         return sizes
     df         = candidates.reset_index(drop=True).copy()
@@ -610,7 +576,6 @@ def apply_sector_cap(candidates: pd.DataFrame, sizes: pd.Series,
                 if t in adjusted.index:
                     adjusted[t] *= scale
     return adjusted
-
 
 
 # =============================================================================
@@ -632,13 +597,11 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                     'LSTM_Vol', 'Sector'] if c in signals_df.columns]
     signal_meta = signals_df[signal_meta_cols].copy()
 
-    # Pre-normalise rank_pivot index once
     rp_idx_norm = rank_pivot.index.normalize().tz_localize(None)
 
     cash       = float(starting_nav)
     positions  = {}
     nav_series = []
-    # Bi-weekly trigger: initialise far enough back so first holdout day rebalances
     last_rebalance_date = _ts(HOLDOUT_START) - pd.tseries.offsets.BDay(10)
     peak_nav   = float(starting_nav)
 
@@ -648,12 +611,10 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
         ts        = _ts(dt)
         rebalance = (ts - last_rebalance_date).days >= 14
 
-        # ── Daily MTM ────────────────────────────────────────────────────────
         long_val = short_val = 0.0
         if dt in daily_ret_pivot.index:
             day_rets = daily_ret_pivot.loc[dt]
             for ticker, pos in list(positions.items()):
-                # Skip MTM on entry day and already-stopped positions
                 if pos['stopped'] or pos['entry_date'] == dt:
                     if pos['direction'] == 'long':
                         long_val  += pos['alloc'] + pos['pnl']
@@ -677,11 +638,9 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                         pos['stopped'] = True
                     else:
                         long_val += pos['alloc'] + pos['pnl']
-
-                else:  # short
+                else:
                     pos['pnl'] += pos['alloc'] * (-ret)
                     if pos['pnl'] / pos['alloc'] <= -SHORT_STOP_LOSS_ENH:
-                        # AUDIT FIX 3: shorts close at alloc - pnl (profit reduces liability)
                         cash += (pos['alloc'] - pos['pnl']) * (1 - COST_RATE_ENH)
                         pos['stopped'] = True
                     else:
@@ -691,19 +650,15 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
         peak_nav = max(peak_nav, nav_now)
         in_defence = (nav_now / peak_nav) - 1 < DD_DEFENCE_THRESHOLD
 
-        # ── Bi-weekly partial rebalance ───────────────────────────────────────
         if rebalance:
             last_rebalance_date = ts
 
-            #  strict < so today's signal is never used today
-            available = rank_pivot.index[rp_idx_norm < ts]     # was <=
+            available = rank_pivot.index[rp_idx_norm < ts]
             if len(available) == 0:
                 rebalance_log.append({'date': dt, 'reason': 'no_signal_date',
                                       'n_long': 0, 'n_closed': 0, 'n_opened': 0})
-                #  no append+continue — fall through to single append below
             else:
-                signal_dt = available[-1]
-
+                signal_dt  = available[-1]
                 regime_int = int(regime_by_date.get(
                     signal_dt,
                     regime_by_date.get(rp_idx_norm[rank_pivot.index.get_loc(signal_dt)], 3)
@@ -716,11 +671,9 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                 if meta_today.empty:
                     rebalance_log.append({'date': dt, 'reason': 'empty_meta',
                                           'n_long': 0, 'n_closed': 0, 'n_opened': 0})
-                    #  fall through to single append below
                 else:
                     ranks = rank_pivot.loc[signal_dt].dropna()
 
-                    #  threshold fallback
                     all_long_ranks = ranks.nlargest(LONG_TOP_K)
                     above_thresh   = ranks[ranks >= BUY_THRESHOLD_ENH].nlargest(LONG_TOP_K)
 
@@ -732,7 +685,6 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                         rebalance_log.append({'date': dt, 'reason': 'too_few_candidates',
                                               'n_above_thresh': len(above_thresh),
                                               'n_long': 0, 'n_closed': 0, 'n_opened': 0})
-                        #  fall through to single append below
                         long_ranks = None
 
                     if long_ranks is not None:
@@ -742,9 +694,7 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                         if long_candidates.empty:
                             rebalance_log.append({'date': dt, 'reason': 'no_meta_match',
                                                   'n_long': 0, 'n_closed': 0, 'n_opened': 0})
-                            #  fall through to single append below
                         else:
-                            # Short candidates (Bear/HighVol regimes, F&O only)
                             short_candidates = pd.DataFrame()
                             if regime_int in SHORT_REGIMES:
                                 short_ranks      = ranks[ranks <= SELL_THRESHOLD_ENH].nsmallest(SHORT_TOP_K_ENH)
@@ -753,7 +703,6 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                     meta_today[TICKER_COL].str.replace('.NS', '', regex=False).isin(FO_TICKERS)
                                 ].copy()
 
-                            # ATR from recent prices
                             recent_prices = daily_ret_pivot.loc[:dt]
                             atr_series    = compute_atr_from_prices(recent_prices.tail(20), window=14)
 
@@ -776,8 +725,6 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                     atr_series=atr_series,
                                 )
 
-                            # ──  partial rebalance ───────────────
-                            # Step A: close positions no longer in the signal set
                             target_long_tickers  = set(long_sizes.index)
                             target_short_tickers = set(short_sizes.index)
                             n_closed = 0
@@ -788,28 +735,24 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                     del positions[ticker]
                                     continue
                                 if pos['direction'] == 'long' and ticker not in target_long_tickers:
-                                    # Signal gone — exit long
                                     cash += (pos['alloc'] + pos['pnl']) * (1 - COST_RATE_ENH)
                                     del positions[ticker]
                                     n_closed += 1
                                 elif pos['direction'] == 'short' and ticker not in target_short_tickers:
-                                    # Signal gone — exit short
-                                    # AUDIT FIX 3: short close = alloc - pnl
                                     cash += (pos['alloc'] - pos['pnl']) * (1 - COST_RATE_ENH)
                                     del positions[ticker]
                                     n_closed += 1
 
-                            # Step B: open only NEW long positions not already held
                             budget   = NAV * long_target_pct
                             n_opened = 0
 
                             for ticker, size_pct in long_sizes.items():
                                 if ticker in positions:
-                                    continue           # already held — keep it, skip cost
+                                    continue
                                 alloc = NAV * size_pct
                                 cost  = alloc * COST_RATE_ENH
-                                if alloc < NAV * 0.003:      continue  # below floor
-                                if budget < alloc + cost:    continue  # over budget
+                                if alloc < NAV * 0.003:      continue
+                                if budget < alloc + cost:    continue
                                 cash   -= (alloc + cost)
                                 budget -= (alloc + cost)
                                 positions[ticker] = {
@@ -818,10 +761,9 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                 }
                                 n_opened += 1
 
-                            # Step C: open only NEW short positions not already held
                             for ticker, size_pct in short_sizes.items():
                                 if ticker in positions:
-                                    continue           # already held — keep it
+                                    continue
                                 alloc = NAV * size_pct
                                 if alloc < NAV * 0.003: continue
                                 total_short = sum(p['alloc'] for p in positions.values()
@@ -843,14 +785,12 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                                 'reason': 'ok'
                             })
 
-        # AUDIT FIX 2: single NAV append — ONE record per day, no duplicates
         long_val  = sum(p['alloc'] + p['pnl'] for p in positions.values()
                         if not p['stopped'] and p['direction'] == 'long')
         short_val = sum(p['alloc'] - p['pnl'] for p in positions.values()
                         if not p['stopped'] and p['direction'] == 'short')
         nav_series.append({'Date': dt, 'NAV': max(cash + long_val + short_val, 0)})
 
-    # ── Rebalance diagnostic summary ─────────────────────────────────────────
     rlog_df = pd.DataFrame(rebalance_log)
     print(f"\nRebalance log summary ({len(rlog_df)} rebalances):")
     if not rlog_df.empty:
@@ -861,13 +801,12 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
             print(f"  Avg positions closed per rebalance : {ok_rebs['n_closed'].mean():.1f}")
             print(f"  Avg candidates above threshold     : {ok_rebs['n_above_thresh'].mean():.1f}")
 
-    # ── Sanity check: verify no duplicate dates in NAV series ────────────────
     nav_df = pd.DataFrame(nav_series).set_index('Date')
     dupes  = nav_df.index.duplicated().sum()
     if dupes > 0:
-        print(f"⚠️  WARNING: {dupes} duplicate dates found in NAV series — investigate!")
+        print(f"WARNING: {dupes} duplicate dates found in NAV series — investigate!")
     else:
-        print(f"✅  NAV series clean: {len(nav_df)} unique dates, no duplicates.")
+        print(f"NAV series clean: {len(nav_df)} unique dates, no duplicates.")
 
     return nav_df
 
@@ -879,7 +818,7 @@ print("run_backtest() defined.")
 # =============================================================================
 nav_df = run_backtest(STARTING_NAV, daily_ret_pivot)
 print(f"Complete : {len(nav_df)} days  |  "
-      f"End NAV ₹{nav_df['NAV'].iloc[-1]:,.0f}  |  "
+      f"End NAV Rs{nav_df['NAV'].iloc[-1]:,.0f}  |  "
       f"Return {(nav_df['NAV'].iloc[-1]/STARTING_NAV-1)*100:.2f}%")
 
 metrics, daily_rets, drawdown = compute_metrics(nav_df)
@@ -898,10 +837,10 @@ for yr, grp in nav_df.groupby('Year'):
 
 try:
     cagr = float(metrics.get('CAGR','0%').strip('%')) / 100
-    print(f"\n{'✅ TARGET MET' if cagr >= 0.12 else '⚠️  Below target'}: "
-          f"CAGR {cagr*100:.1f}%  (target ≥ 12%)")
+    print(f"\n{'TARGET MET' if cagr >= 0.12 else 'Below target'}: "
+          f"CAGR {cagr*100:.1f}%  (target >= 12%)")
     if cagr < 0.12:
-        print("   → Set ENABLE_TUNING = True below to run parameter grid search.")
+        print("   -> Set ENABLE_TUNING = True below to run parameter grid search.")
 except ValueError:
     pass
 
@@ -909,23 +848,20 @@ nav_df.reset_index().to_csv(
     os.path.join(RESULTS_DIR, f'nav_series_{DATE_STAMP}.csv'), index=False)
 with open(os.path.join(RESULTS_DIR, f'metrics_{DATE_STAMP}.txt'), 'w', encoding='utf-8') as f:
     f.write("AI Hedge Fund Simulator v2 — Backtest\n")
-    f.write("Changes: bi-weekly rebalance, TOP_K=20, BUY=0.85, cash_floor=2%, "
-            "bull_deploy=99%, DD_defence=-12%/-20%, momentum_topup=1.25x.\n")
     f.write("="*55 + "\n")
     for k, v in metrics.items(): f.write(f"  {k:<20} : {v}\n")
-print(f"Saved results → {RESULTS_DIR}")
+print(f"Saved results -> {RESULTS_DIR}")
 
-# ── Optional tuning grid ──────────────────────────────────────────────────────
-ENABLE_TUNING = False   # ← flip True if CAGR still below 12%
+ENABLE_TUNING = False
 
 if ENABLE_TUNING:
     print("\nRunning parameter tuning grid ...")
     best_cagr, best_params, results_grid = -999.0, {}, []
 
     for bt, ltk, ivw in itertools.product(
-        [0.82, 0.83, 0.85, 0.87],   # buy threshold
-        [15, 20, 25],                # top K
-        [0.50, 0.60, 0.70],          # inv vol weight
+        [0.82, 0.83, 0.85, 0.87],
+        [15, 20, 25],
+        [0.50, 0.60, 0.70],
     ):
         BUY_THRESHOLD_ENH = bt
         LONG_TOP_K        = ltk

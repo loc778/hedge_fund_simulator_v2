@@ -204,18 +204,14 @@ def validate_inputs() -> bool:
     return all_good
 
 
-def truncate_output_tables():
-    """Truncate features_master and sector_fundamentals_median before rebuild."""
-    print("\n🧹 Truncating output tables...")
+def get_ticker_last_date(ticker: str):
+    """Return the latest Date already stored in features_master for this ticker, or None."""
     with engine.connect() as conn:
-        for key in ("features", "sector_median"):
-            tbl = TABLES[key]
-            try:
-                conn.execute(text(f"TRUNCATE TABLE {tbl}"))
-                conn.commit()
-                print(f"  ✅ {tbl} truncated")
-            except Exception as e:
-                print(f"  ⚠️  {tbl}: {e}")
+        result = conn.execute(
+            text(f"SELECT MAX(Date) FROM {TABLES['features']} WHERE Ticker = :t"),
+            {"t": ticker}
+        ).scalar()
+    return pd.Timestamp(result) if result else None
 
 
 def load_tier_map() -> dict:
@@ -425,36 +421,57 @@ def build_sector_median_lookup(med_df: pd.DataFrame) -> dict:
 # PHASE 2 — PER-TICKER FEATURE CONSTRUCTION
 # ═══════════════════════════════════════════════════════════
 
-def load_ticker_ohlcv(ticker: str) -> pd.DataFrame:
-    df = pd.read_sql(
-        f"""
+def load_ticker_ohlcv(ticker: str, after_date=None) -> pd.DataFrame:
+    if after_date is not None:
+        query = f"""
         SELECT Date, Ticker, High, Low, Adj_Close, Volume, VWAP_Daily
-        FROM {TABLES['ohlcv']}
+        FROM {{TABLES['ohlcv']}}
+        WHERE Ticker = %s AND Date > %s
+        ORDER BY Date
+        """
+        params = (ticker, after_date.date() if hasattr(after_date, 'date') else after_date)
+    else:
+        query = f"""
+        SELECT Date, Ticker, High, Low, Adj_Close, Volume, VWAP_Daily
+        FROM {{TABLES['ohlcv']}}
         WHERE Ticker = %s
         ORDER BY Date
-        """,
-        con=engine,
-        params=(ticker,),
-    )
+        """
+        params = (ticker,)
+    df = pd.read_sql(query, con=engine, params=params)
     df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
     return df
 
 
-def load_ticker_indicators(ticker: str) -> pd.DataFrame:
-    df = pd.read_sql(
-        f"""
+def load_ticker_indicators(ticker: str, after_date=None) -> pd.DataFrame:
+    if after_date is not None:
+        # Pull 300-day lookback so rolling windows (252d beta, 200d SMA) have
+        # enough context rows even for the first new date being processed.
+        lookback = after_date - pd.Timedelta(days=300)
+        query = f"""
         SELECT Date,
                SMA_20, SMA_50, SMA_200,
                MACD_Hist, RSI_14,
                BB_Upper, BB_Middle, BB_Lower,
                ATR_14, Stoch_K, ADX_14, OBV, VWAP_Dev
-        FROM {TABLES['indicators']}
+        FROM {{TABLES['indicators']}}
+        WHERE Ticker = %s AND Date >= %s
+        ORDER BY Date
+        """
+        params = (ticker, lookback.date() if hasattr(lookback, 'date') else lookback)
+    else:
+        query = f"""
+        SELECT Date,
+               SMA_20, SMA_50, SMA_200,
+               MACD_Hist, RSI_14,
+               BB_Upper, BB_Middle, BB_Lower,
+               ATR_14, Stoch_K, ADX_14, OBV, VWAP_Dev
+        FROM {{TABLES['indicators']}}
         WHERE Ticker = %s
         ORDER BY Date
-        """,
-        con=engine,
-        params=(ticker,),
-    )
+        """
+        params = (ticker,)
+    df = pd.read_sql(query, con=engine, params=params)
     df["Date"] = pd.to_datetime(df["Date"]).astype("datetime64[ns]")
     return df
 
@@ -705,14 +722,15 @@ def process_ticker(ticker: str,
                    sector_lookup: dict,
                    macro_df: pd.DataFrame,
                    regime_df: pd.DataFrame,
-                   dataset_max_date: pd.Timestamp) -> pd.DataFrame:
-    
+                   dataset_max_date: pd.Timestamp,
+                   after_date=None) -> pd.DataFrame:
+
     # ── 1-3. OHLCV + Indicators ──────────────────────────────────────────
-    ohlcv = load_ticker_ohlcv(ticker)
+    ohlcv = load_ticker_ohlcv(ticker, after_date=after_date)
     if ohlcv.empty:
         return pd.DataFrame()
 
-    indic = load_ticker_indicators(ticker)
+    indic = load_ticker_indicators(ticker, after_date=after_date)
     df    = ohlcv.merge(indic, on="Date", how="left")
 
     # ── 4. Price-derived features (incl. Mom_12_1, Mom_6_1) ─────────────
@@ -788,14 +806,23 @@ def process_ticker(ticker: str,
 # PHASE 3 — CROSS-SECTIONAL RANK PASS (target ranks)
 # ═══════════════════════════════════════════════════════════
 
-def compute_and_write_ranks():
+def compute_and_write_ranks(from_date=None):
     print("\n🎯 Phase 3 — cross-sectional rank pass (target ranks)...")
+
+    # In incremental mode, ranks must be recomputed for every date >= from_date
+    # because cross-sectional rank depends on ALL tickers on that date.
+    if from_date is not None:
+        date_filter = f"AND Date >= '{pd.Timestamp(from_date).date()}'"
+        print(f"  Incremental: recomputing ranks from {pd.Timestamp(from_date).date()}")
+    else:
+        date_filter = ""
 
     df = pd.read_sql(
         f"""
         SELECT Ticker, Date, Target_Return_21d
         FROM {TABLES['features']}
         WHERE Data_Tier IN (1, 2) AND Target_Return_21d IS NOT NULL
+        {date_filter}
         """,
         con=engine,
     )
@@ -862,11 +889,17 @@ def compute_and_write_ranks():
 
 
 # ═══════════════════════════════════════════════════════════
-# PHASE 3.5 — CROSS-SECTIONAL FEATURE RANK PASS (Fix A + Fix B)
+# PHASE 3.5 — CROSS-SECTIONAL FEATURE RANK PASS 
 # ═══════════════════════════════════════════════════════════
 
-def compute_and_write_feature_ranks(sector_map: dict):
-    print("\n🎯 Phase 3.5 — feature rank pass (Fix A: momentum ranks, Fix B: sector ranks)...")
+def compute_and_write_feature_ranks(sector_map: dict, from_date=None):
+    print("\n🎯 Phase 3.5 — feature rank pass ")
+
+    if from_date is not None:
+        date_filter = f"AND Date >= '{pd.Timestamp(from_date).date()}'"
+        print(f"  Incremental: recomputing feature ranks from {pd.Timestamp(from_date).date()}")
+    else:
+        date_filter = ""
 
     # ── Load relevant columns from features_master ────────────────────────
     print("  📥 Loading momentum and fundamental columns from features_master...")
@@ -876,6 +909,7 @@ def compute_and_write_feature_ranks(sector_map: dict):
                Return_21d, Mom_12_1, Mom_6_1, RS_21d,
                ROA, EBITDA_Margin, Revenue_YoY_Growth
         FROM {TABLES['features']}
+        {date_filter}
         """,
         con=engine,
     )
@@ -886,7 +920,7 @@ def compute_and_write_feature_ranks(sector_map: dict):
     df["Sector"] = df["Ticker"].map(sector_map).fillna("Unknown")
 
     # ── Fix A: Cross-sectional momentum ranks (all tickers per date) ──────
-    print("  📊 Computing Fix A: cross-sectional momentum ranks...")
+    print("  📊 Computing cross-sectional momentum ranks...")
 
     def cs_rank(series: pd.Series) -> pd.Series:
         """Percentile rank with NaN preserved. Returns NaN if < 2 non-null values."""
@@ -901,8 +935,8 @@ def compute_and_write_feature_ranks(sector_map: dict):
     df["Mom_6_1_Rank"]  = df.groupby("Date")["Mom_6_1"].transform(cs_rank)
     df["RS_21d_Rank"]   = df.groupby("Date")["RS_21d"].transform(cs_rank)
 
-    # ── Fix B: Within-sector fundamental ranks ────────────────────────────
-    print("  📊 Computing Fix B: within-sector fundamental ranks...")
+    # ──  Within-sector fundamental ranks ────────────────────────────
+    print("  📊 Computing within-sector fundamental ranks...")
 
     def sector_rank_with_min(series: pd.Series) -> pd.Series:
         valid_count = series.notna().sum()
@@ -995,129 +1029,18 @@ def compute_and_write_feature_ranks(sector_map: dict):
 
 
 # ═══════════════════════════════════════════════════════════
-# PHASE 4 — VERIFICATION
-# ═══════════════════════════════════════════════════════════
-
-def print_verification():
-    """Post-run summary statistics for all feature groups."""
-    print("\n" + "=" * 60)
-    print("VERIFICATION — features_master")
-    print("=" * 60)
-
-    with engine.connect() as conn:
-
-        total = conn.execute(text(f"SELECT COUNT(*) FROM {TABLES['features']}")).scalar()
-        print(f"\nTotal rows : {total:,}")
-        print(f"Columns    : {len(FEATURES_COLUMNS)} (all training-usable)")
-
-        print("\nRows per tier:")
-        for row in conn.execute(text(f"""
-            SELECT Data_Tier, COUNT(*) AS n, COUNT(DISTINCT Ticker) AS t
-            FROM {TABLES['features']}
-            GROUP BY Data_Tier ORDER BY Data_Tier
-        """)):
-            name = {1:"A", 2:"B", 3:"C"}.get(row[0], str(row[0]))
-            print(f"  Tier {name}: {row[1]:>10,} rows | {row[2]:>4} tickers")
-
-        d = conn.execute(text(f"""
-            SELECT MIN(Date), MAX(Date), COUNT(DISTINCT Date)
-            FROM {TABLES['features']}
-        """)).fetchone()
-        print(f"\nDate range : {d[0]} → {d[1]} ({d[2]:,} trading days)")
-
-        # ── Targets ───────────────────────────────────────────────────────
-        t = conn.execute(text(f"""
-            SELECT
-                SUM(CASE WHEN Target_Return_21d        IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Target_Rank_21d          IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Target_Direction_Median  IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Target_Direction_Tertile IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Target_Vol_5d            IS NOT NULL THEN 1 ELSE 0 END)
-            FROM {TABLES['features']}
-        """)).fetchone()
-        print("\nTarget coverage (non-NULL rows):")
-        print(f"  Target_Return_21d       : {t[0]:>12,}")
-        print(f"  Target_Rank_21d         : {t[1]:>12,}")
-        print(f"  Target_Direction_Median : {t[2]:>12,}")
-        print(f"  Target_Direction_Tertile: {t[3]:>12,}")
-        print(f"  Target_Vol_5d           : {t[4]:>12,}")
-
-        # ── Flags ─────────────────────────────────────────────────────────
-        fl = conn.execute(text(f"""
-            SELECT
-                SUM(Price_Gap_Flag), SUM(SMA200_Available), SUM(SMA50_Available),
-                SUM(ADX14_Available), SUM(Volatility20d_Available),
-                SUM(Fundamentals_Available)
-            FROM {TABLES['features']}
-        """)).fetchone()
-        print("\nFlag distributions (rows = 1):")
-        for name, val in zip(
-            ["Price_Gap_Flag", "SMA200_Available", "SMA50_Available",
-             "ADX14_Available", "Volatility20d_Available",
-             "Fundamentals_Available"], fl
-        ):
-            print(f"  {name:<28}: {val:>12,}")
-
-        # ── Fix A: momentum rank coverage ─────────────────────────────────
-        ma = conn.execute(text(f"""
-            SELECT
-                SUM(CASE WHEN Mom_12_1      IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Mom_6_1       IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Mom_1M_Rank   IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Mom_12_1_Rank IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Mom_6_1_Rank  IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN RS_21d_Rank   IS NOT NULL THEN 1 ELSE 0 END)
-            FROM {TABLES['features']}
-        """)).fetchone()
-        print("\nFix A — Cross-sectional momentum rank coverage (non-NULL rows):")
-        for name, val in zip(
-            ["Mom_12_1 (raw)", "Mom_6_1 (raw)",
-             "Mom_1M_Rank", "Mom_12_1_Rank", "Mom_6_1_Rank", "RS_21d_Rank"], ma
-        ):
-            print(f"  {name:<28}: {val:>12,}")
-
-        # ── Fix B: sector rank coverage ────────────────────────────────────
-        mb = conn.execute(text(f"""
-            SELECT
-                SUM(CASE WHEN ROA_Sector_Rank            IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN EBITDA_Margin_Sector_Rank  IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN Revenue_Growth_Sector_Rank IS NOT NULL THEN 1 ELSE 0 END)
-            FROM {TABLES['features']}
-        """)).fetchone()
-        print("\nFix B — Within-sector fundamental rank coverage (non-NULL rows):")
-        for name, val in zip(
-            ["ROA_Sector_Rank", "EBITDA_Margin_Sector_Rank",
-             "Revenue_Growth_Sector_Rank"], mb
-        ):
-            print(f"  {name:<35}: {val:>12,}")
-
-        # ── Spot-check: rank distributions ────────────────────────────────
-        print("\nRank distribution spot-check (should be near 0.5 mean for valid ranks):")
-        for col in ["Mom_1M_Rank", "Mom_12_1_Rank", "ROA_Sector_Rank"]:
-            row = conn.execute(text(f"""
-                SELECT AVG({col}), MIN({col}), MAX({col})
-                FROM {TABLES['features']}
-                WHERE {col} IS NOT NULL
-            """)).fetchone()
-            if row and row[0] is not None:
-                print(f"  {col:<35}: avg={float(row[0]):.4f}  min={float(row[1]):.4f}  max={float(row[2]):.4f}")
-
-
-# ═══════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
-def main():
+def main(incremental=True):
     print("=" * 60)
-    print("FEATURES PIPELINE — hedge_v2.3")
+    print(f"FEATURES PIPELINE — hedge_v2.3  ({'INCREMENTAL' if incremental else 'FULL REBUILD'})")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
     if not validate_inputs():
         print("\n❌ Input validation failed. Exiting.")
         return
-
-    truncate_output_tables()
 
     # ── Phase 1: Pre-computation ─────────────────────────────────────────
     print("\n📥 Loading tier classification...")
@@ -1163,22 +1086,33 @@ def main():
     total_tickers      = len(tickers)
     total_rows_written = 0
     failed             = []
+    new_dates_seen     = []   # track earliest new date written this run for rank passes
 
     for idx, ticker in enumerate(tickers, 1):
         try:
             tier = tier_map[ticker]
-            df   = process_ticker(
+
+            after_date = get_ticker_last_date(ticker) if incremental else None
+
+            if incremental and after_date is not None:
+                if after_date >= dataset_max_date:
+                    continue   # already up to date — nothing to write
+
+            df = process_ticker(
                 ticker, tier, ratios_df, sector_lookup,
                 macro_df, regime_df, dataset_max_date,
+                after_date=after_date,
             )
 
             if df.empty:
-                print(f"  [{idx}/{total_tickers}] {ticker}: no OHLCV rows, skipped")
                 continue
 
             df = df.replace([np.inf, -np.inf], np.nan)
             save_to_db(df, TABLES["features"], engine)
             total_rows_written += len(df)
+
+            min_new = pd.to_datetime(df["Date"].min())
+            new_dates_seen.append(min_new)
 
             if idx % 25 == 0 or idx == total_tickers:
                 print(f"  [{idx}/{total_tickers}] {ticker}: +{len(df):,} rows | total {total_rows_written:,}")
@@ -1194,14 +1128,18 @@ def main():
         if len(failed) > 10:
             print(f"    ... and {len(failed) - 10} more")
 
+    if total_rows_written == 0:
+        print("\nNo new rows written — features_master is already up to date.")
+        return
+
+    # Earliest date added this run — rank passes only need to cover these dates.
+    rank_from_date = min(new_dates_seen) if new_dates_seen else None
+
     # ── Phase 3: Cross-sectional target rank pass ─────────────────────────
-    compute_and_write_ranks()
+    compute_and_write_ranks(from_date=rank_from_date)
 
-    # ── Phase 3.5: Cross-sectional feature rank pass (Fix A + Fix B) ─────
-    compute_and_write_feature_ranks(sector_map)
-
-    # ── Phase 4: Verification ─────────────────────────────────────────────
-    print_verification()
+    # ── Phase 3.5: Cross-sectional feature rank pass 
+    compute_and_write_feature_ranks(sector_map, from_date=rank_from_date)
 
     print("\n" + "=" * 60)
     print(f"DONE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

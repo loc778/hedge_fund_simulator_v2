@@ -1,10 +1,3 @@
-# data/hmm.py
-# ═══════════════════════════════════════════════════════════
-# HMM REGIME DETECTION — hedge_v2.3
-# Trains a 4-state Gaussian HMM on Nifty 50 to classify
-# daily market regimes: Bull(0) Bear(1) HighVol(2) Sideways(3)
-# ═══════════════════════════════════════════════════════════
-
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,7 +11,7 @@ from datetime import datetime, date
 from sklearn.preprocessing import StandardScaler
 from hmmlearn.hmm import GaussianHMM
 import matplotlib
-matplotlib.use('Agg')   # non-interactive backend — saves to PNG, no display window needed
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Patch
@@ -29,10 +22,6 @@ warnings.filterwarnings('ignore')
 
 from data.db import get_engine
 
-# ═══════════════════════════════════════════════════════════
-# PATHS — aligned with project structure
-# ═══════════════════════════════════════════════════════════
-
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_DIR  = os.path.join(PROJECT_ROOT, 'ML_models', 'results')
 MODELS_DIR   = os.path.join(PROJECT_ROOT, 'ML_models')
@@ -40,27 +29,23 @@ MODELS_DIR   = os.path.join(PROJECT_ROOT, 'ML_models')
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR,  exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════
-
 DATA_START      = '2010-01-01'
 DATA_END        = date.today().strftime('%Y-%m-%d')
 NIFTY_TICKER    = '^NSEI'
 VIX_TICKER      = '^INDIAVIX'
 
 N_STATES        = 4
-N_RESTARTS      = 75      
+N_RESTARTS      = 75
 N_ITER          = 300
-COVARIANCE_TYPE = 'full'   
+COVARIANCE_TYPE = 'full'
 RANDOM_SEED     = 42
 TOL             = 1e-5
 
 BASE_FEATURE_COLS = [
-    'Nifty_Return',    # 1-day log return
-    'India_VIX',       # VIX level
-    'Volatility_20d',  # 20-day trailing realized vol (annualized)
-    'Return_5d',       # 5-day trailing log return (FIX-F1)
+    'Nifty_Return',
+    'India_VIX',
+    'Volatility_20d',
+    'Return_5d',
 ]
 FII_FEATURE = 'FII_Flow_zscore'
 
@@ -75,12 +60,7 @@ LABEL_TO_INT = {'Bull': 0, 'Bear': 1, 'HighVol': 2, 'Sideways': 3}
 INT_TO_LABEL = {v: k for k, v in LABEL_TO_INT.items()}
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 1 — FETCH PRICE DATA
-# ═══════════════════════════════════════════════════════════
-
 def fetch_price_data() -> tuple:
-    """Fetch Nifty 50 and India VIX from yfinance."""
     print('Fetching Nifty 50...')
     nifty_raw = yf.download(NIFTY_TICKER, start=DATA_START, end=DATA_END,
                             auto_adjust=False, progress=False)
@@ -89,7 +69,6 @@ def fetch_price_data() -> tuple:
     vix_raw = yf.download(VIX_TICKER, start=DATA_START, end=DATA_END,
                           auto_adjust=False, progress=False)
 
-    # Flatten MultiIndex if present (yfinance 0.2.x)
     if isinstance(nifty_raw.columns, pd.MultiIndex):
         nifty_raw.columns = nifty_raw.columns.get_level_values(0)
     if isinstance(vix_raw.columns, pd.MultiIndex):
@@ -100,20 +79,15 @@ def fetch_price_data() -> tuple:
     assert len(nifty_raw) > 3000, f'Too few Nifty rows: {len(nifty_raw)}'
 
     print(f'  Nifty : {len(nifty_raw):,} rows  '
-          f'({nifty_raw.index[0].date()} → {nifty_raw.index[-1].date()})')
+          f'({nifty_raw.index[0].date()} -> {nifty_raw.index[-1].date()})')
     print(f'  VIX   : {len(vix_raw):,} rows  '
-          f'({vix_raw.index[0].date()} → {vix_raw.index[-1].date()})')
+          f'({vix_raw.index[0].date()} -> {vix_raw.index[-1].date()})')
 
     return nifty_raw, vix_raw
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 2 — BUILD FEATURE MATRIX
-# ═══════════════════════════════════════════════════════════
-
 def build_features(nifty_raw: pd.DataFrame,
                    vix_raw: pd.DataFrame) -> tuple:
-    # Nifty features
     nifty = pd.DataFrame(index=nifty_raw.index)
     nifty['Close']          = pd.to_numeric(nifty_raw['Close'], errors='coerce')
     nifty['Nifty_Return']   = np.log(nifty['Close'] / nifty['Close'].shift(1))
@@ -122,7 +96,6 @@ def build_features(nifty_raw: pd.DataFrame,
         nifty['Nifty_Return'].rolling(20, min_periods=15).std(ddof=1) * np.sqrt(252)
     )
 
-    # VIX join
     vix = vix_raw[['Close']].rename(columns={'Close': 'India_VIX'})
     vix['India_VIX'] = pd.to_numeric(vix['India_VIX'], errors='coerce')
 
@@ -130,7 +103,6 @@ def build_features(nifty_raw: pd.DataFrame,
     df = df.join(vix, how='left')
     df['India_VIX'] = df['India_VIX'].ffill()
 
-    # FIX-F2: FII_Flow_zscore from macro_indicators
     feature_cols = BASE_FEATURE_COLS.copy()
     fii_loaded   = False
 
@@ -159,15 +131,15 @@ def build_features(nifty_raw: pd.DataFrame,
 
         null_pct = df['FII_Flow_zscore'].isna().mean() * 100
         if null_pct > 20:
-            print(f'  ⚠ FII_Flow_zscore: {null_pct:.1f}% null after ffill — excluding')
+            print(f'  FII_Flow_zscore: {null_pct:.1f}% null after ffill — excluding')
             df.drop(columns=['FII_Flow_zscore'], inplace=True)
         else:
             feature_cols.append('FII_Flow_zscore')
             fii_loaded = True
-            print(f'  ✅ FII_Flow_zscore loaded ({fii_zscore.notna().sum():,} non-null)')
+            print(f'  FII_Flow_zscore loaded ({fii_zscore.notna().sum():,} non-null)')
 
     except Exception as e:
-        print(f'  ⚠ FII load failed ({e}) — training on {len(feature_cols)} base features')
+        print(f'  FII load failed ({e}) — training on {len(feature_cols)} base features')
 
     df_train = df[feature_cols].dropna().copy()
 
@@ -180,13 +152,8 @@ def build_features(nifty_raw: pd.DataFrame,
     return df, df_train, feature_cols, fii_loaded
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 3 — TRAIN HMM
-# ═══════════════════════════════════════════════════════════
-
 def train_hmm(df_train: pd.DataFrame,
               feature_cols: list) -> tuple:
-    """Scale features and train HMM with N_RESTARTS random initialisations."""
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(df_train[feature_cols].values)
 
@@ -232,14 +199,10 @@ def train_hmm(df_train: pd.DataFrame,
     print(f'  Best model converged: {best_model.monitor_.converged}')
 
     if not best_model.monitor_.converged:
-        print('  ⚠ WARNING: Best model did not converge — consider increasing N_ITER')
+        print('  WARNING: Best model did not converge — consider increasing N_ITER')
 
     return best_model, scaler, X_scaled, n_converged, best_score
 
-
-# ═══════════════════════════════════════════════════════════
-# PHASE 4 — AUTO-LABEL STATES
-# ═══════════════════════════════════════════════════════════
 
 def label_states(best_model: GaussianHMM,
                  X_scaled: np.ndarray,
@@ -263,11 +226,9 @@ def label_states(best_model: GaussianHMM,
 
     remaining  = list(state_stats.index)
 
-    # Step 1: Bull
     bull_state = state_stats['Mean_Return'].idxmax()
     remaining.remove(bull_state)
 
-    # Step 2: Bear — joint score on remaining
     rem = state_stats.loc[remaining].copy()
     vix_min   = rem['Mean_VIX'].min()
     vix_max   = rem['Mean_VIX'].max()
@@ -277,11 +238,9 @@ def label_states(best_model: GaussianHMM,
     bear_state = rem['Bear_score'].idxmax()
     remaining.remove(bear_state)
 
-    # Step 3: HighVol
     highvol_state = state_stats.loc[remaining, 'Mean_VIX'].idxmax()
     remaining.remove(highvol_state)
 
-    # Step 4: Sideways
     sideways_state = remaining[0]
 
     STATE_MAP = {
@@ -291,10 +250,10 @@ def label_states(best_model: GaussianHMM,
         sideways_state: 'Sideways',
     }
 
-    print('State label assignments (FIX-S1 joint score):')
+    print('State label assignments:')
     for raw_id, label in STATE_MAP.items():
         row = state_stats.loc[raw_id]
-        print(f'  Raw state {raw_id} → {label:<10} '
+        print(f'  Raw state {raw_id} -> {label:<10} '
               f'mean_ret={row.Mean_Return:+.6f}  '
               f'mean_vix={row.Mean_VIX:.2f}  '
               f'n={row.Count:,}')
@@ -306,9 +265,9 @@ def label_states(best_model: GaussianHMM,
 
     print()
     print(f'  Bull mean return : {bull_ret*100:+.4f}%  '
-          f'{"✅ positive" if bull_ret > 0 else "⚠ non-positive"}')
+          f'{"positive" if bull_ret > 0 else "WARNING: non-positive"}')
     print(f'  Bear mean return : {bear_ret*100:+.4f}%  '
-          f'{"✅ negative" if bear_ret < 0 else "⚠ non-negative"}')
+          f'{"negative" if bear_ret < 0 else "WARNING: non-negative"}')
 
     df_train['Regime_Label'] = df_train['Raw_State'].map(STATE_MAP)
     df_train['Regime_Int']   = df_train['Regime_Label'].map(LABEL_TO_INT)
@@ -317,10 +276,6 @@ def label_states(best_model: GaussianHMM,
             highvol_state, sideways_state,
             bull_ret, bear_ret, hv_vix, max_vix, state_stats)
 
-
-# ═══════════════════════════════════════════════════════════
-# PHASE 5 — BUILD REGIME SERIES + POSTERIORS
-# ═══════════════════════════════════════════════════════════
 
 def build_regime_series(best_model: GaussianHMM,
                         X_scaled: np.ndarray,
@@ -349,7 +304,7 @@ def build_regime_series(best_model: GaussianHMM,
     regime_df['Date'] = pd.to_datetime(regime_df['Date']).dt.date
 
     print(f'\n  Total regime rows : {len(regime_df):,}')
-    print(f'  Date range        : {regime_df.Date.min()} → {regime_df.Date.max()}')
+    print(f'  Date range        : {regime_df.Date.min()} -> {regime_df.Date.max()}')
     print(f'  Model version     : {model_version}')
     print()
     print('  Regime distribution:')
@@ -361,25 +316,10 @@ def build_regime_series(best_model: GaussianHMM,
     return regime_df, ordered_raw, prob_cols, model_version
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 6 — WRITE TO DB
-# ═══════════════════════════════════════════════════════════
-
 def write_to_db(regime_df: pd.DataFrame,
                 prob_cols: list,
                 model_version: str,
                 date_stamp: str) -> bool:
-    # CSV backup — always
-    csv_stamped = os.path.join(MODELS_DIR, f'market_regimes_{date_stamp}.csv')
-    csv_latest  = os.path.join(MODELS_DIR, 'market_regimes_latest.csv')
-    regime_out  = regime_df.copy()
-    regime_out['Date'] = regime_out['Date'].astype(str)
-    regime_out.to_csv(csv_stamped, index=False)
-    regime_out.to_csv(csv_latest,  index=False)
-    print(f'  CSV saved: {csv_stamped}')
-    print(f'  CSV saved: {csv_latest}')
-
-    # DB write
     try:
         engine = get_engine()
         rows   = []
@@ -418,7 +358,7 @@ def write_to_db(regime_df: pd.DataFrame,
                 conn.execute(upsert_sql, rows[i:i+1000])
                 written += len(rows[i:i+1000])
 
-        print(f'  ✅ DB write complete: {written:,} rows upserted into market_regimes')
+        print(f'  DB write complete: {written:,} rows upserted into market_regimes')
 
         with engine.connect() as conn:
             total  = conn.execute(text('SELECT COUNT(*) FROM market_regimes')).scalar()
@@ -428,17 +368,11 @@ def write_to_db(regime_df: pd.DataFrame,
         return True
 
     except Exception as e:
-        print(f'  ❌ DB write failed: {e}')
-        print('  Use the CSV files above.')
+        print(f'  DB write failed: {e}')
         return False
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 7 — PLOTS
-# ═══════════════════════════════════════════════════════════
-
 def build_segments(df: pd.DataFrame) -> list:
-    """Build contiguous regime segments for axvspan plotting."""
     segs = []
     if df.empty:
         return segs
@@ -481,7 +415,6 @@ def plot_regime_timeline(nifty_raw: pd.DataFrame,
         fontsize=11, fontweight='bold'
     )
 
-    # Subplot 1: Nifty price with regime background
     ax1 = axes[0]
     ax1.plot(plot_df['Date'], plot_df['Close'], color='black', linewidth=0.8, zorder=2)
     for start, end, label in segments:
@@ -493,7 +426,6 @@ def plot_regime_timeline(nifty_raw: pd.DataFrame,
     ax1.set_ylabel('Nifty 50 Close')
     ax1.set_title('Nifty 50 Price — Background Shaded by Regime')
 
-    # Subplot 2: Regime timeline
     ax2 = axes[1]
     for start, end, label in segments:
         ax2.axvspan(start, end, alpha=0.85, color=STATE_COLORS[label], zorder=1)
@@ -502,7 +434,6 @@ def plot_regime_timeline(nifty_raw: pd.DataFrame,
     ax2.set_ylabel('Regime')
     ax2.set_title('Regime Timeline')
 
-    # Subplot 3: India VIX
     ax3 = axes[2]
     ax3.plot(pd.to_datetime(vix_raw.index), vix_raw['Close'],
              color='#8e44ad', linewidth=0.8)
@@ -528,7 +459,6 @@ def plot_regime_timeline(nifty_raw: pd.DataFrame,
 def plot_state_stats(df_train: pd.DataFrame,
                      trans_reordered: np.ndarray,
                      date_stamp: str):
-    """Bar charts of per-state statistics + transition matrix heatmap."""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle('HMM v3 State Statistics', fontsize=13, fontweight='bold')
 
@@ -566,7 +496,7 @@ def plot_state_stats(df_train: pd.DataFrame,
     im = ax.imshow(trans_reordered, cmap='YlOrRd', vmin=0, vmax=1)
     ax.set_xticks(range(4))
     ax.set_yticks(range(4))
-    ax.set_xticklabels(['→' + l for l in labels_ordered], fontsize=8)
+    ax.set_xticklabels(['->' + l for l in labels_ordered], fontsize=8)
     ax.set_yticklabels(labels_ordered, fontsize=8)
     ax.set_title('Transition Matrix')
     for i in range(4):
@@ -616,10 +546,6 @@ def plot_posteriors(regime_df: pd.DataFrame,
     print(f'  Saved: {p}')
 
 
-# ═══════════════════════════════════════════════════════════
-# PHASE 8 — SAVE MODEL FILES
-# ═══════════════════════════════════════════════════════════
-
 def save_models(best_model: GaussianHMM,
                 scaler: StandardScaler,
                 STATE_MAP: dict,
@@ -658,9 +584,6 @@ def save_models(best_model: GaussianHMM,
         }, f)
     print(f'  Saved: {statemap_path}')
 
-# ═══════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════
 
 def main():
     print('=' * 60)
@@ -670,37 +593,31 @@ def main():
 
     date_stamp = datetime.today().strftime('%Y%m%d')
 
-    # Phase 1
-    print('\n📥 Phase 1 — Fetch price data...')
+    print('\nPhase 1 — Fetch price data...')
     nifty_raw, vix_raw = fetch_price_data()
 
-    # Phase 2
-    print('\n📊 Phase 2 — Build feature matrix...')
+    print('\nPhase 2 — Build feature matrix...')
     df, df_train, feature_cols, fii_loaded = build_features(nifty_raw, vix_raw)
 
-    # Phase 3
-    print('\n🔄 Phase 3 — Train HMM...')
+    print('\nPhase 3 — Train HMM...')
     best_model, scaler, X_scaled, n_converged, best_score = train_hmm(
         df_train, feature_cols
     )
 
-    # Phase 4
-    print('\n🏷  Phase 4 — Label states...')
+    print('\nPhase 4 — Label states...')
     (df_train, STATE_MAP,
      bull_state, bear_state, highvol_state, sideways_state,
      bull_ret, bear_ret, hv_vix, max_vix, state_stats) = label_states(
         best_model, X_scaled, df_train, feature_cols
     )
 
-    # Phase 5
-    print('\n📋 Phase 5 — Build regime series...')
+    print('\nPhase 5 — Build regime series...')
     regime_df, ordered_raw, prob_cols, model_version = build_regime_series(
         best_model, X_scaled, df_train,
         bull_state, bear_state, highvol_state, sideways_state,
         date_stamp
     )
 
-    # Transition matrix
     trans_reordered = best_model.transmat_[np.ix_(ordered_raw, ordered_raw)]
     print('\nTransition matrix:')
     labels_o = ['Bull', 'Bear', 'HighVol', 'Sideways']
@@ -711,31 +628,25 @@ def main():
     for i, label in enumerate(labels_o):
         val = trans_reordered[i, i]
         print(f'  Persistence {label:<10}: {val:.4f}  '
-              f'{"✅" if val > 0.90 else "⚠"}')
+              f'{"OK" if val > 0.90 else "WARN"}')
 
-    # Phase 6
-    print('\n💾 Phase 6 — Write to DB...')
-    db_write_ok = write_to_db(regime_df, prob_cols, model_version, date_stamp)
+    print('\nPhase 6 — Write to DB...')
+    write_to_db(regime_df, prob_cols, model_version, date_stamp)
 
-    # Phase 7
-    print('\n📈 Phase 7 — Generate plots...')
+    print('\nPhase 7 — Generate plots...')
     plot_regime_timeline(nifty_raw, vix_raw, regime_df, feature_cols, date_stamp)
     plot_state_stats(df_train, trans_reordered, date_stamp)
     plot_posteriors(regime_df, prob_cols, date_stamp)
 
-    # Phase 8
-    print('\n📦 Phase 8 — Save model files...')
+    print('\nPhase 8 — Save model files...')
     save_models(best_model, scaler, STATE_MAP, feature_cols, ordered_raw,
                 best_score, n_converged, fii_loaded, model_version, date_stamp)
-
 
     print(f'\n{"=" * 60}')
     print(f'DONE: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     print(f'{"=" * 60}')
     print(f'\nPlots saved to : {RESULTS_DIR}')
     print(f'Models saved to: {MODELS_DIR}')
-    print()
-    
 
 
 if __name__ == '__main__':

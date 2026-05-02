@@ -39,7 +39,6 @@ PIPELINE = [
     ("Technical Indicators",    "data/indicators.py",                      [], False),
     ("Macro Data",              "data/macro.py",                           [], False),
     ("FII/DII Data",            "data/fii_dii_stockedge.py",               [], False),
-    ("RBI Macro",               "data/rbi_macro.py",                       [], False),
     ("HMM Regime Detection",    "ML_scripts/hmm.py",                       [], False),
     ("Feature Engineering",     "data/features.py",                        [], False),
     ("Export Features",         "data/export_features.py",                 [], False),
@@ -88,9 +87,9 @@ def main():
     failed = [n for n, ok in results.items() if not ok]
 
     for n in passed:
-        log.info(f"  ✓  {n}")
+        log.info(f"  [OK]  {n}")
     for n in failed:
-        log.error(f"  ✗  {n}")
+        log.error(f" [NOT OK]  {n}")
 
     log.info(f"\nCompleted: {len(passed)}/{len(results)}  |  Log: {LOG_FILE}")
 

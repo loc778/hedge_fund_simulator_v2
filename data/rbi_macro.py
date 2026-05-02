@@ -23,7 +23,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import text
 
-from config import TABLES
+from config import TABLES, RBI_REPO_HISTORY
 from data.db import get_engine
 
 load_dotenv()
@@ -41,70 +41,12 @@ FRED_FOREX_SERIES = "TRESEGINM052N"    # India total reserves excl. gold (USD mn
 
 def get_repo_rate() -> pd.Series:
     """
-    Full RBI repo rate history Jan 2010 → Apr 2026.
-    Each entry = effective date of that rate.
-    Forward-filled to daily in features.py.
-    Source: RBI MPC press releases
+    Reads RBI repo rate history from config.RBI_REPO_HISTORY.
+    To update: edit RBI_REPO_HISTORY in config.py after each MPC meeting.
     """
-    repo_history = [
-        ("2010-01-01", 4.75),
-        ("2010-02-01", 5.00),
-        ("2010-04-20", 5.25),
-        ("2010-07-02", 5.50),
-        ("2010-07-27", 5.75),
-        ("2010-09-16", 6.00),
-        ("2010-11-02", 6.25),
-        ("2011-01-25", 6.50),
-        ("2011-03-17", 6.75),
-        ("2011-05-03", 7.25),
-        ("2011-06-16", 7.50),
-        ("2011-07-26", 8.00),
-        ("2011-10-25", 8.50),
-        ("2012-04-17", 8.00),
-        ("2012-06-18", 8.00),
-        ("2012-10-30", 7.50),
-        ("2013-01-29", 7.75),
-        ("2013-03-19", 7.50),
-        ("2013-05-03", 7.25),
-        ("2014-01-28", 8.00),
-        ("2014-06-03", 8.00),
-        ("2015-01-15", 7.75),
-        ("2015-03-04", 7.50),
-        ("2015-06-02", 7.25),
-        ("2015-09-29", 6.75),
-        ("2016-04-05", 6.50),
-        ("2016-10-04", 6.25),
-        ("2017-08-02", 6.00),
-        ("2018-06-06", 6.25),
-        ("2018-08-01", 6.50),
-        ("2019-02-07", 6.25),
-        ("2019-04-04", 6.00),
-        ("2019-06-06", 5.75),
-        ("2019-08-07", 5.40),
-        ("2019-10-04", 5.15),
-        ("2020-03-27", 4.40),
-        ("2020-05-22", 4.00),
-        ("2022-05-04", 4.40),
-        ("2022-06-08", 4.90),
-        ("2022-08-05", 5.40),
-        ("2022-09-30", 5.90),
-        ("2022-12-07", 6.25),
-        ("2023-02-08", 6.50),
-        # 2025 easing cycle — 3 cuts of 25bps each
-        ("2025-02-07", 6.25),
-        ("2025-04-09", 6.00),
-        ("2025-06-06", 5.75),
-        ("2025-09-05", 5.50),
-        ("2025-12-05", 5.25),
-        # 2026 — held at 5.25% (Feb 2026 MPC, Apr 2026 MPC)
-        # ── MAINTENANCE NOTE ──────────────────────────────────────────
-        # MPC meets ~8x/year. After each meeting, add the new rate here
-        # if changed. Source: rbi.org.in → Monetary Policy → Press Releases
-        # Last verified: Apr 2026 — rate held at 5.25%
-    ]
     series = pd.Series(
-        [r[1] for r in repo_history],
-        index=pd.to_datetime([r[0] for r in repo_history]),
+        [r[1] for r in RBI_REPO_HISTORY],
+        index=pd.to_datetime([r[0] for r in RBI_REPO_HISTORY]),
         name="Repo_Rate"
     )
     series.index.name = "Date"

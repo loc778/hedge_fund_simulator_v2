@@ -1,11 +1,7 @@
 .env
 __pycache__/
 models/
-features_master.csv
-files/
 .venv/
-debugging/
 logs/
 exports/
 results/
-ML_models/

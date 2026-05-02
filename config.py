@@ -16,14 +16,8 @@ NIFTY500_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_tickers.csv")
 # Columns: Company Name, Industry, Symbol, Series, ISIN Code
 NIFTY500_SECTORS_CSV = os.path.join(PROJECT_ROOT, "files", "nifty500_sectors.csv")
 
-# Path to RBI repo rate history CSV
-# Columns: effective_date, repo_rate
-# Update this file manually after each MPC meeting
-RBI_REPO_CSV = os.path.join(PROJECT_ROOT, "files", "rbi", "repo_history.csv")
-
 #path to the FO_LIST CSV file
 FO_LIST_CSV = os.path.join(PROJECT_ROOT, "files", "fo_list.csv")
-
 
 # ── Load Tickers from CSV ─────────────────────────────────────────────
 def load_tickers(csv_path: str) -> list:
@@ -37,13 +31,11 @@ def load_tickers(csv_path: str) -> list:
     symbols = [s for s in symbols if s and s != 'NIFTY 500']
     return [f"{s}.NS" for s in symbols]
 
-
 try:
     TICKERS = load_tickers(NIFTY500_CSV)
 except FileNotFoundError:
     TICKERS = []
     print(f"WARNING: {NIFTY500_CSV} not found. TICKERS is empty.")
-
 
 # ── Load Sector Map from CSV ──────────────────────────────────────────
 # Replaces the hardcoded SECTOR_MAP_FALLBACK dict.
@@ -68,17 +60,14 @@ def load_sector_map(csv_path: str) -> dict:
         print(f"WARNING: {csv_path} not found. SECTOR_MAP is empty.")
         return {}
 
-
 try:
     SECTOR_MAP = load_sector_map(NIFTY500_SECTORS_CSV)
 except Exception:
     SECTOR_MAP = {}
 
-
 def get_sector(ticker: str) -> str:
     """Returns sector for a ticker. Defaults to 'Others' if not found."""
     return SECTOR_MAP.get(ticker, "Others")
-
 
 # ── NSE Holidays ──────────────────────────────────────────────────────
 # NSE is closed on these dates. Updated annually.
@@ -172,7 +161,6 @@ NSE_HOLIDAYS = {
     date(2010, 12, 17),
 }
 
-
 # ── Banking / NBFC Tickers ────────────────────────────────────────────
 # Used by screener_fundamentals.py to apply bank-specific P&L row names.
 # Only pure deposit-taking banks and pure lending NBFCs.
@@ -192,7 +180,6 @@ BANKING_TICKERS = {
     "HOMEFIRST.NS", "CANFINHOME.NS","APTUS.NS",       "CREDITACC.NS",
 }
 
-
 # ── Data Range ────────────────────────────────────────────────────────
 DATA_START = "2010-01-01"
 DATA_END   = None   # None = today
@@ -200,10 +187,6 @@ DATA_END   = None   # None = today
 # ── Batch Settings ────────────────────────────────────────────────────
 BATCH_SIZE  = 10
 BATCH_DELAY = 2
-STOCK_DELAY = 1
-
-# ── Database ──────────────────────────────────────────────────────────
-DB_NAME = "hedge_v2_db"
 
 # ── Table Names ───────────────────────────────────────────────────────
 # NOTE: "sector_median" key renamed from "sector_fundamentals_med" (Apr 2026)
@@ -221,13 +204,8 @@ TABLES = {
     "market_regimes"           : "market_regimes",
 }
 
-# ── Model Version ─────────────────────────────────────────────────────
-MODEL_VERSION = "v2_20260418"
-MODEL_DIR     = os.path.join(PROJECT_ROOT, "models")
-
 # ── Bhavcopy Config ───────────────────────────────────────────────────
 BHAVCOPY_TEMP_DIR = os.path.join(PROJECT_ROOT, "data", "bhavcopy_temp")
-DATA_SOURCE       = "bhavcopy"
 
 # ── Data Quality Tier Thresholds ──────────────────────────────────────
 # Max observed coverage_ratio across 500 bhavcopy-ingested stocks = 0.9454.
@@ -256,40 +234,62 @@ TIER_X_EXCLUDED = [
     "ATHERENERG.NS",
 ]
 
-# ── Portfolio Constraints ─────────────────────────────────────────────
-PORTFOLIO = {
-    "min_stocks"              : 30,
-    "max_stocks"              : 55,
-    "max_stocks_hard_limit"   : 60,
-    "max_position_pct"        : 0.05,
-    "min_position_pct"        : 0.001,
-    "max_sector_long_pct"     : 0.25,
-    "max_sector_short_pct"    : 0.15,
-    "max_long_exposure"       : 1.20,
-    "target_long_exposure"    : 1.15,
-    "max_short_exposure"      : 0.20,
-    "target_short_exposure"   : 0.15,
-    "nifty100_anchor_pct"     : 0.65,
-    "alpha_midcap_pct"        : 0.35,
-    "max_midcap_exposure"     : 0.35,
-    "min_cash_pct"            : 0.08,
-    "max_cash_pct"            : 0.12,
-    "monthly_drawdown_trigger": 0.05,
-    "peak_trough_hard_stop"   : 0.10,
-    "long_stop_loss"          : 0.15,
-    "short_stop_loss"         : 0.10,
-    "brokerage_bps"           : 3,
-    "stamp_duty_bps"          : 1.5,
-    "stt_bps"                 : 10,
-    "slippage_bps"            : 5,
-}
-
-DEPLOY_PCT = {
-    "Bull"     : 0.92,
-    "Sideways" : 0.90,
-    "Bear"     : 0.80,
-    "Elevated" : 0.75,
-}
+# ── RBI Repo Rate History ────────────────────────────────────────────
+# Full MPC history Jan 2010 → present.
+# Each entry: (effective_date, rate_pct).
+# MAINTENANCE: After each MPC meeting, append new entry if rate changed.
+# Source: rbi.org.in → Monetary Policy → Press Releases
+# Last verified: Apr 2026 — rate held at 5.25%
+RBI_REPO_HISTORY = [
+    ("2010-01-01", 4.75),
+    ("2010-02-01", 5.00),
+    ("2010-04-20", 5.25),
+    ("2010-07-02", 5.50),
+    ("2010-07-27", 5.75),
+    ("2010-09-16", 6.00),
+    ("2010-11-02", 6.25),
+    ("2011-01-25", 6.50),
+    ("2011-03-17", 6.75),
+    ("2011-05-03", 7.25),
+    ("2011-06-16", 7.50),
+    ("2011-07-26", 8.00),
+    ("2011-10-25", 8.50),
+    ("2012-04-17", 8.00),
+    ("2012-06-18", 8.00),
+    ("2012-10-30", 7.50),
+    ("2013-01-29", 7.75),
+    ("2013-03-19", 7.50),
+    ("2013-05-03", 7.25),
+    ("2014-01-28", 8.00),
+    ("2014-06-03", 8.00),
+    ("2015-01-15", 7.75),
+    ("2015-03-04", 7.50),
+    ("2015-06-02", 7.25),
+    ("2015-09-29", 6.75),
+    ("2016-04-05", 6.50),
+    ("2016-10-04", 6.25),
+    ("2017-08-02", 6.00),
+    ("2018-06-06", 6.25),
+    ("2018-08-01", 6.50),
+    ("2019-02-07", 6.25),
+    ("2019-04-04", 6.00),
+    ("2019-06-06", 5.75),
+    ("2019-08-07", 5.40),
+    ("2019-10-04", 5.15),
+    ("2020-03-27", 4.40),
+    ("2020-05-22", 4.00),
+    ("2022-05-04", 4.40),
+    ("2022-06-08", 4.90),
+    ("2022-08-05", 5.40),
+    ("2022-09-30", 5.90),
+    ("2022-12-07", 6.25),
+    ("2023-02-08", 6.50),
+    ("2025-02-07", 6.25),
+    ("2025-04-09", 6.00),
+    ("2025-06-06", 5.75),
+    ("2025-09-05", 5.50),
+    ("2025-12-05", 5.25),
+]
 
 # ── Macro Data Config ─────────────────────────────────────────────────
 MACRO_YFINANCE = {
@@ -308,82 +308,6 @@ MACRO_FRED = {
     "US_CPI"         : "CPIAUCSL",
     "US_10Y_Bond"    : "DGS10",
 }
-
-MACRO_RBI = {
-    "Repo_Rate"      : "rbi_repo_rate",
-    "IIP_Growth"     : "rbi_iip",
-    "Forex_Reserves" : "rbi_forex_reserves",
-}
-
-# ── Fundamentals Source ───────────────────────────────────────────────
-FUNDAMENTALS_SOURCE = "screener"
- 
-    # NSE corporate announcements API (public, no auth, rate-limited)
-NSE_ANNOUNCEMENT_URL = (
-        "https://www.nseindia.com/api/corporate-announcements"
-        "?index=equities&from_date={from_date}&to_date={to_date}"
-    )
- 
-    # Moneycontrol RSS feeds — current snapshot only (~50-100 items per feed)
-MONEYCONTROL_RSS_FEEDS = {
-        "business"  : "https://www.moneycontrol.com/rss/business.xml",
-        "markets"   : "https://www.moneycontrol.com/rss/marketsnews.xml",
-        "economy"   : "https://www.moneycontrol.com/rss/economy.xml",
-        "results"   : "https://www.moneycontrol.com/rss/results.xml",
-        "latest"    : "https://www.moneycontrol.com/rss/latestnews.xml",
-    }
- 
-    # Rule-based scoring for NSE announcements.
-    # Matches subject/description against keyword lists (case-insensitive).
-    # First matching category wins. Score range [-1.0, +1.0].
-NSE_ANNOUNCEMENT_RULES = {
-        "earnings_result": {
-            "keywords": ["financial result", "quarterly result", "audited result",
-                         "unaudited result", "board meeting outcome"],
-            "score": 0.2,
-        },
-        "buyback": {
-            "keywords": ["buy-back", "buyback", "buy back of equity"],
-            "score": 0.6,
-        },
-        "dividend": {
-            "keywords": ["dividend declared", "interim dividend", "final dividend",
-                         "dividend declaration"],
-            "score": 0.3,
-        },
-        "pledge": {
-            "keywords": ["pledge", "encumbrance", "invocation of pledge"],
-            "score": -1.0,
-        },
-        "credit_rating": {
-            "keywords": ["credit rating", "rating action", "rating revision",
-                         "rating upgrade", "rating downgrade"],
-            "score": 0.0,
-        },
-        "order_win": {
-            "keywords": ["order win", "new order", "contract awarded",
-                         "letter of intent", "loi received", "work order"],
-            "score": 0.5,
-        },
-        "management_change": {
-            "keywords": ["resignation", "appointment", "cessation",
-                         "managing director", "chief executive", "cfo"],
-            "score": 0.0,
-        },
-        "regulatory": {
-            "keywords": ["sebi", "penalty", "show cause", "adjudication",
-                         "enforcement", "violation"],
-            "score": -0.7,
-        },
-    }
-
-# ── Liquidity Filter ──────────────────────────────────────────────────
-LIQUIDITY_FILTER = {
-    "long_book_min_adv_cr"  : 5.0,
-    "short_book_min_adv_cr" : 10.0,
-    "lookback_days"         : 90,
-}
-
 
 # ── Features Pipeline Config ──────────────────────────────────────────
 # Tunable parameters for data/features.py. All values locked via
@@ -424,7 +348,6 @@ FEATURES = {
     # Volatility annualization factor (trading days per year).
     # Indian equity markets: ~250 trading days/year.
     "trading_days_per_year": 252,
-
 
     "export_dir": "exports",
 }

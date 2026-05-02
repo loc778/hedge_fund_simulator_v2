@@ -135,19 +135,6 @@ def print_summary(df: pd.DataFrame, timestamped_path: str, latest_path: str):
     print(f"\n  File size     : {file_size_mb:.1f} MB")
     print(f"  Timestamped   : {timestamped_path}")
     print(f"  Latest        : {latest_path}")
-    print("\n" + "=" * 60)
-    print("NEXT STEPS")
-    print("=" * 60)
-    print(f"  1. Upload to Google Drive:")
-    print(f"     {latest_path}")
-    print(f"  2. In Colab:")
-    print(f"     from google.colab import drive")
-    print(f"     drive.mount('/content/drive')")
-    print(f"     df = pd.read_parquet('/content/drive/MyDrive/<your_folder>/features_master_latest.parquet')")
-    print(f"  3. Filter by tier for training:")
-    print(f"     tier_ab = df[df['Data_Tier'].isin([1, 2])]  # Tier A+B for XGBoost/LSTM")
-    print(f"     tier_a  = df[df['Data_Tier'] == 1]          # Tier A only for LSTM")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Export features_master to Parquet")
