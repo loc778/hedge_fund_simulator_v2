@@ -24,6 +24,8 @@ GitHub: https://github.com/loc778/hedge_fund_simulator_v2
   - give a reason for api request example "need api for macro data "
   - submit and copy the api key and paste in .env file at fred_api_key
 
+## NOTE: Currently the repo contains all the necessary files and trained models upto May 2026. After setting up db and .env file just running the setup_pipeline and app.py would suffice to run the project.
+
 ### `.env` format
 
 ```
@@ -34,7 +36,7 @@ DB_NAME=hedge_v2_db
 FRED_API_KEY=your_fred_api_key
 ```
 
-### Installation
+### Installation/Setup
 
 ```bash
 # STEP 1:
@@ -53,8 +55,12 @@ In mysql "CREATE DATABASE hedge_v2_db;"
 # create .env file. use the same format in .env.example
 
 
-# STEP 5 Run full setup
+# STEP 5: Run full setup
 python setup_pipeline.py
+
+#STEP 6: Run dashboard/UI
+streamlit run dashboard/app.py
+
 ```
 
 ### ML Model Training (after setup completes)
