@@ -12,6 +12,7 @@ Intended to be scheduled via Windows Task Scheduler after market close
 (18:30 IST or later).
 """
 
+import io
 import subprocess
 import sys
 import os
@@ -21,16 +22,18 @@ from datetime import datetime
 # ── Logging ──────────────────────────────────────────────────────────────────
 LOG_FILE = f"logs/daily_refresh_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 os.makedirs("logs", exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')),
     ],
 )
 log = logging.getLogger(__name__)
+
+# ── Force UTF-8 output in all subprocesses (fixes Unicode crashes on Windows) ─
+os.environ["PYTHONIOENCODING"] = "utf-8"
 
 # ── Pipeline definition ───────────────────────────────────────────────────────
 # Each entry: (display_name, script_path, extra_args, skip_if_missing)
@@ -58,11 +61,17 @@ def run_step(name, script, args, skip_if_missing):
     log.info(f"START [{name}] — {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(cmd, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', check=True)
+        if result.stdout:
+            log.info(result.stdout.strip())
         log.info(f"DONE  [{name}]")
         return True
     except subprocess.CalledProcessError as e:
         log.error(f"FAIL  [{name}] — exit code {e.returncode}")
+        if e.stdout and e.stdout.strip():
+            log.error(f"  STDOUT:\n{e.stdout.strip()[-3000:]}")
+        if e.stderr and e.stderr.strip():
+            log.error(f"  STDERR:\n{e.stderr.strip()[-3000:]}")
         return False
     except Exception as e:
         log.error(f"FAIL  [{name}] — {e}")
