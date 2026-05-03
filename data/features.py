@@ -423,17 +423,20 @@ def build_sector_median_lookup(med_df: pd.DataFrame) -> dict:
 
 def load_ticker_ohlcv(ticker: str, after_date=None) -> pd.DataFrame:
     if after_date is not None:
+        # Pull 300-day lookback so rolling windows (252d momentum, 20d vol,
+        # 252d beta) have enough context for the first new date being processed.
+        lookback = after_date - pd.Timedelta(days=300)
         query = f"""
         SELECT Date, Ticker, High, Low, Adj_Close, Volume, VWAP_Daily
-        FROM {{TABLES['ohlcv']}}
-        WHERE Ticker = %s AND Date > %s
+        FROM {TABLES['ohlcv']}
+        WHERE Ticker = %s AND Date >= %s
         ORDER BY Date
         """
-        params = (ticker, after_date.date() if hasattr(after_date, 'date') else after_date)
+        params = (ticker, lookback.date() if hasattr(lookback, 'date') else lookback)
     else:
         query = f"""
         SELECT Date, Ticker, High, Low, Adj_Close, Volume, VWAP_Daily
-        FROM {{TABLES['ohlcv']}}
+        FROM {TABLES['ohlcv']}
         WHERE Ticker = %s
         ORDER BY Date
         """
@@ -454,7 +457,7 @@ def load_ticker_indicators(ticker: str, after_date=None) -> pd.DataFrame:
                MACD_Hist, RSI_14,
                BB_Upper, BB_Middle, BB_Lower,
                ATR_14, Stoch_K, ADX_14, OBV, VWAP_Dev
-        FROM {{TABLES['indicators']}}
+        FROM {TABLES['indicators']}
         WHERE Ticker = %s AND Date >= %s
         ORDER BY Date
         """
@@ -466,7 +469,7 @@ def load_ticker_indicators(ticker: str, after_date=None) -> pd.DataFrame:
                MACD_Hist, RSI_14,
                BB_Upper, BB_Middle, BB_Lower,
                ATR_14, Stoch_K, ADX_14, OBV, VWAP_Dev
-        FROM {{TABLES['indicators']}}
+        FROM {TABLES['indicators']}
         WHERE Ticker = %s
         ORDER BY Date
         """
@@ -799,6 +802,14 @@ def process_ticker(ticker: str,
     )
 
     df["Date"] = df["Date"].dt.date
+
+    # Trim context rows — only return rows strictly after after_date.
+    # Context rows were needed for rolling window calculations above
+    # but must not be written to features_master (already stored).
+    if after_date is not None:
+        cutoff = after_date.date() if hasattr(after_date, 'date') else after_date
+        df = df[df["Date"] > cutoff].reset_index(drop=True)
+
     return df
 
 
@@ -896,7 +907,7 @@ def compute_and_write_feature_ranks(sector_map: dict, from_date=None):
     print("\n🎯 Phase 3.5 — feature rank pass ")
 
     if from_date is not None:
-        date_filter = f"AND Date >= '{pd.Timestamp(from_date).date()}'"
+        date_filter = f"WHERE Date >= '{pd.Timestamp(from_date).date()}'"
         print(f"  Incremental: recomputing feature ranks from {pd.Timestamp(from_date).date()}")
     else:
         date_filter = ""
@@ -1111,7 +1122,7 @@ def main(incremental=True):
             save_to_db(df, TABLES["features"], engine)
             total_rows_written += len(df)
 
-            min_new = pd.to_datetime(df["Date"].min())
+            min_new = pd.Timestamp(str(df["Date"].min()))
             new_dates_seen.append(min_new)
 
             if idx % 25 == 0 or idx == total_tickers:
