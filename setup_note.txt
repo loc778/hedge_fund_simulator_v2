@@ -1,0 +1,34 @@
+Hedge Fund Simulator v2 — Setup Note
+
+Refer to the README in the project root for detailed setup instructions.
+
+Setup Steps
+
+1. Clone the repository via Git, or download the entire project folder
+   (hedge_fund_simulator_v2).
+
+2. Create a new MySQL database named hedge_v2_db.
+
+3. Create a .env file based on the .env.example template. Do not modify
+   .env.example — create a separate .env file and fill in your credentials there.
+
+4. For the FRED API key, follow the steps outlined in the README.
+
+5. For Screener credentials, create an account at https://www.screener.in/,
+   then enter your username and password in the designated fields in the .env file.
+
+6. In VS Code, create a virtual environment using Python 3.11 or below as the
+   interpreter.
+
+7. Run the setup pipeline script from the project root. Once it completes,
+   run app.py located inside the dashboard folder.
+
+8. Initial setup takes approximately 2.5 hours. After starting the pipeline,
+   ensure the PC does not go to sleep or hibernate. Return after ~2 hours and
+   run app.py to complete the setup.
+
+9. The Refresh button in the dashboard updates data to the latest available date.
+   This takes approximately 20-30 minutes. If the page does not reflect the
+   refresh after the completion message appears, close the browser and relaunch
+   the dashboard using: "streamlit run dashboard/app.py"
+
