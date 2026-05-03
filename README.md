@@ -1,493 +1,480 @@
-# AI Hedge Fund Simulator — hedge_v2
+# AI Hedge Fund Simulator v2 — NSE Nifty 500
 
-**Indian Equity Markets | Nifty 500 Universe | Long/Short Strategy**
+**AI-driven long/short equity system for NSE Nifty 500.**
+Generates ranked BUY/SELL/HOLD signals with confidence scores across ~467 actively traded stocks.
+Built on 15 years of historical NSE data (2010–present).
 
-> ⚠️ **Update this file every session.** Add an entry to the Session Log at the bottom whenever you complete a meaningful piece of work. This file is the project's memory — treat it like a diary.
-
----
-
-## What This Project Is
-
-A fully automated, AI-driven equity management platform for Indian stock markets (NSE). The system ingests 15 years of historical market data across 500 Nifty stocks, trains a multi-model ML ensemble, and generates BUY/SELL/HOLD recommendations with intelligent portfolio allocation.
-
-This is `hedge_v2` — the scaled production version. The prototype (`hedge_fund_simulator/`) has been left untouched as a reference.
-
-**Current project phase:** Data pipeline construction. Most ingestion scripts are built. Several critical data-quality issues identified in the Apr 15 audit must be resolved before feature engineering or model training can begin.
+GitHub: https://github.com/loc778/hedge_fund_simulator_v2
 
 ---
 
-## Folder Structure
+## 1. Setup — First Run
+
+### Prerequisites
+
+- Python 3.11 or below
+- MySQL 8.x running locally
+- `.env` file at project root (see below)
+- `files/nifty500_tickers.csv` downloaded from NSE
+- `files/nifty500_sectors.csv` (NSE official sector CSV)
+- `files/fo_list.csv` (F&O eligible list from NSE)
+- FRED API key (free: https://fred.stlouisfed.org/docs/api/api_key.html)
+  - create account in FRED
+  - select request API key
+  - give a reason for api request example "need api for macro data "
+  - submit and copy the api key and paste in .env file at fred_api_key
+
+### `.env` format
+
+```
+DB_HOST=localhost
+DB_USER=your_mysql_user
+DB_PASSWORD=your_mysql_password
+DB_NAME=hedge_v2_db
+FRED_API_KEY=your_fred_api_key
+```
+
+### Installation
+
+```bash
+# STEP 1:
+git clone https://github.com/loc778/hedge_fund_simulator_v2.git
+#clone in desktop
+
+# STEP 2 : Create virtual environment and choose python 3.11 or below
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # Linux/Mac
+
+# STEP 3: Create database
+In mysql "CREATE DATABASE hedge_v2_db;"
+
+# STEP 4:
+# create .env file. use the same format in .env.example
+
+
+# STEP 5 Run full setup
+python setup_pipeline.py
+```
+
+### ML Model Training (after setup completes)
+
+```bash
+# 1. Export features
+python data/export_features.py
+
+# 2. Upload exports/ to Google Drive (folder: "Hedge_Fund_Simulator_V2") → run xgboost.ipynb on Google Colab → download .pkl outputs → ML_models/ at local system
+
+# 3. Upload exports/ to Kaggle dataset → run lstm.ipynb on Kaggle → download .keras + .pkl outputs → ML_models/
+
+# 4. Run ensemble (after model files are in place)
+python ML_scripts/ensemble_final.py
+
+# 5. Launch dashboard
+streamlit run dashboard/app.py
+```
+
+---
+
+## 2. Project Overview
+
+This system simulates an AI-driven hedge fund operating on NSE-listed Nifty 500 equities.
+It is structured as a full end-to-end pipeline:
+
+```
+Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → Portfolio Construction → Dashboard
+```
+
+**Signal horizon:** 21 trading days (XGBoost/LightGBM), 10 trading days (LSTM).
+**Universe:** ~467 Nifty 500 stocks after excluding Tier X (recent IPOs < 252 trading days).
+**Strategy type:** Long/short equity with regime-aware position sizing.
+
+---
+
+## 3. Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DATA LAYER (Local)                       │
+│                                                                 │
+│  NSE Bhavcopy (OHLCV) → nifty500_ohlcv                          │
+│  Screener.in (Fundamentals) → nifty500_fundamentals             │
+│  StockEdge CM API (FII/DII) → fii_dii_flow                      │
+│  FRED + yfinance (Macro) → macro_indicators                     │
+│  RBI Repo Rate (hardcoded history) → macro_indicators           │
+│  Technical Indicators (ta library) → nifty500_indicators        │
+│  Data Quality Classification → stock_data_quality               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                   FEATURE ENGINEERING (Local)                   │
+│                                                                 │
+│  features.py → features_master (MySQL)                          │
+│  export_features.py → exports/ (Parquet, CSV)                   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+┌─────────────▼──────────┐  ┌──────────▼──────────────────────────┐
+│  HMM (Local)           │  │  XGBoost + LightGBM (Google Colab)  │
+│  ML_scripts/hmm.py     │  │  ML_scripts/xgboost.ipynb           │
+│  4-state regime model  │  │  21-day return ranking target       │
+│  → market_regimes      │  │  → ML_models/xgboost_v*.pkl         │
+│  → ML_models/hmm_*.pkl │  │  → ML_models/lightgbm_v*.pkl        │
+└────────────────────────┘  └─────────────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+┌─────────────▼─────────────────────────▼────────────────────────┐
+│               LSTM Dual-Head (Kaggle)                          │
+│               ML_scripts/lstm.ipynb                            │
+│               Head 1: 10-day return rank                       │
+│               Head 2: 5-day realized volatility                │
+│               → ML_models/lstm_v*.keras                        │
+│               → ML_models/lstm_norm_v*.pkl                     │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│                ENSEMBLE (Local)                                 │
+│                ML_scripts/ensemble_final.py                     │
+│                Rank calibration → confidence scores             │
+│                BUY / SELL / HOLD signal generation              │
+│                → exports/model_output/signals_*.csv             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│           PORTFOLIO + RISK + DASHBOARD (Local)                  │
+│           portfolio/optimizer.py                                │
+│           risk/risk_manager.py                                  │
+│           dashboard/app.py (Streamlit)                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Folder Structure
 
 ```
 hedge_fund_simulator_v2/
-├── config.py                    ← Central config (tickers, constraints, table names)
-├── .env                         ← Credentials (never on GitHub)
-├── requirements.txt             ← All libraries (⚠️ no versions pinned — fix pending)
-├── README.md                    ← This file — update every session
 │
-├── files/
-│   ├── nifty500_tickers.csv     ← NSE Nifty 500 watchlist (re-download quarterly)
-│   ├── nifty500_sectors.csv     ← NSE official sector classification, all 500 tickers (loaded into config.py as SECTOR_MAP)
-│   └── rbi/
-│       └── repo_history.csv     ← Repo rate history 2010-present (update manually after each MPC meeting)
+├── dashboard/
+│   └── app.py                      # Streamlit UI
 │
 ├── data/
-│   ├── db.py                    ← Shared DB utilities (get_engine, save_to_db)
-│   ├── setup_db.py              ← Run once on any new machine to create all tables
-│   ├── bhavcopy_ingestion.py    ← Layer 1: OHLCV via NSE bhavcopy archives — DONE, VERIFIED
-│   ├── indicators.py            ← Layer 4: Technical indicators — DONE, C1 FIXED (Adj_Close)
-│   ├── screener_fundamentals.py ← Layer 2: Annual fundamentals from Screener.in — DONE, C2 FIXED
-│   ├── macro.py                 ← Layer 3A: yfinance + FRED macro data — DONE, C6 FIXED (UPSERT)
-│   ├── fii_dii_stockedge.py     ← Layer 3A: FII+DII monthly+daily via StockEdge API — DONE (replaces fii_dii.py + fii_dii_historical.py)
-│   ├── rbi_macro.py             ← Layer 3A: Repo Rate + IIP + Forex — DONE, VERIFIED
-│   ├── sentiment.py             ← Layer 3B: News sentiment via FinBERT — NOT BUILT (home laptop only)
-│   ├── data_quality.py          ← Stock tier classification A/B/C/X — NOT BUILT (NEXT STEP)
-│   ├── features.py              ← Feature engineering — unified ML table — NOT BUILT
-│   └── export_features.py       ← Export features_master.csv for Colab — NOT BUILT
+│   ├── bhavcopy_ingestion.py       # NSE OHLCV download & ingestion
+│   ├── data_quality.py             # Tier A/B/C/X classification
+│   ├── db.py                       # SQLAlchemy engine factory
+│   ├── export_features.py          # Exports features_master → Parquet/CSV
+│   ├── features.py                 # Feature engineering pipeline
+│   ├── fii_dii_stockedge.py        # FII/DII via StockEdge CM API
+│   ├── indicators.py               # Technical indicators (ta library)
+│   ├── macro.py                    # Macro data: FRED + yfinance
+│   ├── rbi_macro.py                # RBI repo rate → macro_indicators
+│   ├── screener_fundamentals.py    # Fundamental data via Screener.in
+│   └── setup_db.py                 # DB schema creation / migration
 │
-├── debugging/                   ← Debug scripts (should be in .gitignore)
-│   ├── debug_screener.py
-│   ├── insure_dbug.py
-│   └── new_debug.py
+├── exports/
+│   └── model_output/               # signals_*.csv, nav_series_*.csv
 │
-├── models/                      ← Saved model files (not on GitHub)
-│   └── adj_factors.pkl          ← yfinance adjustment factors (auto-generated)
+├── files/
+│   ├── fo_list.csv                 # F&O eligible tickers (NSE)
+│   ├── nifty500_sectors.csv        # Symbol → Industry mapping (NSE official)
+│   └── nifty500_tickers.csv        # NSE watchlist CSV (re-download quarterly)
 │
-├── risk/                        ← NOT BUILT — no files exist yet
-│   └── risk_manager.py          ← TODO
+├── logs/                           # Auto-generated pipeline logs
 │
-└── dashboard/                   ← NOT BUILT — no files exist yet
-    └── app.py                   ← TODO
+├── ML_models/
+│   ├── results/                    # HMM regime plots
+│   ├── hmm_model_v*.pkl            # Trained HMM model
+│   ├── hmm_scaler_v*.pkl           # HMM feature scaler
+│   ├── hmm_statemap_v*.pkl         # State → regime label mapping
+│   ├── xgboost_v*.pkl              # Trained XGBoost model
+│   ├── lightgbm_v*.pkl             # Trained LightGBM model
+│   ├── lstm_v*.keras               # Trained LSTM model
+│   ├── lstm_norm_v*.pkl            # LSTM feature normalizer
+│   ├── rank_calibration.pkl        # Rank → confidence score calibration
+│   └── adj_factors.pkl             # Corporate action adjustment factors
+│
+├── ML_scripts/
+│   ├── ensemble_final.py           # Ensemble combiner + signal generation
+│   ├── hmm.py                      # HMM regime detection (local)
+│   ├── lstm.ipynb                  # LSTM training notebook (Kaggle)
+│   └── xgboost.ipynb               # XGBoost + LightGBM notebook (Google Colab)
+│
+├── models/                         # model artefacts
+│
+├── portfolio/
+│   ├── __init__.py
+│   └── optimizer.py                # Position sizing, sector cap, allocation
+│
+├── risk/
+│   ├── __init__.py
+│   └── risk_manager.py             # Pre-trade risk checks, stop-loss logic
+│
+├── .env                            # DB credentials, FRED API key (not committed)
+├── .gitignore
+├── config.py                       # Single source of truth for all parameters
+├── daily_refresh.py                # Incremental daily update pipeline
+├── README.md
+├── requirements.txt
+└── setup_pipeline.py               # Full first-run pipeline orchestrator
 ```
 
 ---
 
-## Script Run Order
+## 5. Data Sources
 
-Run these in order on a fresh machine after `python data/setup_db.py`:
+| Source           | Script                     | Table                   |
+| ---------------- | -------------------------- | ----------------------- |
+| NSE Bhavcopy     | `bhavcopy_ingestion.py`    | `nifty500_ohlcv`        |
+| Screener.in      | `screener_fundamentals.py` | `nifty500_fundamentals` |
+| StockEdge CM API | `fii_dii_stockedge.py`     | `macro_indicators`      |
+| FRED API         | `macro.py`                 | `macro_indicators`      |
+| yfinance 0.2.48  | `macro.py`                 | `macro_indicators`      |
+| RBI Repo Rate    | `rbi_macro.py`             | `macro_indicators`      |
+| ta library       | `indicators.py`            | `nifty500_indicators`   |
 
-```
-1.  python data/bhavcopy_ingestion.py      ← DONE. 500 tickers, 1.3M rows, 2010-2026
-2.  python data/indicators.py              ← DONE. C1 fixed — runs on Adj_Close
-3.  python data/screener_fundamentals.py   ← DONE. C2 fixed — snapshot leak removed
-4.  python data/macro.py                   ← DONE. C6 fixed — UPSERT resume
-5.  python data/fii_dii_stockedge.py       ← DONE. Run MODE=monthly on 1st trading day of month, MODE=daily after market close daily
-6.  python data/rbi_macro.py               ← DONE
-7.  python data/sentiment.py               ← NOT BUILT (home laptop only — corporate firewall blocks HuggingFace/GDELT)
-8.  python data/data_quality.py            ← NOT BUILT (NEXT STEP)
-9.  python data/features.py                ← NOT BUILT
-10. python data/export_features.py         ← NOT BUILT
-```
-
-> ⚠️ **fii_dii.py and fii_dii_historical.py are retired.** Do not run them. Replaced by fii_dii_stockedge.py.
-
-**Then on Google Colab (in order):**
-
-```
-hedge_fund_xgboost.ipynb    ← XGBoost + LightGBM (free T4 GPU)
-hedge_fund_lstm.ipynb       ← LSTM (free T4 GPU)
-hedge_fund_hmm.ipynb        ← HMM regime detection (CPU only)
-hedge_fund_ensemble.ipynb   ← Ensemble combiner + backtest
-```
-
-None of the Colab notebooks have been built yet.
+- `pandas-ta` not used (Python 3.11+ incompatible).
+- Historical DII = NULL. Never zero-fill. StockEdge cookie session required.
+- Re-download `nifty500_tickers.csv` quarterly at SEBI rebalance (Mar/Jun/Sep/Dec).
 
 ---
 
-## Database
+## 6. Database Schema
 
-- **Database name:** `hedge_v2_db`
-- **Credentials:** stored in `.env` file (never committed to GitHub)
-- **Tables:** see `data/setup_db.py` for full schema
+**Database:** `hedge_v2_db` (MySQL) — managed via `data/setup_db.py` (safe to re-run).
 
-| Table                      | Purpose                                | Source                      | Status                                                                               |
-| -------------------------- | -------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| nifty500_ohlcv             | Daily OHLCV prices                     | NSE Bhavcopy                | POPULATED                                                                            |
-| nifty500_indicators        | Technical indicators                   | Computed from OHLCV         | POPULATED (C1 FIXED)                                                                 |
-| nifty500_fundamentals      | Annual P&L, balance sheet              | Screener.in                 | POPULATED (C2 FIXED)                                                                 |
-| macro_indicators           | Daily/monthly macro signals            | yfinance + FRED + StockEdge | POPULATED (4246 rows, new FII/DII columns)                                           |
-| nifty500_sentiment         | Daily news sentiment                   | FinBERT (planned)           | EMPTY                                                                                |
-| stock_data_quality         | Tier A/B/C/X classification            | Computed from OHLCV         | EMPTY                                                                                |
-| features_master            | Unified ML training dataset            | All layers combined         | EMPTY                                                                                |
-| portfolio_positions        | Active/closed position tracker         | Portfolio engine            | EMPTY                                                                                |
-| sector_fundamentals_median | Sector median ratios                   | Imputation fallback         | EMPTY                                                                                |
-| corporate_actions          | Split/dividend history                 | yfinance                    | POPULATED (9455 events)                                                              |
-| fii_dii_staging            | Staging table from Apr 17 FII overhaul | StockEdge API               | ⚠️ DROP THIS — data migrated to macro_indicators. Run: `DROP TABLE fii_dii_staging;` |
+| Table                        | Description                                       |
+| ---------------------------- | ------------------------------------------------- |
+| `nifty500_ohlcv`             | Daily OHLCV + Adj_Close (splits-adjusted)         |
+| `nifty500_indicators`        | 30+ technical indicators                          |
+| `nifty500_fundamentals`      | Quarterly fundamentals. C2 lookahead fix applied. |
+| `macro_indicators`           | Macro + FII/DII data. Historical DII = NULL.      |
+| `stock_data_quality`         | Tier A/B/C/X per ticker                           |
+| `features_master`            | Full feature set per (Ticker, Date)               |
+| `market_regimes`             | Daily HMM regime labels (0–3)                     |
+| `portfolio_positions`        | Active and historical positions                   |
+| `corporate_actions`          | Splits/bonus events for Adj_Close                 |
+| `sector_fundamentals_median` | Sector-level median fundamentals                  |
 
 ---
 
-## Key Design Decisions
+## 7. Pipeline — Local (Windows)
 
-- **Config-driven:** `config.py` is the single source of truth. BANKING_TICKERS, NSE_HOLIDAYS, SECTOR_MAP (from `files/nifty500_sectors.csv`, covers all 500 tickers), and `get_sector()` helper all live here.
-- **UPSERT for macro:** `macro.py` uses `ON DUPLICATE KEY UPDATE` — stale/preliminary FRED values (GDP, CPI) are corrected on re-run. All other scripts use `INSERT IGNORE` via `save_to_db()` — never use `.to_sql()` directly.
-- **nifty500_sentiment must NEVER be truncated** — historical news cannot be recovered.
-- **All ML training on Google Colab** — home laptop (AMD Ryzen 7, 8GB RAM, no GPU) cannot train models.
-- **Survivorship bias:** current implementation uses today's Nifty 500 only. Full fix requires NSE historical constituent files — deferred.
-- **Fundamentals source:** Screener.in annual data (not quarterly). Historical PE/ROE/ROCE/Dividend_Yield/BVPS are NULLed for all periods except latest — snapshot leak fixed (C2).
-- **FII/DII source:** StockEdge CM Provisional API (not NSDL). Covers 2008-present, includes DII, consistent units. `fii_dii_stockedge.py` is the only active FII/DII script. `fii_dii.py` and `fii_dii_historical.py` are retired — do not run them.
-- **Adj_Close:** computed from `corporate_actions` splits table (not yfinance ratio). Dividends excluded.
+### First-time setup
 
----
-
-## Portfolio Constraints (from Constraints doc)
-
-| Constraint                | Value                                      |
-| ------------------------- | ------------------------------------------ |
-| Min stocks in portfolio   | 30 (regime-dependent)                      |
-| Max stocks in portfolio   | 55 (hard cap 60)                           |
-| Max position size         | 5% of NAV                                  |
-| Max sector long exposure  | 25% of NAV                                 |
-| Max sector short exposure | 15% of NAV (cap only — no forced minimum)  |
-| Max long book             | 120% of NAV                                |
-| Max short book            | 20% of NAV (can be 0% if no valid signals) |
-| Min cash buffer           | 8% always                                  |
-| Long stop-loss            | -15% from entry                            |
-| Short stop-loss           | +10% against position                      |
-
----
-
-## Critical Issues (from Apr 15 audit — must fix before model training)
-
-| #   | Issue                                            | Severity | Status          |
-| --- | ------------------------------------------------ | -------- | --------------- |
-| C1  | indicators.py uses raw Close, not Adj_Close      | CRITICAL | ✅ FIXED        |
-| C2  | PE/ROE/ROCE/DivYield are snapshot, not history   | CRITICAL | ✅ FIXED        |
-| C3  | Adj_Close via yfinance ratio — propagates errors | CRITICAL | ✅ FIXED        |
-| C5  | FII column has monthly + daily values mixed      | CRITICAL | ✅ FIXED        |
-| C6  | macro.py resume never corrects stale rows        | CRITICAL | ✅ FIXED        |
-| H1  | features.py / data_quality.py not built          | HIGH     | OPEN            |
-| H2  | Tier A/B/C is README prose only, not computed    | HIGH     | OPEN            |
-| H3  | Fundamentals are annual, not quarterly           | HIGH     | OPEN (deferred) |
-| H4  | Cash derivation for non-banks is wrong           | HIGH     | OPEN            |
-| H7  | BE series excluded from bhavcopy parsing         | HIGH     | OPEN            |
-| H14 | requirements.txt has zero version pins           | HIGH     | OPEN            |
-
-Full issue list: see `audit_report.txt` in project files.
-
----
-
-## Known Issues / Deferred Work
-
-| Issue                                | Priority | Notes                                                                                                                              |
-| ------------------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Survivorship bias in ticker list     | Medium   | Need NSE historical constituent CSVs                                                                                               |
-| Sentiment historical backfill        | Medium   | GDELT bulk API — weeks of calls                                                                                                    |
-| Sector map covers 130/500 tickers    | High     | ✅ FIXED — nifty500_sectors.csv now covers all 500                                                                                 |
-| OBV uses unadjusted volume           | Medium   | Discontinuity on every split date                                                                                                  |
-| VWAP_Daily is actually Typical_Price | Medium   | Mislabeled column — (H+L+C)/3, not volume-weighted                                                                                 |
-| BB_Width in schema but not computed  | Low      | Will remain NULL until indicators.py adds it                                                                                       |
-| Screener ~124 tickers JS-rendered    | Low      | BeautifulSoup can't parse JS tables. These tickers will have NULL fundamentals — handled via sector median fallback in features.py |
-| rbi_macro.py hardcodes repo rate     | Medium   | repo_history.csv created but rbi_macro.py not yet patched to read it                                                               |
-| requirements.txt no version pins     | High     | Must pin — yfinance 1.2.1 breaks India_VIX/USDINR/Crude. Pin to yfinance==0.2.48                                                   |
-
----
-
-## Session Log
-
-> Add a new entry here at the end of every working session. Format: **Date — What was done**
-
----
-
-### 09 Apr 2026 — Project setup and first scripts
-
-**Status:** hedge_v2 project initialized from scratch.
-
-**Completed this session:**
-
-- Created `hedge_v2/` folder structure alongside `hedge_fund_simulator/` prototype
-- `config.py` — reads 500 tickers from NSE CSV (located at `files/nifty500_tickers.csv`), all portfolio constraints from constraints doc, GDP_India and FII/DII added to macro config, fundamentals source correctly set to Screener.in
-- `data/db.py` — shared DB utilities pointing to `hedge_v2_db`
-- `data/setup_db.py` — 10 tables created including stock_data_quality, portfolio_positions, sector_fundamentals_median, corporate_actions
-- `data/bhavcopy_ingestion.py` — downloads 15 years of NSE bhavcopy ZIPs, calculates Adj_Close using yfinance adjustment factor ratio, resume support, survivorship bias limitation documented
-- `requirements.txt` — all libraries listed (no versions pinned)
-- `nifty500_tickers.csv` — placed in `files/` subfolder
-
-**Key decisions made:**
-
-- Survivorship bias acknowledged but deferred — using current 500 tickers for now
-- min_long/short exposure removed from constraints (caps only, no forced floors)
-- Fundamentals: Screener.in (not yfinance) confirmed as source
-- GDP_India added back properly via correct FRED series ID (was corrupt 999999.9999 in prototype)
-
-**Next session:** Run bhavcopy ingestion, build indicators.py
-
----
-
-### 10 Apr 2026 — Bhavcopy ingestion verified, config fixed, indicators built
-
-**Status:** Data pipeline Layer 1 complete and verified. Layer 4 (indicators) built.
-
-**Bhavcopy Data Quality (from total_days.csv audit):**
-
-- 500 tickers ingested. Max observed coverage_ratio = 0.9454.
-- Tier A threshold corrected from 0.95 → 0.93 in config.py.
-- Verified tier distribution (estimated, not from data_quality.py):
-  - Tier A: 275 stocks (8+ years, ≥93% coverage)
-  - Tier B: 107 stocks (4+ years, ≥75% coverage)
-  - Tier C: 85 stocks (below thresholds)
-  - Tier X: 33 stocks (<252 days, all recent IPOs)
-- TIER_X_EXCLUDED list added to config.py — all 33 tickers hardcoded.
-- Note: these tier counts are from bhavcopy verification queries, NOT from data_quality.py (which does not exist yet).
-
-**Changes made:**
-
-- `config.py` — DATA_QUALITY thresholds fixed (0.95→0.93), TIER_X_EXCLUDED list added
-- `data/indicators.py` — built for hedge_v2 (nifty500_ohlcv → nifty500_indicators), skips Tier X tickers, uses `ta` library
-- ⚠️ **indicators.py computes all indicators on raw `Close`, not `Adj_Close`.** A fixed version `indicators1.py` was created later but is not wired into the pipeline. This is a critical bug — see audit_report.txt C1.
-
----
-
-### 10 Apr 2026 — Bhavcopy ingestion bugs fixed, data pipeline Layer 1 fully verified
-
-**Status:** Bhavcopy ingestion fully fixed and verified. 500 tickers, 15 years, data up to Apr 9 2026.
-
-**Bugs found and fixed in bhavcopy_ingestion.py:**
-
-- Root cause: NSE discontinued old bhavcopy format on July 8, 2024 (NSE Circular 62424). Old URL format returned 404 for all dates post Jul 5 2024.
-- Fix 1 — Added UDiFF format URL: `BhavCopy_NSE_CM_0_0_0_{YYYYMMDD}_F_0000.csv.zip`
-- Fix 2 — Added UDiFF column name mappings (TckrSymb→SYMBOL, OpnPric→OPEN, etc.)
-- Fix 3 — Added NSE session cookie refresh every 20 requests
-- Fix 4 — Removed `input()` confirmation prompt from verify_ingestion()
-
-**Final verified data state:**
-
-- Min Date: 2010-01-04
-- Max Date: 2026-04-09
-- Distinct Tickers: 500
-- Total Rows: 1,297,850
-- Trading days expected: 4,213 | Ingested: 4,010 | Coverage: 95.2%
-
-**Next session:** Build screener_fundamentals.py
-
----
-
-### 11 Apr 2026 — Screener fundamentals debugged, macro scripts built
-
-**Status:** All data pipeline ingestion scripts built. Screener fundamentals parser debugged through 3 iterations.
-
----
-
-**indicators.py — built (⚠️ known bug: uses raw Close)**
-
-- Reads nifty500_ohlcv, skips 33 Tier X tickers, computes 20 indicators per stock
-- Uses `ta` library (not pandas-ta — incompatible with Python 3.11+)
-- Drops warmup rows where RSI/MACD not yet valid
-- **BUG: computes all indicators on `Close` instead of `Adj_Close`. A fixed version `indicators1.py` exists using Adj_Close but is not the file referenced in the run order.**
-
----
-
-**screener_fundamentals.py — three debug iterations, v4 is current**
-
-Three bugs found and fixed:
-
-- Bug 1 — Valuation ratios (PE, ROE, ROCE, Dividend Yield) were 100% NULL. Root cause: these live in `.company-ratios li` elements, not financial tables. Fixed by adding `parse_company_ratios()` function.
-- Bug 2 — `get_years()` Windows locale bug with `strptime("%b")`. Fixed with manual MONTH_ORDER dict.
-- Bug 3 — Banking/NBFC tickers use different P&L row names. Fixed with separate keyword lists.
-
-**⚠️ KNOWN DATA QUALITY ISSUE:** PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS are the CURRENT SNAPSHOT from screener.in, applied to EVERY historical year row. This is a look-ahead leak — the model will train on future information for these features. Must be fixed before model training. See audit_report.txt C2.
-
-**⚠️ ANNUAL, NOT QUARTERLY:** The scraper parses Screener's annual P&L/BS/CF tables. The architecture framework claims "10-year quarterly." In reality, one row per year per ticker. Quarterly data would require scraping a different screener section.
-
-Columns permanently NULL (not available from screener): EV_EBITDA, FII_Holding, DII_Holding.
-
----
-
-**macro.py — built and verified**
-
-- Sources: yfinance (India VIX, USDINR, Crude, Gold) + FRED (GDP, CPI, Fed Rate, US 10Y)
-- 4242 rows in macro_indicators, date range 2010-01-01 → 2026-04-10
-- GDP_India: 64 distinct quarterly values, correct range — prototype 999999.9999 bug fixed
-- Resume support: checks latest date in DB, re-fetches last 5 days. **Caveat:** INSERT IGNORE means stale/preliminary values are never corrected on re-run.
-
-**fii_dii.py — built**
-
-- Source: NSE public API endpoint (fiidiiTradeReact)
-- Returns last ~30 days only. Historical backfill via fii_dii_historical.py.
-- SQLAlchemy 2.x text() wrapper fix applied.
-
-**rbi_macro.py — built**
-
-- Repo Rate: hardcoded MPC history (RBI has no public API). Current rate: 5.25%.
-- IIP Growth: FRED INDPROINDMISMEI (YoY % computed in script)
-- Forex Reserves: FRED TRESEGINM052N (USD mn ÷ 1000 = USD bn)
-
-**features.py — NOT BUILT**
-
-Session log previously mentioned "features.py ... sector median fallback loop is unvectorized." This was describing planned design, not existing code. features.py does not exist in the repo.
-
----
-
-### 14-15 Apr 2026 — Macro pipeline verification + FII/DII historical data
-
-**Status:** macro_indicators table fully populated. FII historical data loaded. rbi_macro.py verified.
-
----
-
-**macro.py — VERIFIED**
-
-- 4242 rows, 2010-01-01 → 2026-04-10
-- India_VIX: 248 NULLs (weekends/holidays — acceptable, forward-filled in features.py)
-- Crude_Oil/Gold: ~150 NULLs each (non-US trading day gaps)
-- GDP_India: correct values, quarterly forward-fill confirmed
-- Repo_Rate, IIP_Growth, Forex_Reserves_USD: populated by rbi_macro.py
-- FII_Net_Buy_Cr: populated by fii_dii_historical.py
-
----
-
-**fii_dii_historical.py — BUILT AND VERIFIED**
-
-- Source: NSDL FPI portal (.xls files, one per calendar year)
-- Files placed in `files/fii_nsdl/`
-- Auto-detects year from column header, handles pre/post 2022 formats
-- **⚠️ UNIT MISMATCH:** NSDL provides monthly totals. Each trading day in month M gets the full month M total. But fii_dii.py writes actual daily values for recent dates. Same column (`FII_Net_Buy_Cr`) contains two different measurement units. See audit_report.txt C5.
-- Result: 192 monthly records parsed, 4171 trading days updated
-
----
-
-**rbi_macro.py — rewritten and verified**
-
-Sources changed from RBI DBIE (dead URLs) to:
-
-| Column             | Source                                 |
-| ------------------ | -------------------------------------- |
-| Repo_Rate          | Hardcoded MPC history in script        |
-| IIP_Growth         | FRED: INDPROINDMISMEI (YoY % computed) |
-| Forex_Reserves_USD | FRED: TRESEGINM052N (USD mn ÷ 1000)    |
-
-Repo_Rate stale-row fix (run in MySQL Workbench):
-
-```sql
-UPDATE macro_indicators SET Repo_Rate = 5.75 WHERE Date BETWEEN '2025-06-06' AND '2025-09-04';
-UPDATE macro_indicators SET Repo_Rate = 5.50 WHERE Date BETWEEN '2025-09-05' AND '2025-12-04';
-UPDATE macro_indicators SET Repo_Rate = 5.25 WHERE Date >= '2025-12-05';
+```bash
+# From project root
+python setup_pipeline.py
 ```
 
----
+Runs in order:
 
-**DII_Net_Buy_Cr — investigated, deferred**
+1. `pip install -r requirements.txt`
+2. `data/setup_db.py`
+3. `data/bhavcopy_ingestion.py`
+4. `data/indicators.py`
+5. `data/screener_fundamentals.py`
+6. `data/macro.py`
+7. `data/fii_dii_stockedge.py`
+8. `data/rbi_macro.py`
+9. `data/data_quality.py`
+10. `ML_scripts/hmm.py`
+11. `data/features.py`
+12. `data/export_features.py`
+13. `ML_scripts/ensemble_final.py`
 
-No free bulk historical source exists for 15-year DII data. Remains NULL for historical period. Deferred until after first model training cycle confirms whether DII improves IC.
+### Data tier classification
 
----
+`data/data_quality.py` classifies each ticker into:
 
-### 15 Apr 2026 — Critical codebase audit
+| Tier | Criteria                                    | Count (Apr 2026) |
+| ---- | ------------------------------------------- | ---------------- |
+| A    | ≥ 8 years, ≥ 93% coverage, ≥ ₹5 Cr ADV      | ~275             |
+| B    | ≥ 4 years, ≥ 75% coverage, ≥ ₹1 Cr ADV      | ~107             |
+| C    | Below Tier B thresholds but ≥ 252 days      | ~85              |
+| X    | < 252 trading days (recent IPOs) — excluded | ~33              |
 
-**Status:** Full audit of all v2 source files completed. 5 critical bugs, 16 high-severity issues, 21 medium issues identified. See `audit_report.txt` for complete findings.
+Tier X list is also maintained in `config.py → TIER_X_EXCLUDED` for scripts that run before `data_quality.py`.
 
-**Summary of critical findings:**
+### Lookahead leak prevention
 
-1. **C1 — indicators.py uses raw Close.** indicators1.py is the fixed version but not wired in. All indicator data in DB is unreliable.
-2. **C2 — PE/ROE/ROCE/DivYield are current snapshot on every historical year.** Classic look-ahead leak.
-3. **C3 — Adj_Close via yfinance ratio propagates yfinance errors into NSE data.** Should use splits from corporate_actions directly.
-4. **C5 — FII column has monthly totals (historical) and daily values (recent) mixed.** Unit mismatch will confuse models.
-5. **C6 — macro.py resume with INSERT IGNORE never corrects stale rows.**
-
-**Remediation plan (Phase A — must complete before any further pipeline work):**
-
-1. Delete indicators.py, rename indicators1.py → indicators.py
-2. TRUNCATE nifty500_indicators, do not re-run until adj factor fix
-3. NULL out snapshot PE/ROE/ROCE/DivYield/BVPS for all but latest period per ticker
-4. Rebuild adjustment factors from corporate_actions (splits only)
-5. Split FII into FII_Monthly_Net_Cr + FII_Daily_Net_Cr (or divide monthly by trading days)
-6. Pin requirements.txt via pip freeze
-
-**Next session:** Begin Phase A remediation.
-
-### 15 Apr 2026 — Phase A remediation: all critical bugs fixed
-
-**Status:** All 5 critical audit issues (C1–C6) resolved. Data pipeline is now clean for feature engineering.
-
-**Changes made:**
-
-- `indicators.py` — replaced with fixed version (was `indicators1.py`). Now computes all indicators on `Adj_Close`. Old `indicators1.py` deleted. `nifty500_indicators` truncated and recomputed. **C1 FIXED.**
-- `screener_fundamentals.py` (v5) — PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS NULLed for all periods except latest per ticker. Snapshot look-ahead leak eliminated. **C2 FIXED.**
-- `bhavcopy_ingestion.py` — Adj_Close rebuilt from `corporate_actions` splits table (backward walk, cumulative ratio, bisect O(log N) lookup). Homepage cookie refresh calls removed (were causing 15s timeout waste per 20 iterations). Per-file sleep reduced 0.5s → 0.1s. **C3 FIXED.**
-- `macro.py` — UPSERT resume (`ON DUPLICATE KEY UPDATE`). NaN→None fix for DB writes. **C6 FIXED.**
-- `setup_db.py` — `macro_indicators` schema updated: `FII_Net_Buy_Cr` replaced with `FII_Monthly_Net_Cr` + `FII_Daily_Net_Cr`. Auto-migration function added.
-- `config.py` — NSE_HOLIDAYS moved from bhavcopy_ingestion.py; BANKING_TICKERS moved from screener_fundamentals.py; SECTOR_MAP now loaded from `files/nifty500_sectors.csv` (covers all 500 tickers, replaces hardcoded 130-ticker fallback); `get_sector()` helper added; RBI_REPO_CSV path added.
-- `files/nifty500_sectors.csv` — NEW. NSE official sector classification, all 500 tickers.
-- `files/rbi/repo_history.csv` — NEW. Repo rate history 2010-2026. Update manually after each MPC meeting. Note: `rbi_macro.py` not yet patched to read this file.
-
-**FII split (C5 partial fix — superseded by Apr 17 session):**
-`FII_Monthly_Net_Cr` = monthly total ÷ trading days in month. `FII_Daily_Net_Cr` = actual NSE API daily values (~30 days). `fii_dii_historical.py` and `fii_dii.py` updated to write to respective columns.
-
-**Known issue at end of session:** yfinance 1.2.1 installed — breaks `^INDIAVIX`, `INR=X`, `CL=F`. Fix: `pip install yfinance==0.2.48` then rerun `macro.py`. Must pin in `requirements.txt`.
-
-**Next session:** FII/DII overhaul + data_quality.py.
+- **C1:** All technical indicators use `Adj_Close`, not raw `Close`.
+- **C2:** Fundamental point-in-time enforcement — PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS set NULL for all historical rows except the most recent entry per ticker.
+- **C3:** `Adj_Close` computed from `Close` using backward-adjusted corporate action factors.
 
 ---
 
-### 17 Apr 2026 — FII/DII pipeline overhaul, StockEdge source adopted
+## 8. ML Training — Remote
 
-**Status:** FII/DII data fully replaced with clean StockEdge CM Provisional source. All 5 critical bugs now closed. Next step: `data_quality.py`.
+### XGBoost + LightGBM — Google Colab (T4 GPU)
 
-**Problem with old approach:**
+**Notebook:** `ML_scripts/xgboost.ipynb`
+**Run on:** Google Colab (free tier, T4 GPU)
 
-- `fii_dii_historical.py` (NSDL): monthly totals divided by trading days — approximation, still not true daily data.
-- `fii_dii.py` (NSE API): only last 30 days; DII column was NULL for all history.
-- Both scripts retired permanently.
+- Input: `exports/` Parquet files (sync to Google Drive before training)
+- Target: `Target_Return_21d` — 21-day forward return rank (cross-sectional percentile)
+- Models: XGBoost ranker + LightGBM ranker
+- Walk-forward expanding window CV with purge gap to prevent leakage
+- Outputs: `xgboost_v*.pkl`, `lightgbm_v*.pkl`, `rank_calibration.pkl`
 
-**New source — StockEdge CM Provisional API:**
+**Workflow:**
 
-- Endpoint: `https://api.stockedge.com/Api/FIIDashboardApi/GetFIIDIIProvisional`
-- No authentication. Public API discovered via DevTools.
-- `TimeSpan=M`: monthly FII+DII back to Jan 2008. `TimeSpan=D`: daily last ~50 trading days.
-- NSE CM Provisional data — same-day estimates used by the market. Correct for regime detection.
-- Verified: Mar 2020 FII = -65,816.70 Cr (COVID selloff), DII = +55,595.18 Cr (bought during crash). ✅
+```
+1. Run export_features.py locally → exports/features_*.parquet
+2. Upload to Google Drive
+3. Open xgboost.ipynb in Colab → mount Drive → run all cells
+4. Download output .pkl files → place in ML_models/
+```
 
-**New script: `data/fii_dii_stockedge.py`**
+### LSTM Dual-Head — Kaggle (GPU)
 
-- MODE 1 (monthly): fetches all months back to 2008, stamps monthly total on every trading day via `nifty500_ohlcv` join. Resume logic skips months already in DB.
-- MODE 2 (daily): fetches last ~50 days of actual daily values. Resume logic skips dates already in DB.
-- `FII_Source_Flag` = `'monthly'` or `'daily'` — tells `features.py` data resolution per row.
-- Run schedule: MODE 1 on 1st trading day of each month; MODE 2 daily after market close.
+**Notebook:** `ML_scripts/lstm.ipynb`
+**Run on:** Kaggle (P100/T4 GPU — more reliable than Colab for long training runs)
 
-**Schema changes to `macro_indicators`:**
+- Input: same Parquet exports
+- Architecture: Shared LSTM encoder → two heads
+  - Head 1: 10-day return rank (classification)
+  - Head 2: 5-day realized volatility (regression)
+- Sequence length: configurable (default 20 trading days lookback)
+- Outputs: `lstm_v*.keras`, `lstm_norm_v*.pkl`
 
-| Column             | Change                                                         |
-| ------------------ | -------------------------------------------------------------- |
-| FII_Monthly_Net_Cr | Monthly FII net flow (same value on all trading days in month) |
-| DII_Monthly_Net_Cr | Monthly DII net flow — NEW, was not available before           |
-| FII_Daily_Net_Cr   | Actual daily FII — last ~50 trading days                       |
-| DII_Daily_Net_Cr   | Actual daily DII — NEW                                         |
-| FII_Source_Flag    | `'monthly'` or `'daily'`                                       |
-| DII_Net_Buy_Cr     | DROPPED — old broken NSDL column                               |
+**Workflow:**
 
-**Staging and migration:**
+```
+1. Upload features Parquet to Kaggle dataset
+2. Open lstm.ipynb as Kaggle notebook → enable GPU accelerator → run all cells
+3. Download output files → place in ML_models/
+```
 
-- Data first written to `fii_dii_staging` table for verification against NSDL source.
-- Migration SQL run: `UPDATE macro_indicators JOIN fii_dii_staging ON Date`.
-- All values confirmed in `macro_indicators`. **⚠️ `fii_dii_staging` table can now be dropped:**
-  ```sql
-  DROP TABLE fii_dii_staging;
-  ```
+### HMM Regime Detection — Local
 
-**C5 FIXED.** All FII/DII audit issues closed.
+**Script:** `ML_scripts/hmm.py`
+**Run on:** Local machine (CPU, included in daily_refresh pipeline)
 
-**Next step:** Build `data/data_quality.py` — classifies all 500 tickers into Tier A/B/C/X based on `nifty500_ohlcv` coverage, gap%, ADV. Populates `stock_data_quality` table. Pending decision: F&O list source (CSV or fetch from NSE).
+- Features: Nifty daily return, India VIX, 20-day volatility, 5-day return, FII flow z-score
+- 4 hidden states mapped to regime labels: Bull / Bear / High-Vol / Recovery
+- 75 random restarts, selects best BIC
+- Outputs: `hmm_model_v*.pkl`, `hmm_scaler_v*.pkl`, `hmm_statemap_v*.pkl`
+- Writes daily regime labels to `market_regimes` table
 
-17 Apr 2026 — data_quality.py built and verified
-Status: stock_data_quality table fully populated. Tier classification operational. Next step: features.py.
-Completed this session:
+---
 
-Downloaded fo_mktlots.csv from NSE (Permitted lot size file) — saved as files/fo_list.csv. Added FO_LIST_CSV path to config.py.
-Built data/data_quality.py — classifies all 500 tickers into Tier A/B/C/X based on OHLCV coverage, gap%, 90-day ADV, and F&O eligibility. Populates stock_data_quality table. Safe to re-run (TRUNCATE + reinsert).
+## 9. Ensemble & Signals
 
-Verified results:
-TierCountCriteriaA292≥8 years, ≥93% coverage, ADV ≥5 CrB90≥4 years, ≥75% coverage, ADV ≥1 CrC85Below Tier B thresholdsX33<252 trading days (recent IPOs)
+**Script:** `ML_scripts/ensemble_final.py`
+**Run on:** Local (CPU only — GPU disabled deliberately)
 
-F&O listed: 213 / 500
-Avg coverage (Tier A): 14.6 years
-Spot checks confirmed: HDFCBANK/RELIANCE/ICICIBANK at correct ADV and Tier A; ETERNAL.NS and recent IPOs correctly Tier X.
+**Signal generation logic:**
 
-Key decisions:
+1. Load features from `features_master`
+2. Run XGBoost + LightGBM → 21-day return rank scores
+3. Run LSTM → 10-day return rank + volatility scores
+4. Load HMM regime from `market_regimes` → modulate position sizing
+5. Combine scores via calibrated rank weighting (`rank_calibration.pkl`)
+6. Apply cross-sectional normalization per date
+7. Classify each stock: BUY / SELL / HOLD with confidence score (0–1)
+8. Write signals to `exports/model_output/signals_YYYYMMDD.csv`
+9. Write NAV backtest series to `exports/model_output/nav_series_YYYYMMDD.csv`
 
-TIER_X_EXCLUDED hardcoded list in config.py is now superseded by the stock_data_quality table. All downstream scripts must query the DB for tier classification — do not use the hardcoded list.
-Tier A count (292) is higher than the 275 estimated in the Apr 10 session log — the earlier estimate was from a manual bhavcopy query without ADV filtering. The new count from combined coverage + ADV logic is the authoritative figure.
+**Horizon note:** XGBoost/LightGBM (21-day) and LSTM (10-day) targets are not averaged directly. The ensemble combiner documents and accounts for the horizon difference via rank calibration — raw scores are not mixed.
 
-7.  python data/sentiment.py --mode backfill ← DONE. 212,891 raw rows,
-    152,826 aggregated. 2022→2026.
-    python data/sentiment.py --mode daily ← Run daily after market close
-    python data/sentiment.py --mode aggregate ← Run after Colab FinBERT scoring
+---
 
-_End of session log. Add your next entry above this line._
+## 10. Portfolio & Risk
+
+### Optimizer (`portfolio/optimizer.py`)
+
+- Reads latest signal CSV
+- Applies sector cap: max 3 stocks per sector (prevents IT concentration)
+- ATR-normalized position sizing: `ATR_14 / Close` prevents low-priced stock over-allocation
+- Midcap vs. large-cap size differentiation
+- Writes final allocations to `portfolio_positions` table
+
+### Risk Manager (`risk/risk_manager.py`)
+
+Pre-trade checks enforced before any position is committed:
+
+- Max single core long position
+- Max single midcap long position
+- Max single short position
+- Cash reserve minimum
+- Minimum position size threshold
+- Financial sector concentration limits
+
+---
+
+## 11. Dashboard
+
+**Script:** `dashboard/app.py`
+**Run:** `streamlit run dashboard/app.py` from project root
+
+**Tabs:**
+
+- **Signals** — Current BUY/SELL/HOLD table with confidence scores, sector, stop-loss
+- **Portfolio** — Active positions, allocation %, NAV tracking
+- **Regime** — Current HMM market regime + historical regime chart
+- **Backtest** — NAV curve vs. Nifty 500 benchmark
+- **Pipeline Status** — Last run date per data source
+
+**Sidebar:**
+
+- Starting NAV input (₹) for position sizing simulation
+- Refresh Data button (triggers `daily_refresh.py`)
+
+All DB access is read-only. No writes from dashboard.
+
+---
+
+## 12. Configuration
+
+**`config.py` is the single file to modify for system-wide changes.**
+
+Key parameters:
+
+| Parameter          | Location    | Description                                       |
+| ------------------ | ----------- | ------------------------------------------------- |
+| `DATA_START`       | `config.py` | Historical data start date (currently 2010-01-01) |
+| `TICKERS`          | `config.py` | Loaded from `files/nifty500_tickers.csv`          |
+| `TIER_X_EXCLUDED`  | `config.py` | Recent IPO exclusion list                         |
+| `NSE_HOLIDAYS`     | `config.py` | Updated annually                                  |
+| `BANKING_TICKERS`  | `config.py` | Tickers using bank-specific P&L parsing           |
+| `TABLES`           | `config.py` | All MySQL table name mappings                     |
+| `MACRO_YFINANCE`   | `config.py` | yfinance macro symbol map                         |
+| `MACRO_FRED`       | `config.py` | FRED series IDs                                   |
+| `FEATURES`         | `config.py` | Feature engineering tunable params                |
+| `DATA_QUALITY`     | `config.py` | Tier A/B/C thresholds                             |
+| `RBI_REPO_HISTORY` | `config.py` | Full MPC rate history — append after each meeting |
+
+**When adding new tables or libraries:** update `config.py → TABLES`, `data/setup_db.py`, and `requirements.txt`.
+
+---
+
+## 13. Daily Operations
+
+**Scheduled via Windows Task Scheduler — run after market close (18:30 IST or later)**
+
+```bash
+python daily_refresh.py
+```
+
+Daily pipeline steps:
+
+1. `bhavcopy_ingestion.py` — fetch today's OHLCV
+2. `indicators.py` — compute today's indicators
+3. `macro.py` — update macro data
+4. `fii_dii_stockedge.py` — update FII/DII flows
+5. `hmm.py` — update market regime
+6. `features.py` — incremental feature computation
+7. `export_features.py` — export updated features
+8. `ensemble_final.py` — generate today's signals
+
+All scripts resume from their last ingested date automatically. No manual date flags needed.
+
+**Screener fundamentals** — not in daily pipeline. Run `screener_fundamentals.py` manually once per quarter after earnings season.
+
+**NSE ticker CSV** — re-download from NSE at each SEBI rebalance (March, June, September, December). Replace `files/nifty500_tickers.csv` and update `TIER_X_EXCLUDED` in `config.py` for any new IPOs.
+
+---
+
+_Last updated: May 2026_
