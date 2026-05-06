@@ -23,6 +23,8 @@ GitHub: https://github.com/loc778/hedge_fund_simulator_v2
   - select request API key
   - give a reason for api request example "need api for macro data "
   - submit and copy the api key and paste in .env file at fred_api_key
+- For Screener credentials, create an account at https://www.screener.in/,
+  then enter your username and password in the designated fields in the .env file.
 
 ## NOTE: Currently the repo contains all the necessary files and trained models upto May 2026. After setting up db and .env file just running the setup_pipeline and app.py would suffice to run the project.
 
@@ -34,6 +36,8 @@ DB_USER=your_mysql_user
 DB_PASSWORD=your_mysql_password
 DB_NAME=hedge_v2_db
 FRED_API_KEY=your_fred_api_key
+SCREENER_EMAIL=screener account mail
+SCREENER_PASSWORD=screener account password
 ```
 
 ### Installation/Setup
@@ -154,9 +158,12 @@ Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → P
 │           risk/risk_manager.py                                  │
 │           dashboard/app.py (Streamlit)                          │
 └─────────────────────────────────────────────────────────────────┘
+
 ```
 
----
+**Simplified pipeline overview:**
+
+## ![Pipeline Architecture](architecture_img/simle_prt_arch.png)
 
 ## 4. Folder Structure
 
@@ -305,9 +312,9 @@ Tier X list is also maintained in `config.py → TIER_X_EXCLUDED` for scripts th
 
 ### Lookahead leak prevention
 
-- **C1:** All technical indicators use `Adj_Close`, not raw `Close`.
-- **C2:** Fundamental point-in-time enforcement — PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS set NULL for all historical rows except the most recent entry per ticker.
-- **C3:** `Adj_Close` computed from `Close` using backward-adjusted corporate action factors.
+- All technical indicators use `Adj_Close`, not raw `Close`.
+- Fundamental point-in-time enforcement — PE_Ratio, ROE, ROCE, Dividend_Yield, Book_Value_PS set NULL for all historical rows except the most recent entry per ticker.
+- `Adj_Close` computed from `Close` using backward-adjusted corporate action factors.
 
 ---
 
