@@ -29,28 +29,25 @@ from risk.risk_manager import (
 
 # ── Optimizer constants ───────────────────────────────────────────────────────
 
-MAX_POSITIONS         = 45      # hard cap: longs + shorts combined (fewer, higher conviction)
+MAX_POSITIONS         = 45      # hard cap: longs + shorts combined
 MIN_POSITIONS         = 25      # floor (warning only, not enforced)
-LONG_RANK_THRESHOLD   = 0.82    # Final_Rank >= this → BUY candidate (slightly wider to fill slots)
-SHORT_RANK_THRESHOLD  = 0.08    # Final_Rank <= this → SELL candidate (tighter = fewer shorts)
+LONG_RANK_THRESHOLD   = 0.82    # Final_Rank >= this → BUY candidate
+SHORT_RANK_THRESHOLD  = 0.08    # Final_Rank <= this → SELL candidate
 
-# NEW
-LONG_TARGET_PCT       = 1.40    # target gross long as fraction of NAV
+LONG_TARGET_PCT       = 1.30    # target gross long as fraction of NAV
 SHORT_TARGET_PCT      = 0.10    # target gross short
-LONG_HARD_CAP_PCT     = 1.45    # hard cap gross long
-SHORT_HARD_CAP_PCT    = 0.15    # hard cap gross short   
+LONG_HARD_CAP_PCT     = 1.35    # hard cap gross long
+SHORT_HARD_CAP_PCT    = 0.15    # hard cap gross short
 
-# Regime-aware maximum deployable NAV fraction (cash floor is the complement)
-# Raised across the board — the old values left too much idle cash suppressing returns
-# NEW
+# Regime-aware maximum deployable NAV fraction
 REGIME_DEPLOY_CAP = {
-    0: 0.99,   # Bull       — fully deployed
-    1: 0.90,   # Bear       — cautious but active
-    2: 0.93,   # High Vol   — ATR sizing auto-reduces individual positions
-    3: 0.97,   # Sideways   — near full deployment
+    0: 0.97,   # Bull       — nearly fully deployed
+    1: 0.88,   # Bear       — cautious but active
+    2: 0.90,   # High Vol   — ATR sizing auto-reduces individual positions
+    3: 0.94,   # Sideways   — near full deployment
 }
 
-# Tier → is_midcap mapping (Tier 2 = mid-cap proxy)
+# Tier → is_midcap mapping
 TIER_IS_MIDCAP = {1: False, 2: True, 3: True}
 
 # ATR fallback when indicator data is missing
@@ -70,7 +67,7 @@ class PortfolioStats:
     nav                : float
     regime             : int
     regime_label       : str
-    deploy_cap         : float          # regime-aware max deployable
+    deploy_cap         : float
     gross_long_pct     : float
     gross_short_pct    : float
     net_exposure_pct   : float
@@ -80,8 +77,8 @@ class PortfolioStats:
     n_shorts           : int
     n_total            : int
     n_rejected         : int
-    long_sectors       : int            # distinct sectors in long book
-    below_min_warning  : bool           # True if n_total < MIN_POSITIONS
+    long_sectors       : int
+    below_min_warning  : bool
 
 
 @dataclass
@@ -93,7 +90,6 @@ class OptimizedPortfolio:
     rejected        : candidates that did not pass risk checks
     stats           : book-level metrics
     portfolio_state : PortfolioState snapshot after all positions added
-                      (pass this to risk_manager for subsequent checks)
     """
     positions       : pd.DataFrame
     rejected        : pd.DataFrame
@@ -115,13 +111,11 @@ def _load_atr(tickers: list[str], engine) -> pd.DataFrame:
     except ImportError:
         table = "nifty500_indicators"
 
-    # Build both .NS and bare variants — indicators table may use either format
+    # Build both .NS and bare variants
     tickers_bare = [t.replace(".NS", "") for t in tickers]
     tickers_all  = list(set(tickers) | set(tickers_bare))
     ticker_list  = ", ".join(f"'{t}'" for t in tickers_all)
 
-    # nifty500_indicators has ATR_14 but NOT Adj_Close
-    # nifty500_ohlcv has Adj_Close — join the two tables
     try:
         import config as cfg_inner
         ohlcv_table = cfg_inner.TABLES.get("ohlcv", "nifty500_ohlcv")
@@ -154,20 +148,20 @@ def _load_atr(tickers: list[str], engine) -> pd.DataFrame:
     if df.empty:
         warnings.warn("[optimizer] ATR query returned no rows — check ticker format in DB. Using fallback.")
         df = pd.DataFrame({"Ticker": tickers})
-        df["ATR_14"]   = float("nan")
-        df["Adj_Close"]= float("nan")
+        df["ATR_14"]    = float("nan")
+        df["Adj_Close"] = float("nan")
 
     df["ATR_14"]    = pd.to_numeric(df["ATR_14"],    errors="coerce")
     df["Adj_Close"] = pd.to_numeric(df["Adj_Close"], errors="coerce")
 
-    # Normalise Ticker to .NS format so merge with signals (which use .NS) succeeds
+    # Normalise Ticker to .NS format
     df["Ticker"] = df["Ticker"].apply(
         lambda x: x if str(x).endswith(".NS") else str(x) + ".NS"
     )
     # Drop duplicates after normalisation (keep highest ATR_14 row per ticker)
     df = df.sort_values("ATR_14", ascending=False).drop_duplicates("Ticker")
 
-    # ATR_pct = ATR_14 / Adj_Close, fallback if either is missing/zero
+    # ATR_pct = ATR_14 / Adj_Close
     df["ATR_pct"] = df["ATR_14"] / df["Adj_Close"].replace(0, float("nan"))
     df["ATR_pct"] = df["ATR_pct"].fillna(ATR_PCT_FALLBACK).clip(lower=0.005)
 
@@ -188,24 +182,19 @@ def _compute_sizes(
     if candidates.empty:
         return pd.Series(dtype=float)
 
-    # Rank-conviction-weighted inverse-vol sizing:
-    # Combine inverse ATR (risk parity) with Final_Rank signal strength.
-    # This ensures rank-0.99 names are sized up vs rank-0.85 names.
+    # Rank-conviction-weighted inverse-vol sizing
     inv_vol = 1.0 / candidates["ATR_pct"].clip(lower=0.005)
 
     if "Final_Rank" in candidates.columns:
         if direction == "long":
-            # For longs: rank above threshold carries conviction weight
             conviction = candidates["Final_Rank"].clip(lower=0.0, upper=1.0)
         else:
-            # For shorts: inverted rank (lower rank = more conviction short)
             conviction = (1.0 - candidates["Final_Rank"]).clip(lower=0.0, upper=1.0)
-        # Blend: 60% risk-parity, 40% conviction — prevents pure vol dominance
         combined_w = 0.60 * inv_vol + 0.40 * (conviction / conviction.sum() * len(conviction))
     else:
         combined_w = inv_vol
 
-    raw_w   = combined_w / combined_w.sum()
+    raw_w = combined_w / combined_w.sum()
 
     # Per-position cap depends on direction and tier
     if direction == "long":
@@ -223,7 +212,6 @@ def _compute_sizes(
     clipped = raw_sizes.clip(upper=caps.values)
 
     # Re-normalise so total = effective_target after clipping
-    # (iterative: clipping changes total, so renormalise once)
     total_after_clip = clipped.sum()
     if total_after_clip > 0:
         scale   = min(effective_target / total_after_clip, 1.0)
@@ -258,7 +246,6 @@ def optimize_portfolio(
     # ── 1. Candidate selection ─────────────────────────────────────────────
 
     df = signals_df.copy()
-    # Always use sector_map_df as ground truth — signals CSV sector may be "Unknown"
     df = df.drop(columns=["Sector"], errors="ignore")
     df = df.merge(sector_map_df[["Ticker","Sector"]], on="Ticker", how="left")
     df["Sector"] = df["Sector"].fillna("Unknown")
@@ -269,7 +256,7 @@ def optimize_portfolio(
     ).reset_index(drop=True)
 
     short_cands = df[df["Final_Rank"] <= SHORT_RANK_THRESHOLD].sort_values(
-        "Final_Rank", ascending=True   # worst rank first (most conviction shorts)
+        "Final_Rank", ascending=True
     ).reset_index(drop=True)
 
     all_cands = pd.concat([long_cands, short_cands], ignore_index=True)
@@ -303,7 +290,6 @@ def optimize_portfolio(
 
     # ── 3. Compute proposed sizes ──────────────────────────────────────────
 
-    # Allocate MAX_POSITIONS slots proportionally to candidate counts
     n_long_cands  = len(long_cands)
     n_short_cands = len(short_cands)
     total_cands   = n_long_cands + n_short_cands
@@ -312,46 +298,29 @@ def optimize_portfolio(
         long_slots  = MAX_POSITIONS
         short_slots = 0
     else:
-        # Bias heavily toward longs: shorts capped at 20% of MAX_POSITIONS slots
-        # This prevents a balanced signal count from wasting slots on shorts
-        max_short_slots = max(3, round(MAX_POSITIONS * 0.20))  # ≤ 20% slots to shorts
+        max_short_slots = max(3, round(MAX_POSITIONS * 0.20))
         short_slots = min(max_short_slots, n_short_cands)
         long_slots  = min(MAX_POSITIONS - short_slots, n_long_cands)
-        long_slots  = max(long_slots, min(5, n_long_cands))  # at least 5 longs
+        long_slots  = max(long_slots, min(5, n_long_cands))
 
-    # Take top candidates by rank within each slot budget
     long_pool  = long_cands.head(long_slots).reset_index(drop=True)
     short_pool = short_cands.head(short_slots).reset_index(drop=True)
 
     long_sizes  = _compute_sizes(long_pool,  "long",  nav, LONG_TARGET_PCT,  deploy_cap)
     short_sizes = _compute_sizes(short_pool, "short", nav, SHORT_TARGET_PCT, deploy_cap)
-    
+
     # ── 4. Risk-check loop ────────────────────────────────────────────────
-    # Process longs first (higher conviction, larger book), then shorts.
-    # Each iteration updates the running portfolio state.
+    # Incumbents are excluded from cash accounting — they represent the prior
+    # run's book and are being superseded. Including them double-counts cash
+    # against positions that are about to be replaced, starving the short book.
+    # Sector/exposure limits apply correctly via approved_positions accumulation.
 
     approved_positions: dict[str, dict] = {}
     rejected_records:   list[dict]      = []
 
-    # Load incumbent open positions from DB once before the risk-check loop.
-    # This ensures risk limits (sector caps, gross exposure) account for
-    # positions already on the book from prior signal runs.
-    
-    _incumbent_positions: dict = {}
-    try:
-        _incumbent_ps = PortfolioState.from_db(
-            engine=engine, nav=nav, peak_nav=nav, cash=nav,
-            fii_net_today_cr=None, fii_consecutive_neg=0,
-            nav_return_21d=None, is_budget_period=False,
-            is_fo_expiry_week=False, regime=regime_int, as_of_date=as_of,
-        )
-        _incumbent_positions = dict(_incumbent_ps.positions)
-    except Exception:
-        _incumbent_positions = {}
-
     def _current_ps() -> PortfolioState:
-        """Build PortfolioState from incumbent DB positions + newly approved positions."""
-        pos_map = dict(_incumbent_positions)  # start from open book
+        """Build PortfolioState from newly approved positions only."""
+        pos_map = {}
         for t, d in approved_positions.items():
             pos_map[t] = OpenPosition(
                 ticker        = t,
@@ -379,10 +348,6 @@ def optimize_portfolio(
         )
 
     def _try_add(row: pd.Series, direction: str, proposed_size: float) -> bool:
-        """
-        Run risk check, add to approved if passes.
-        Returns True if added (APPROVED or REDUCED).
-        """
         if len(approved_positions) >= MAX_POSITIONS:
             rejected_records.append(_rej_row(row, direction, proposed_size,
                                              "REJECTED", "CAP", "MAX_POSITIONS reached"))
@@ -410,34 +375,32 @@ def optimize_portfolio(
             ))
             return False
 
-        # APPROVED or REDUCED
         approved_positions[ticker] = {
-            "direction":   direction,
+            "direction":    direction,
             "size_nav_pct": decision.approved_size,
-            "sector":      sector,
-            "is_midcap":   is_midcap,
+            "sector":       sector,
+            "is_midcap":    is_midcap,
         }
         return True
 
     def _rej_row(row, direction, size, status, limit, reason) -> dict:
         return {
-            "Ticker":    row["Ticker"],
-            "Direction": "LONG" if direction == "long" else "SHORT",
-            "Sector":    row.get("Sector", "Unknown"),
-            "Final_Rank":round(float(row["Final_Rank"]), 3),
+            "Ticker":             row["Ticker"],
+            "Direction":          "LONG" if direction == "long" else "SHORT",
+            "Sector":             row.get("Sector", "Unknown"),
+            "Final_Rank":         round(float(row["Final_Rank"]), 3),
             "Proposed_Size_%NAV": round(size * 100, 2),
-            "Risk_Status": status,
-            "Risk_Limit":  limit,
-            "Reason":      reason[:120],
+            "Risk_Status":        status,
+            "Risk_Limit":         limit,
+            "Reason":             reason[:120],
         }
 
-    # Process longs
+    # Process longs first, then shorts
     for _, row in long_pool.iterrows():
         ticker = row["Ticker"]
         size   = float(long_sizes.get(ticker, MIN_POSITION_SIZE_PCT))
         _try_add(row, "long", size)
 
-    # Process shorts
     for _, row in short_pool.iterrows():
         ticker = row["Ticker"]
         size   = float(short_sizes.get(ticker, MIN_POSITION_SIZE_PCT))
@@ -449,12 +412,11 @@ def optimize_portfolio(
         position_rows = []
     else:
         position_rows = []
-        # Merge back signal metadata
         all_sig = pd.concat([long_pool, short_pool], ignore_index=True)
-        sig_idx  = all_sig.set_index("Ticker")
+        sig_idx = all_sig.set_index("Ticker")
 
         for ticker, pos in approved_positions.items():
-            sig_row = sig_idx.loc[ticker] if ticker in sig_idx.index else pd.Series()
+            sig_row   = sig_idx.loc[ticker] if ticker in sig_idx.index else pd.Series()
             adj_close = float(sig_row.get("Adj_Close", float("nan")))
             atr_pct   = float(sig_row.get("ATR_pct",   ATR_PCT_FALLBACK))
             rank      = float(sig_row.get("Final_Rank", 0.5))
@@ -462,16 +424,16 @@ def optimize_portfolio(
             tier      = int(sig_row.get("Data_Tier", 1)) if "Data_Tier" in sig_row.index else 1
 
             position_rows.append({
-                "Ticker":       ticker,
-                "Direction":    "LONG" if pos["direction"] == "long" else "SHORT",
-                "Sector":       pos["sector"],
-                "Tier":         {1:"A", 2:"B", 3:"C"}.get(tier, "?"),
-                "Final_Rank":   round(rank, 3),
-                "ATR_pct":      round(atr_pct, 4),
-                "LSTM_Vol":     round(lstm_vol, 3) if not pd.isna(lstm_vol) else None,
-                "Last_Price":   round(adj_close, 2) if not pd.isna(adj_close) else None,
-                "Size_%NAV":    round(pos["size_nav_pct"] * 100, 2),
-                "Alloc_Rs":     round(pos["size_nav_pct"] * nav),
+                "Ticker":     ticker,
+                "Direction":  "LONG" if pos["direction"] == "long" else "SHORT",
+                "Sector":     pos["sector"],
+                "Tier":       {1:"A", 2:"B", 3:"C"}.get(tier, "?"),
+                "Final_Rank": round(rank, 3),
+                "ATR_pct":    round(atr_pct, 4),
+                "LSTM_Vol":   round(lstm_vol, 3) if not pd.isna(lstm_vol) else None,
+                "Last_Price": round(adj_close, 2) if not pd.isna(adj_close) else None,
+                "Size_%NAV":  round(pos["size_nav_pct"] * 100, 2),
+                "Alloc_Rs":   round(pos["size_nav_pct"] * nav),
             })
 
     positions_df = pd.DataFrame(position_rows)
@@ -496,7 +458,7 @@ def optimize_portfolio(
 
     net  = gl - gs
     grs  = gl + gs
-    csh  = 1 - gl - gs
+    csh  = 1.0 - gl - gs
     n_tot = n_longs + n_shorts
 
     stats = PortfolioStats(

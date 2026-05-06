@@ -53,6 +53,7 @@ _PROJECT_ROOT = os.path.dirname(_DASH_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
 # ── Config import ─────────────────────────────────────────────────────────────
+_CONFIG_ERROR = None
 try:
     from urllib.parse import quote_plus
     import config as cfg
@@ -62,10 +63,22 @@ try:
     SIGNALS_DIR  = os.path.join(_PROJECT_ROOT, "exports", "model_output")
     SCRIPTS_DIR  = os.path.join(_PROJECT_ROOT, "data")
 except Exception as e:
-    st.error(f"Config import failed: {e}")
-    st.stop()
+    _CONFIG_ERROR = str(e)
+    TABLES = {}
+    SECTORS_CSV = ""
+    SIGNALS_DIR = ""
+    SCRIPTS_DIR = ""
+
+# ── Page config — must be first Streamlit call ───────────────────────────────
+st.set_page_config(
+    page_title="AlphaEngine",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ── Risk manager import ───────────────────────────────────────────────────────
+_RISK_IMPORT_ERROR = None
 try:
     from risk.risk_manager import (
         PortfolioState, OpenPosition, check_position, screen_signals,
@@ -80,15 +93,7 @@ try:
     RISK_AVAILABLE = True
 except Exception as e:
     RISK_AVAILABLE = False
-    st.warning(f"Risk manager / optimizer not available: {e}")
-
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="AlphaEngine",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+    _RISK_IMPORT_ERROR = str(e)
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -498,8 +503,12 @@ def get_deployed_cash(engine) -> float:
 
 
 def get_available_cash(engine) -> float:
-    """Available cash = total balance - deployed capital."""
-    return max(get_cash_balance(engine) - get_deployed_cash(engine), 0.0)
+    """
+    Available cash = total fund capital (cash ledger balance).
+    Optimizer uses full balance as NAV; position sizing % handles deployment limits.
+    Deployed capital is tracked via portfolio_cash pnl_credit entries on close.
+    """
+    return get_cash_balance(engine)
 
 
 def add_cash_transaction(engine, tx_type: str, amount: float,
@@ -1085,6 +1094,13 @@ macro_row = load_macro_latest(as_of_date=pd.Timestamp(signal_date).strftime("%Y-
 # ─────────────────────────────────────────────────────────────────────────────
 # RUN OPTIMIZER (must run before KPIs so opt_stats is available)
 # ─────────────────────────────────────────────────────────────────────────────
+
+if _CONFIG_ERROR:
+    st.error(f"Config import failed: {_CONFIG_ERROR}")
+    st.stop()
+
+if not RISK_AVAILABLE and _RISK_IMPORT_ERROR:
+    st.error(f"Risk manager / optimizer not available: {_RISK_IMPORT_ERROR}")
 
 opt_result = run_optimization(signals_today, sector_map, nav_input, regime_int)
 
