@@ -163,7 +163,7 @@ Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → P
 
 **Simplified pipeline overview:**
 
-![Pipeline Architecture](architecture_img/simle_prt_arch.png)
+![Pipeline Architecture](architecture_img/simle_prt_arch.png?raw=true)
 
 ## 4. Folder Structure
 
