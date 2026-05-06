@@ -1,3 +1,8 @@
+# =============================================================================
+# AI Hedge Fund Simulator — Ensemble v3 (LSTM Head 1 integrated)
+# Local PC version — no Google Drive / Colab dependencies
+# =============================================================================
+
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 print("GPU disabled — CPU only")
@@ -6,6 +11,7 @@ import gc
 import glob
 import itertools
 import pickle
+import sys
 import warnings
 from datetime import datetime
 
@@ -20,6 +26,10 @@ from scipy.stats import spearmanr
 warnings.filterwarnings('ignore')
 print(f"TF: {tf.__version__}  |  NumPy: {np.__version__}  |  Pandas: {pd.__version__}")
 
+
+# =============================================================================
+# BLOCK A — CrossSectionalNormalizer
+# =============================================================================
 
 class CrossSectionalNormalizer(BaseEstimator, TransformerMixin):
     def __init__(self):
@@ -63,23 +73,32 @@ class CrossSectionalNormalizer(BaseEstimator, TransformerMixin):
 
 print("CrossSectionalNormalizer defined.")
 
+
+# =============================================================================
+# BLOCK B — PATHS
+# =============================================================================
+
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR   = os.path.join(BASE_DIR, 'ML_models')
 RESULTS_DIR  = os.path.join(BASE_DIR, 'exports', 'model_output')
 PARQUET_PATH = os.path.join(BASE_DIR, 'exports', 'features_master_latest.parquet')
 
-import sys
+PRICES_CSV         = os.path.join(BASE_DIR, 'exports', 'backtest_prices.csv')
+MARKET_REGIMES_CSV = os.path.join(BASE_DIR, 'exports', 'market_regimes.csv')
+FO_LIST_CSV        = os.path.join(BASE_DIR, 'files', 'fo_list.csv')
+
 sys.path.insert(0, os.path.join(BASE_DIR, 'data'))
-from db import get_engine
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 DATE_STAMP = datetime.today().strftime('%Y%m%d')
 print(f"Date stamp     : {DATE_STAMP}")
 print(f"Parquet exists : {os.path.exists(PARQUET_PATH)}")
+print(f"Prices exists  : {os.path.exists(PRICES_CSV)}")
+print(f"Regimes exists : {os.path.exists(MARKET_REGIMES_CSV)}")
 
 
 # =============================================================================
-# BLOCK B — CONFIGURATION
+# BLOCK C — CONFIGURATION
 # =============================================================================
 
 HOLDOUT_START = '2024-01-01'
@@ -94,12 +113,23 @@ HMM_MODEL_PATTERN    = 'hmm_model_v*.pkl'
 HMM_SCALER_PATTERN   = 'hmm_scaler_v*.pkl'
 HMM_STATEMAP_PATTERN = 'hmm_statemap_v*.pkl'
 
+# ── Regime-adaptive ensemble weights ─────────────────────────────────────────
+# Original XGB/LGB ratios preserved; LSTM added and remainder rescaled.
+#   Regime 0 (Bull)    : xgb=0.571 lgb=0.429 -> lstm=0.20, xgb/lgb scaled by 0.80
+#   Regimes 1-3        : xgb=0.500 lgb=0.500 -> lstm varies, xgb/lgb scaled accordingly
 REGIME_WEIGHTS = {
-    0: {'xgb': 0.571, 'lgb': 0.429},
-    1: {'xgb': 0.500, 'lgb': 0.500},
-    2: {'xgb': 0.500, 'lgb': 0.500},
-    3: {'xgb': 0.500, 'lgb': 0.500},
+    0: {'xgb': round(0.571 * 0.80, 4), 'lgb': round(0.429 * 0.80, 4), 'lstm': 0.20},
+    1: {'xgb': round(0.500 * 0.85, 4), 'lgb': round(0.500 * 0.85, 4), 'lstm': 0.15},
+    2: {'xgb': round(0.500 * 0.90, 4), 'lgb': round(0.500 * 0.90, 4), 'lstm': 0.10},
+    3: {'xgb': round(0.500 * 0.85, 4), 'lgb': round(0.500 * 0.85, 4), 'lstm': 0.15},
 }
+
+for _r, _w in REGIME_WEIGHTS.items():
+    _total = round(_w['xgb'] + _w['lgb'] + _w['lstm'], 6)
+    assert abs(_total - 1.0) < 1e-4, f"Regime {_r} weights sum to {_total}"
+print("REGIME_WEIGHTS sanity check passed — all regimes sum to 1.0")
+for _r, _w in REGIME_WEIGHTS.items():
+    print(f"  Regime {_r}: xgb={_w['xgb']:.4f}  lgb={_w['lgb']:.4f}  lstm={_w['lstm']:.2f}")
 
 TIER_MULT = {1: 1.00, 2: 1.00, 3: 1.00}
 
@@ -115,9 +145,9 @@ SEQ_LEN = 60
 
 STARTING_NAV = 10_000_000
 
-LONG_TOP_K          = 20
+LONG_TOP_K          = 35
 SHORT_TOP_K_ENH     = 6
-MAX_POSITIONS_ENH   = 36
+MAX_POSITIONS_ENH   = 40
 BUY_THRESHOLD_ENH   = 0.85
 SELL_THRESHOLD_ENH  = 0.05
 POS_CAP_LARGE       = 0.10
@@ -154,7 +184,7 @@ print(f"  Bull deploy     : {REGIME_DEPLOY_ENH[0]*100:.0f}%")
 
 
 # =============================================================================
-# BLOCK C — MODELS & DATA
+# BLOCK D — MODELS
 # =============================================================================
 
 def load_latest(pattern, base=MODELS_DIR):
@@ -216,6 +246,18 @@ REGIME_LABEL_MAP = hmm_statemap.get('label_map', {0:'Bull',1:'Bear',2:'HighVol',
 print(f"    HMM features  : {HMM_FEATURES}")
 print("\nAll models loaded successfully.")
 
+_dummy = np.zeros((2, SEQ_LEN, len(LSTM_FEATURES)), dtype=np.float32)
+_out   = lstm_model.predict(_dummy, verbose=0)
+assert isinstance(_out, (list, tuple)) and len(_out) == 2, \
+    "LSTM model must have 2 output heads. Got: " + str(type(_out))
+print(f"LSTM dual-head confirmed: Head1={_out[0].shape}  Head2={_out[1].shape}")
+del _dummy, _out
+
+
+# =============================================================================
+# BLOCK E — DATA
+# =============================================================================
+
 print(f"\nLoading parquet: {PARQUET_PATH}")
 df_raw = pd.read_parquet(PARQUET_PATH)
 df_raw[DATE_COL] = pd.to_datetime(df_raw[DATE_COL])
@@ -251,12 +293,8 @@ print(f"Holdout rows : {len(df_full[df_full[DATE_COL] >= holdout_start_dt]):,}")
 print(f"Tickers      : {df_full[TICKER_COL].nunique()}")
 print(f"Date range   : {df_full[DATE_COL].min().date()} -> {df_full[DATE_COL].max().date()}")
 
-print("\nLoading pre-computed HMM regimes from DB ...")
-engine = get_engine()
-regimes_all = pd.read_sql(
-    "SELECT Date, Regime_Label FROM market_regimes ORDER BY Date",
-    engine
-)
+print("\nLoading market regimes from CSV ...")
+regimes_all = pd.read_csv(MARKET_REGIMES_CSV)
 regimes_all['Date'] = pd.to_datetime(regimes_all['Date'])
 regimes_df  = regimes_all[regimes_all['Date'] >= holdout_start_dt].copy()
 regimes_df  = regimes_df.sort_values('Date').reset_index(drop=True)
@@ -271,6 +309,11 @@ for label, cnt in regimes_df['Regime_Label'].value_counts().items():
     ri = LABEL_TO_INT.get(label, '?')
     print(f"  {label:<12}: {cnt:4d} days ({cnt/len(regimes_df)*100:.1f}%)  [int={ri}]")
 
+
+# =============================================================================
+# BLOCK F — INFERENCE
+# =============================================================================
+
 df_bt = df_full[
     (df_full[DATE_COL] >= holdout_start_dt) &
     (df_full[TIER_COL].isin([1, 2, 3]))
@@ -283,17 +326,18 @@ for _col in _SENTINEL_COLS:
         df_bt[_col] = 0.0
 
 _xgb_input = df_bt[XGB_FEATURES].copy()
-_xgb_input = _xgb_input[XGB_FEATURES]
 df_bt['XGB_Score'] = xgb_model.predict(_xgb_input)
 
 _lgb_input = df_bt[LGB_FEATURES].copy()
-_lgb_input = _lgb_input[LGB_FEATURES]
 df_bt['LGB_Score'] = lgb_model.predict(_lgb_input)
 df_bt['XGB_Rank']  = df_bt.groupby(DATE_COL)['XGB_Score'].rank(pct=True)
 df_bt['LGB_Rank']  = df_bt.groupby(DATE_COL)['LGB_Score'].rank(pct=True)
 print("XGB + LGB predictions + cross-sectional ranking done.")
 
-print("\nGenerating LSTM vol predictions (Head 2) ...")
+# ── LSTM dual-head inference ──────────────────────────────────────────────────
+# preds[0] -> Head 1 (rank_output, tanh, -1 to 1)  -> LSTM_Rank_Raw
+# preds[1] -> Head 2 (vol_output,  softplus, >0)   -> LSTM_Vol
+print("\nGenerating LSTM predictions (Head 1 = rank, Head 2 = vol) ...")
 lstm_records = []
 tickers_all  = df_bt[TICKER_COL].unique()
 n_ok = n_skip = 0
@@ -302,9 +346,9 @@ for i, ticker in enumerate(tickers_all):
     t_hist = df_full[df_full[TICKER_COL] == ticker].sort_values(DATE_COL).reset_index(drop=True)
     if len(t_hist) < SEQ_LEN + 1: n_skip += 1; continue
     missing = [f for f in LSTM_FEATURES if f not in t_hist.columns]
-    if missing:                    n_skip += 1; continue
+    if missing: n_skip += 1; continue
 
-    feat_df  = t_hist[LSTM_FEATURES].ffill().bfill().fillna(0.0)
+    feat_df = t_hist[LSTM_FEATURES].ffill().bfill().fillna(0.0)
     try:
         feat_arr  = feat_df.values.astype(np.float32)
         feat_vals = lstm_normalizer.transform(feat_arr, dates=t_hist[DATE_COL].values)
@@ -321,33 +365,61 @@ for i, ticker in enumerate(tickers_all):
 
     try:
         preds = lstm_model.predict(np.array(seqs, dtype=np.float32), verbose=0, batch_size=256)
-        vol_preds = preds[1].flatten() if isinstance(preds, (list,tuple)) and len(preds)==2 else preds.flatten()
+        if isinstance(preds, (list, tuple)) and len(preds) == 2:
+            rank_preds = preds[0].flatten()
+            vol_preds  = preds[1].flatten()
+        else:
+            rank_preds = np.full(len(preds.flatten()), np.nan)
+            vol_preds  = preds.flatten()
     except Exception: n_skip += 1; continue
 
-    for d, v in zip(dates, vol_preds):
-        lstm_records.append({TICKER_COL: ticker, DATE_COL: d, 'LSTM_Vol': float(v)})
+    for d, rk, v in zip(dates, rank_preds, vol_preds):
+        lstm_records.append({
+            TICKER_COL:      ticker,
+            DATE_COL:        d,
+            'LSTM_Rank_Raw': float(rk),
+            'LSTM_Vol':      float(v),
+        })
     n_ok += 1
     if (i + 1) % 100 == 0:
         print(f"  {i+1}/{len(tickers_all)}  ok={n_ok}  skip={n_skip}")
 
-lstm_vol_df = (pd.DataFrame(lstm_records) if lstm_records
-               else pd.DataFrame(columns=[TICKER_COL, DATE_COL, 'LSTM_Vol']))
-print(f"LSTM vol done : {len(lstm_vol_df):,} rows  ok={n_ok}  skip={n_skip}")
+lstm_df = (pd.DataFrame(lstm_records) if lstm_records
+           else pd.DataFrame(columns=[TICKER_COL, DATE_COL, 'LSTM_Rank_Raw', 'LSTM_Vol']))
+print(f"LSTM inference done : {len(lstm_df):,} rows  ok={n_ok}  skip={n_skip}")
 del lstm_records; gc.collect()
 
-df_signals = df_bt.merge(lstm_vol_df[[TICKER_COL, DATE_COL, 'LSTM_Vol']],
-                         on=[TICKER_COL, DATE_COL], how='left')
+# Cross-sectional percentile rank — aligns Head 1 to 0-1 scale of XGB/LGB ranks
+lstm_df['LSTM_Rank'] = lstm_df.groupby(DATE_COL)['LSTM_Rank_Raw'].rank(pct=True)
+pct_valid = lstm_df['LSTM_Rank'].notna().mean() * 100
+print(f"LSTM_Rank non-null : {pct_valid:.1f}%")
+
+
+# =============================================================================
+# BLOCK G — ENSEMBLE SIGNALS
+# =============================================================================
+
+df_signals = df_bt.merge(
+    lstm_df[[TICKER_COL, DATE_COL, 'LSTM_Rank_Raw', 'LSTM_Rank', 'LSTM_Vol']],
+    on=[TICKER_COL, DATE_COL], how='left'
+)
 
 reg_merge = regimes_df.drop_duplicates(subset=[DATE_COL]).copy()
 for c in ['Regime_Int', 'Regime_Label']:
     if c in df_signals.columns: df_signals = df_signals.drop(columns=c)
-df_signals = df_signals.merge(reg_merge[[DATE_COL,'Regime_Int','Regime_Label']],
+df_signals = df_signals.merge(reg_merge[[DATE_COL, 'Regime_Int', 'Regime_Label']],
                                on=DATE_COL, how='left')
 df_signals['Regime_Int'] = df_signals['Regime_Int'].fillna(3).astype(int)
 
+# NaN fill: 0.5 is neutral — no directional effect when LSTM Head 1 unavailable
+df_signals['LSTM_Rank'] = df_signals['LSTM_Rank'].fillna(0.5)
+
 def compute_ensemble_score(row):
-    w = REGIME_WEIGHTS.get(row['Regime_Int'], REGIME_WEIGHTS[3])
-    return w['xgb'] * row['XGB_Rank'] + w['lgb'] * row['LGB_Rank']
+    """Three-model weighted ensemble with regime-adaptive LSTM weight (0.10-0.20)."""
+    w = REGIME_WEIGHTS.get(int(row['Regime_Int']), REGIME_WEIGHTS[3])
+    return (w['xgb']  * row['XGB_Rank'] +
+            w['lgb']  * row['LGB_Rank'] +
+            w['lstm'] * row['LSTM_Rank'])
 
 df_signals['Raw_Score']      = df_signals.apply(compute_ensemble_score, axis=1)
 df_signals['Tier_Mult']      = df_signals[TIER_COL].map(TIER_MULT).fillna(0.50)
@@ -357,12 +429,12 @@ df_signals = df_signals.merge(sector_map, on=TICKER_COL, how='left')
 df_signals['Sector'] = df_signals['Sector'].fillna('Unknown')
 
 tier_a_mean = (df_signals[df_signals[TIER_COL]==1]
-               .groupby([DATE_COL,'Sector'])['Raw_Score'].mean().reset_index()
-               .rename(columns={'Raw_Score':'Sector_Score'}))
-df_signals   = df_signals.merge(tier_a_mean, on=[DATE_COL,'Sector'], how='left')
+               .groupby([DATE_COL, 'Sector'])['Raw_Score'].mean().reset_index()
+               .rename(columns={'Raw_Score': 'Sector_Score'}))
+df_signals   = df_signals.merge(tier_a_mean, on=[DATE_COL, 'Sector'], how='left')
 tier_c       = df_signals[TIER_COL] == 3
 df_signals.loc[tier_c, 'Ensemble_Score'] = (
-    0.5 + (df_signals.loc[tier_c,'Sector_Score'].fillna(0.5) - 0.5) * TIER_MULT[3])
+    0.5 + (df_signals.loc[tier_c, 'Sector_Score'].fillna(0.5) - 0.5) * TIER_MULT[3])
 
 df_signals['Final_Rank'] = df_signals.groupby(DATE_COL)['Ensemble_Score'].rank(pct=True)
 
@@ -371,12 +443,21 @@ df_signals.loc[df_signals['Final_Rank'] >= BUY_THRESHOLD,  'Signal'] =  1
 df_signals.loc[df_signals['Final_Rank'] <= SELL_THRESHOLD, 'Signal'] = -1
 df_signals.loc[(df_signals[TIER_COL]==3) & (df_signals['Signal']==-1), 'Signal'] = 0
 
-df_signals['LSTM_Vol'] = df_signals['LSTM_Vol'].replace([np.inf,-np.inf], np.nan)
+df_signals['LSTM_Vol'] = df_signals['LSTM_Vol'].replace([np.inf, -np.inf], np.nan)
 df_signals['LSTM_Vol'] = df_signals['LSTM_Vol'].fillna(df_signals['LSTM_Vol'].median())
+
+print(f"\nEnsemble signals : {len(df_signals):,} rows")
+print(f"Date range       : {df_signals[DATE_COL].min().date()} -> {df_signals[DATE_COL].max().date()}")
+
+print("\nActive regime weight breakdown:")
+for ri, cnt in df_signals['Regime_Int'].value_counts().sort_index().items():
+    w   = REGIME_WEIGHTS.get(int(ri), REGIME_WEIGHTS[3])
+    lbl = REGIME_LABEL_MAP.get(int(ri), str(ri))
+    print(f"  Regime {ri} ({lbl:<9}): {cnt:5d} rows  xgb={w['xgb']:.4f}  lgb={w['lgb']:.4f}  lstm={w['lstm']:.2f}")
 
 try:
     calib_path = os.path.join(MODELS_DIR, 'rank_calibration.pkl')
-    with open(calib_path,'rb') as f: calib_payload = pickle.load(f)
+    with open(calib_path, 'rb') as f: calib_payload = pickle.load(f)
     calib_df  = calib_payload['calibration_df'].sort_values('rank_lo').reset_index(drop=True)
     bin_lows  = calib_df['rank_lo'].values
     bin_highs = calib_df['rank_hi'].values
@@ -385,26 +466,23 @@ try:
             if bin_lows[i] <= rank <= bin_highs[i]:
                 return calib_df.iloc[i].get(col, np.nan)
         return calib_df.iloc[(calib_df['rank_mid']-rank).abs().argmin()].get(col, np.nan)
-    for col, src in [('Projected_Return_21d','mean_return_21d'),
-                     ('Projected_Return_63d','mean_return_63d'),
+    for col, src in [('Projected_Return_21d', 'mean_return_21d'),
+                     ('Projected_Return_63d', 'mean_return_63d'),
                      ('Projected_Return_252d','mean_return_252d'),
-                     ('Band_Low_21d','p05_return_21d'),
-                     ('Band_High_21d','p95_return_21d')]:
+                     ('Band_Low_21d',         'p05_return_21d'),
+                     ('Band_High_21d',        'p95_return_21d')]:
         df_signals[col] = df_signals['Final_Rank'].apply(lambda r: get_calib(r, src))
     print("Calibration applied.")
 except Exception as e:
     print(f"Calibration not applied: {e}")
-    for col in ['Projected_Return_21d','Projected_Return_63d','Projected_Return_252d',
-                'Band_Low_21d','Band_High_21d']:
+    for col in ['Projected_Return_21d', 'Projected_Return_63d', 'Projected_Return_252d',
+                'Band_Low_21d', 'Band_High_21d']:
         df_signals[col] = np.nan
 
-print(f"\nEnsemble signals : {len(df_signals):,} rows")
-print(f"Date range       : {df_signals[DATE_COL].min().date()} -> {df_signals[DATE_COL].max().date()}")
-
-OUTPUT_COLS = [c for c in [TICKER_COL,DATE_COL,'Final_Rank','Signal','Regime_Int',
-               TIER_COL,'Sector','LSTM_Vol','XGB_Rank','LGB_Rank',
-               'Projected_Return_21d','Projected_Return_63d','Projected_Return_252d',
-               'Band_Low_21d','Band_High_21d'] if c in df_signals.columns]
+OUTPUT_COLS = [c for c in [TICKER_COL, DATE_COL, 'Final_Rank', 'Signal', 'Regime_Int',
+               TIER_COL, 'Sector', 'LSTM_Vol', 'LSTM_Rank', 'XGB_Rank', 'LGB_Rank',
+               'Projected_Return_21d', 'Projected_Return_63d', 'Projected_Return_252d',
+               'Band_Low_21d', 'Band_High_21d'] if c in df_signals.columns]
 df_signals[OUTPUT_COLS].to_csv(os.path.join(RESULTS_DIR, f'signals_{DATE_STAMP}.csv'), index=False)
 
 df_signals_clean = df_signals.copy()
@@ -422,7 +500,7 @@ print(f"  Unique signal dates: {df_signals_clean[DATE_COL].nunique()}")
 
 
 # =============================================================================
-# BLOCK D — PRICE DATA (from DB)
+# BLOCK H — PRICE DATA
 # =============================================================================
 
 print("\nLoading backtest prices from DB ...")
@@ -442,7 +520,7 @@ print(f"Price range : {prices[DATE_COL].min().date()} -> {prices[DATE_COL].max()
 dr = prices['Daily_Ret'].dropna()
 print(f"Daily ret   : mean={dr.mean()*100:.3f}%  std={dr.std()*100:.3f}%")
 
-fo_df = pd.read_csv(os.path.join(BASE_DIR, 'files', 'fo_list.csv'))
+fo_df = pd.read_csv(FO_LIST_CSV)
 fo_df.columns   = fo_df.columns.str.strip()
 fo_df['SYMBOL'] = fo_df['SYMBOL'].str.strip()
 FO_TICKERS      = set(fo_df['SYMBOL'].dropna().str.strip())
@@ -457,13 +535,10 @@ if len(overlap_d) == 0:
     print("CRITICAL: zero date overlap between signals and prices!")
     print(f"   Signal dates sample : {sorted(sig_dates)[:3]}")
     print(f"   Price dates sample  : {sorted(price_dates)[:3]}")
-else:
-    print(f"   Signal date sample  : {sorted(sig_dates)[:3]}")
-    print(f"   Price date sample   : {sorted(price_dates)[:3]}")
 
 
 # =============================================================================
-# BLOCK E — HELPER FUNCTIONS
+# BLOCK I — HELPER FUNCTIONS
 # =============================================================================
 
 def compute_metrics(nav_df, rf_rate=0.065):
@@ -499,7 +574,6 @@ def compute_atr_from_prices(ret_pivot: pd.DataFrame, window: int = 14) -> pd.Ser
     recent  = ret_pivot.tail(window + 1)
     atr_pct = recent.std(axis=0).fillna(ATR_FALLBACK).clip(lower=0.005)
     return atr_pct
-
 
 
 def compute_position_sizes(
@@ -579,7 +653,7 @@ def apply_sector_cap(candidates: pd.DataFrame, sizes: pd.Series,
 
 
 # =============================================================================
-# BLOCK F — BACKTEST ENGINE
+# BLOCK J — BACKTEST ENGINE
 # =============================================================================
 
 def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataFrame:
@@ -804,7 +878,7 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
     nav_df = pd.DataFrame(nav_series).set_index('Date')
     dupes  = nav_df.index.duplicated().sum()
     if dupes > 0:
-        print(f"WARNING: {dupes} duplicate dates found in NAV series — investigate!")
+        print(f"WARNING: {dupes} duplicate dates found in NAV series.")
     else:
         print(f"NAV series clean: {len(nav_df)} unique dates, no duplicates.")
 
@@ -814,8 +888,9 @@ print("run_backtest() defined.")
 
 
 # =============================================================================
-# BLOCK G — RUN BACKTEST + RESULTS
+# BLOCK K — RUN BACKTEST + RESULTS
 # =============================================================================
+
 nav_df = run_backtest(STARTING_NAV, daily_ret_pivot)
 print(f"Complete : {len(nav_df)} days  |  "
       f"End NAV Rs{nav_df['NAV'].iloc[-1]:,.0f}  |  "
@@ -824,7 +899,7 @@ print(f"Complete : {len(nav_df)} days  |  "
 metrics, daily_rets, drawdown = compute_metrics(nav_df)
 
 print("\n" + "="*55)
-print("BACKTEST PERFORMANCE")
+print("BACKTEST PERFORMANCE  (Ensemble v3 — LSTM H1 integrated)")
 print("="*55)
 for k, v in metrics.items(): print(f"  {k:<20} : {v}")
 print("="*55)
@@ -836,7 +911,7 @@ for yr, grp in nav_df.groupby('Year'):
     print(f"  {yr}: {(grp['NAV'].iloc[-1]/grp['NAV'].iloc[0]-1)*100:+.2f}%")
 
 try:
-    cagr = float(metrics.get('CAGR','0%').strip('%')) / 100
+    cagr = float(metrics.get('CAGR', '0%').strip('%')) / 100
     print(f"\n{'TARGET MET' if cagr >= 0.12 else 'Below target'}: "
           f"CAGR {cagr*100:.1f}%  (target >= 12%)")
     if cagr < 0.12:
@@ -847,10 +922,15 @@ except ValueError:
 nav_df.reset_index().to_csv(
     os.path.join(RESULTS_DIR, f'nav_series_{DATE_STAMP}.csv'), index=False)
 with open(os.path.join(RESULTS_DIR, f'metrics_{DATE_STAMP}.txt'), 'w', encoding='utf-8') as f:
-    f.write("AI Hedge Fund Simulator v2 — Backtest\n")
+    f.write("AI Hedge Fund Simulator v3 — Ensemble (LSTM H1 integrated)\n")
     f.write("="*55 + "\n")
     for k, v in metrics.items(): f.write(f"  {k:<20} : {v}\n")
 print(f"Saved results -> {RESULTS_DIR}")
+
+
+# =============================================================================
+# BLOCK L — PARAMETER TUNING (optional)
+# =============================================================================
 
 ENABLE_TUNING = False
 
@@ -860,7 +940,7 @@ if ENABLE_TUNING:
 
     for bt, ltk, ivw in itertools.product(
         [0.82, 0.83, 0.85, 0.87],
-        [15, 20, 25],
+        [15, 20, 25, 35],
         [0.50, 0.60, 0.70],
     ):
         BUY_THRESHOLD_ENH = bt
@@ -869,26 +949,26 @@ if ENABLE_TUNING:
         CONVICTION_WEIGHT = 1.0 - ivw
         try:
             nav_tmp     = run_backtest(STARTING_NAV, daily_ret_pivot)
-            m_tmp,_,_   = compute_metrics(nav_tmp)
+            m_tmp, _, _ = compute_metrics(nav_tmp)
             cagr_tmp    = float(m_tmp['CAGR'].strip('%')) / 100
             sharpe_tmp  = float(m_tmp['Sharpe Ratio'])
-            results_grid.append({'BUY': bt,'TOP_K': ltk,'INV_VOL': ivw,
-                                  'CAGR': cagr_tmp,'Sharpe': sharpe_tmp})
+            results_grid.append({'BUY': bt, 'TOP_K': ltk, 'INV_VOL': ivw,
+                                  'CAGR': cagr_tmp, 'Sharpe': sharpe_tmp})
             if cagr_tmp > best_cagr:
                 best_cagr   = cagr_tmp
-                best_params = {'BUY_THRESHOLD_ENH': bt,'LONG_TOP_K': ltk,'INV_VOL_WEIGHT': ivw}
+                best_params = {'BUY_THRESHOLD_ENH': bt, 'LONG_TOP_K': ltk, 'INV_VOL_WEIGHT': ivw}
                 print(f"  New best CAGR={cagr_tmp*100:.1f}%  Sharpe={sharpe_tmp:.3f}  {best_params}")
         except Exception as e:
             print(f"  Error ({bt},{ltk},{ivw}): {e}")
 
-    print(pd.DataFrame(results_grid).sort_values('CAGR',ascending=False).head(5).to_string(index=False))
+    print(pd.DataFrame(results_grid).sort_values('CAGR', ascending=False).head(5).to_string(index=False))
 
     BUY_THRESHOLD_ENH = best_params.get('BUY_THRESHOLD_ENH', 0.85)
-    LONG_TOP_K        = best_params.get('LONG_TOP_K', 20)
+    LONG_TOP_K        = best_params.get('LONG_TOP_K', 35)
     INV_VOL_WEIGHT    = best_params.get('INV_VOL_WEIGHT', 0.60)
     CONVICTION_WEIGHT = 1.0 - INV_VOL_WEIGHT
     print(f"\nBest params restored. Re-running backtest ...")
     nav_best     = run_backtest(STARTING_NAV, daily_ret_pivot)
-    m_best,_,_   = compute_metrics(nav_best)
+    m_best, _, _ = compute_metrics(nav_best)
     print("\n" + "="*55 + "\nTUNED BACKTEST PERFORMANCE\n" + "="*55)
     for k, v in m_best.items(): print(f"  {k:<20} : {v}")
