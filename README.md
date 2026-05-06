@@ -162,6 +162,7 @@ Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → P
 ```
 
 **Simplified pipeline overview:**
+
 ![Pipeline Architecture](architecture_img/simle_prt_arch.png)
 
 ## 4. Folder Structure
@@ -397,11 +398,12 @@ Tier X list is also maintained in `config.py → TIER_X_EXCLUDED` for scripts th
 
 ### Optimizer (`portfolio/optimizer.py`)
 
-- Reads latest signal CSV
+- Reads latest signal CSV and current open positions from `portfolio_positions` table
 - Applies sector cap: max 3 stocks per sector (prevents IT concentration)
 - ATR-normalized position sizing: `ATR_14 / Close` prevents low-priced stock over-allocation
 - Midcap vs. large-cap size differentiation
-- Writes final allocations to `portfolio_positions` table
+- Regime-aware allocation scaling via HMM state
+- Writes proposed allocations to `portfolio_positions` table (idempotent — skips if date already committed)
 
 ### Risk Manager (`risk/risk_manager.py`)
 
@@ -410,9 +412,20 @@ Pre-trade checks enforced before any position is committed:
 - Max single core long position
 - Max single midcap long position
 - Max single short position
+- Max sector gross long exposure
+- Max sector gross long exposure (financials)
+- Max sector gross short exposure
+- Gross exposure cap
+- Net exposure min/max bounds
 - Cash reserve minimum
+- Midcap long book maximum
 - Minimum position size threshold
-- Financial sector concentration limits
+
+### Cash Ledger (`portfolio_cash` table)
+
+- Available cash = total balance − deployed capital (Entry_Price × Shares for open positions)
+- P&L credits and debits written on position close
+- All cash transactions logged with type, amount, reference position ID, and notes
 
 ---
 
@@ -423,18 +436,21 @@ Pre-trade checks enforced before any position is committed:
 
 **Tabs:**
 
-- **Signals** — Current BUY/SELL/HOLD table with confidence scores, sector, stop-loss
-- **Portfolio** — Active positions, allocation %, NAV tracking
-- **Regime** — Current HMM market regime + historical regime chart
-- **Backtest** — NAV curve vs. Nifty 500 benchmark
-- **Pipeline Status** — Last run date per data source
+- **Signals** — Full BUY/SELL/HOLD signal table with confidence scores, sector, tier, stop-loss
+- **Portfolio** — Optimizer output: proposed positions, allocation %, risk gauges, rejected signals
+- **Backtest Graphs** — NAV curve vs. Nifty 500 benchmark with drawdown analysis
+- **Returns & Taxes** — Per-position projected returns, STCG/LTCG tax breakdown, capital waterfall
 
 **Sidebar:**
 
-- Starting NAV input (₹) for position sizing simulation
+- Starting NAV input (₹) for position sizing and optimizer
+- Market regime pill (HMM state), macro strip (VIX, Repo, USD/INR, Crude, Gold, FII flows)
+- Pipeline status (last run date per data source)
 - Refresh Data button (triggers `daily_refresh.py`)
 
-All DB access is read-only. No writes from dashboard.
+Portfolio writes to `portfolio_positions` and `portfolio_cash` tables on each refresh (idempotent). All other DB access is read-only.
+
+---
 
 ---
 
