@@ -105,65 +105,51 @@ Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → P
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        DATA LAYER (Local)                       │
+│                      1. DATA LAYER (Local)                      │
 │                                                                 │
-│  NSE Bhavcopy (OHLCV) → nifty500_ohlcv                          │
-│  Screener.in (Fundamentals) → nifty500_fundamentals             │
-│  StockEdge CM API (FII/DII) → fii_dii_flow                      │
-│  FRED + yfinance (Macro) → macro_indicators                     │
-│  RBI Repo Rate (hardcoded history) → macro_indicators           │
-│  Technical Indicators (ta library) → nifty500_indicators        │
-│  Data Quality Classification → stock_data_quality               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                   FEATURE ENGINEERING (Local)                   │
-│                                                                 │
-│  features.py → features_master (MySQL)                          │
-│  export_features.py → exports/ (Parquet, CSV)                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-┌─────────────▼──────────┐  ┌──────────▼──────────────────────────┐
-│  HMM (Local)           │  │  XGBoost + LightGBM (Google Colab)  │
-│  ML_scripts/hmm.py     │  │  ML_scripts/xgboost.ipynb           │
-│  4-state regime model  │  │  21-day return ranking target       │
-│  → market_regimes      │  │  → ML_models/xgboost_v*.pkl         │
-│  → ML_models/hmm_*.pkl │  │  → ML_models/lightgbm_v*.pkl        │
-└────────────────────────┘  └─────────────────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-┌─────────────▼─────────────────────────▼────────────────────────┐
-│               LSTM Dual-Head (Kaggle)                          │
-│               ML_scripts/lstm.ipynb                            │
-│               Head 1: 10-day return rank                       │
-│               Head 2: 5-day realized volatility                │
-│               → ML_models/lstm_v*.keras                        │
-│               → ML_models/lstm_norm_v*.pkl                     │
-└──────────────────────────┬─────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                ENSEMBLE (Local)                                 │
-│                ML_scripts/ensemble_final.py                     │
-│                Rank calibration → confidence scores             │
-│                BUY / SELL / HOLD signal generation              │
-│                → exports/model_output/signals_*.csv             │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│           PORTFOLIO + RISK + DASHBOARD (Local)                  │
-│           portfolio/optimizer.py                                │
-│           risk/risk_manager.py                                  │
-│           dashboard/app.py (Streamlit)                          │
-└─────────────────────────────────────────────────────────────────┘
+│  OHLCV Market Data        →  nifty500_ohlcv                     │
+│  Fundamental Data         →  nifty500_fundamentals              │
+│  FII / DII Flow Data      →  macro_indicators                   │
+│  Macro Economic Data      →  macro_indicators                   │
+│  Repo Rate Data           →  macro_indicators                   │
+│  Indicator Calculation    →  nifty500_indicators                │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+               ┌────────────────┴────────────────┐
+               │                                 │
+┌──────────────▼──────────────┐    ┌──────────────▼──────────────┐
+│   2. HMM (Local)            │    │  3. FEATURE ENGINEERING     │
+│                             │    │     (Local)                 │
+│  market_regimes (Table)     │──▶│   features_master (Table)   |
+│  hmm_model.pkl              │    │   features_master.parquet   |
+└─────────────────────────────┘    └─────────────────────────────┘
+              │                             |
+              └──────────────┬──────────────┘
+                             │
+              ┌──────────────┴──────────────────────────────┐
+              │                                             │
+┌─────────────▼───────────┐               ┌─────────────────▼────────────┐
+│  4A. XGBoost + LightGBM │               │  4B. LSTM DUAL-HEAD          │
+│      (Google Colab)     │               │      (Kaggle)                │
+│                         │               │                              │
+│  xgboost_model.pkl      │               │  lstm_model.keras            │
+│  lightgbm_model.pkl     │               │  lstm_norm.pkl               │
+└───────────┬─────────────┘               └───────────────┬──────────────┘
+            │                                             │
+            └──────────────────────┬──────────────────────┘
+                                   │
+                      ┌────────────▼────────────────┐
+                      │      5. ENSEMBLE (Local)    │
+                      │                             │
+                      │        signals.csv          │
+                      └──────────────┬──────────────┘
+                                     │
+                      ┌──────────────▼──────────────┐
+                      │  6. PORTFOLIO + RISK +      │
+                      │     DASHBOARD (Local)       │
+                      └─────────────────────────────┘
 
 ```
-
-**Simplified pipeline overview:**
-
-![Pipeline Architecture](architecture_img/simle_prt_arch.png?raw=true)
 
 ## 4. Folder Structure
 
