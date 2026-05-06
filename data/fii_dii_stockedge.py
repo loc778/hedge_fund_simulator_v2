@@ -274,7 +274,7 @@ def write_daily(engine, fii_df: pd.DataFrame, dii_df: pd.DataFrame):
     log.info(f"Daily  — trading days written : {total}")
     log.info(f"Daily  — dates skipped        : {skipped}")
 
-# ── Verify ────────────────────────────────────────────────────────────────────
+#  Verify 
 
 def verify(engine):
     sql = text("""
@@ -290,7 +290,7 @@ def verify(engine):
     with engine.connect() as conn:
         r = conn.execute(sql).fetchone()
 
-    log.info("── Verification ──────────────────────────────────────────")
+    log.info(" Verification ")
     log.info(f"  FII_Monthly_Net_Cr filled : {r.monthly_filled} rows (from {r.monthly_earliest})")
     log.info(f"  DII_Monthly_Net_Cr filled : {r.dii_monthly_filled} rows")
     log.info(f"  FII_Daily_Net_Cr   filled : {r.daily_filled} rows (latest: {r.daily_latest})")
@@ -310,7 +310,7 @@ def verify(engine):
         log.info(f"  Spot Mar 2020 FII        : {row.FII_Monthly_Net_Cr} "
                  f"({'PASS' if ok else 'FAIL'})")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+#  Main 
 
 if __name__ == "__main__":
     engine  = get_engine()

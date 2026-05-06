@@ -247,7 +247,7 @@ TABLES = {
         )
     """,
 
-    # ── Portfolio Positions Tracker ───────────────────────────────────
+    # Portfolio Positions
     "portfolio_positions": """
         CREATE TABLE IF NOT EXISTS portfolio_positions (
             id                      INT AUTO_INCREMENT PRIMARY KEY,
@@ -269,10 +269,26 @@ TABLES = {
             NAV_Weight_At_Entry     DECIMAL(10,4),
             Shares                  INT,
             Status                  ENUM('open','closed') DEFAULT 'open',
+            Realized_PnL            DECIMAL(14,2)   DEFAULT NULL,
+            Tax_Amount              DECIMAL(14,2)   DEFAULT NULL,
+            Holding_Days            INT             DEFAULT NULL,
             UNIQUE KEY unique_ticker_entry (Ticker, Entry_Date, Direction)
         )
     """,
 
+    # ── Portfolio Cash Ledger ─────────────────────────────────────────
+    "portfolio_cash": """
+        CREATE TABLE IF NOT EXISTS portfolio_cash (
+            id                  INT AUTO_INCREMENT PRIMARY KEY,
+            Transaction_Date    DATE            NOT NULL,
+            Transaction_Type    ENUM('initial','deposit','withdrawal',
+                                     'pnl_credit','tax_debit') NOT NULL,
+            Amount              DECIMAL(20,2)   NOT NULL,
+            Reference_Id        INT             DEFAULT NULL,
+            Notes               TEXT,
+            Created_At          DATETIME        DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
     # ── Sector Fundamentals Median ────────────────────────────────────
    
     "sector_fundamentals_median": """

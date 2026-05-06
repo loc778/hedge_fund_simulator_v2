@@ -34,18 +34,20 @@ MIN_POSITIONS         = 25      # floor (warning only, not enforced)
 LONG_RANK_THRESHOLD   = 0.82    # Final_Rank >= this → BUY candidate (slightly wider to fill slots)
 SHORT_RANK_THRESHOLD  = 0.08    # Final_Rank <= this → SELL candidate (tighter = fewer shorts)
 
-LONG_TARGET_PCT       = 1.30    # ↑ target gross long as fraction of NAV (was 1.15)
-SHORT_TARGET_PCT      = 0.10    # ↓ target gross short (was 0.15) — less drag, more net long
-LONG_HARD_CAP_PCT     = 1.35    # hard cap gross long
-SHORT_HARD_CAP_PCT    = 0.15    # hard cap gross short
+# NEW
+LONG_TARGET_PCT       = 1.40    # target gross long as fraction of NAV
+SHORT_TARGET_PCT      = 0.10    # target gross short
+LONG_HARD_CAP_PCT     = 1.45    # hard cap gross long
+SHORT_HARD_CAP_PCT    = 0.15    # hard cap gross short   
 
 # Regime-aware maximum deployable NAV fraction (cash floor is the complement)
 # Raised across the board — the old values left too much idle cash suppressing returns
+# NEW
 REGIME_DEPLOY_CAP = {
-    0: 0.97,   # Bull       — nearly fully deployed
-    1: 0.88,   # Bear       — more cautious but still active
-    2: 0.90,   # High Vol   — was 0.85, slight raise; ATR sizing auto-reduces anyway
-    3: 0.94,   # Sideways   — was 0.90
+    0: 0.99,   # Bull       — fully deployed
+    1: 0.90,   # Bear       — cautious but active
+    2: 0.93,   # High Vol   — ATR sizing auto-reduces individual positions
+    3: 0.97,   # Sideways   — near full deployment
 }
 
 # Tier → is_midcap mapping (Tier 2 = mid-cap proxy)
@@ -323,7 +325,7 @@ def optimize_portfolio(
 
     long_sizes  = _compute_sizes(long_pool,  "long",  nav, LONG_TARGET_PCT,  deploy_cap)
     short_sizes = _compute_sizes(short_pool, "short", nav, SHORT_TARGET_PCT, deploy_cap)
-
+    
     # ── 4. Risk-check loop ────────────────────────────────────────────────
     # Process longs first (higher conviction, larger book), then shorts.
     # Each iteration updates the running portfolio state.
@@ -331,10 +333,11 @@ def optimize_portfolio(
     approved_positions: dict[str, dict] = {}
     rejected_records:   list[dict]      = []
 
-    # NEW
     # Load incumbent open positions from DB once before the risk-check loop.
     # This ensures risk limits (sector caps, gross exposure) account for
     # positions already on the book from prior signal runs.
+    
+    _incumbent_positions: dict = {}
     try:
         _incumbent_ps = PortfolioState.from_db(
             engine=engine, nav=nav, peak_nav=nav, cash=nav,
@@ -342,7 +345,7 @@ def optimize_portfolio(
             nav_return_21d=None, is_budget_period=False,
             is_fo_expiry_week=False, regime=regime_int, as_of_date=as_of,
         )
-        _incumbent_positions: dict = dict(_incumbent_ps.positions)
+        _incumbent_positions = dict(_incumbent_ps.positions)
     except Exception:
         _incumbent_positions = {}
 

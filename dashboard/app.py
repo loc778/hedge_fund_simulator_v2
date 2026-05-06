@@ -11,7 +11,8 @@ Reads:
     - files/nifty500_sectors.csv                  (sector map)
     - risk/risk_manager.py                         (pre-trade checks)
 
-All DB access is read-only. No writes.
+Cash is managed via portfolio_cash ledger table.
+Available cash = total balance - deployed capital (Entry_Price * Shares for open positions).
 """
 
 import glob
@@ -282,12 +283,10 @@ def load_sectors() -> pd.DataFrame:
                 ticker_col = cand
                 break
         if ticker_col is None:
-            # Last resort: first column
             ticker_col = df.columns[0]
         df = df.rename(columns={ticker_col: "Ticker"})
         df["Ticker"] = df["Ticker"].str.strip()
 
-        # Ensure .NS suffix present for merge with signals (which use .NS tickers)
         df["Ticker"] = df["Ticker"].apply(
             lambda x: x if str(x).endswith(".NS") else str(x) + ".NS"
         )
@@ -333,7 +332,6 @@ def load_signals() -> tuple[pd.DataFrame, str]:
     latest = files[-1]
     df = pd.read_csv(latest, parse_dates=["Date"])
     return df, latest
-
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -448,6 +446,96 @@ def load_pipeline_last_dates() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CASH LEDGER HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INITIAL_CASH = 1_000_000_000   # ₹100 Cr starting capital
+
+
+def _ensure_cash_initialized(engine) -> None:
+    """Seed portfolio_cash with ₹100 Cr initial deposit if table is empty."""
+    from sqlalchemy import text as _text
+    try:
+        with engine.connect() as conn:
+            count = conn.execute(_text("SELECT COUNT(*) FROM portfolio_cash")).scalar()
+            if count == 0:
+                conn.execute(_text("""
+                    INSERT INTO portfolio_cash
+                        (Transaction_Date, Transaction_Type, Amount, Notes)
+                    VALUES (:d, 'initial', :amt, 'System initialization — starting capital ₹100 Cr')
+                """), {"d": date.today().isoformat(), "amt": _INITIAL_CASH})
+                conn.commit()
+    except Exception:
+        pass
+
+
+def get_cash_balance(engine) -> float:
+    """Total cash balance = SUM of all portfolio_cash transactions."""
+    from sqlalchemy import text as _text
+    try:
+        _ensure_cash_initialized(engine)
+        with engine.connect() as conn:
+            val = conn.execute(_text(
+                "SELECT COALESCE(SUM(Amount), 0) FROM portfolio_cash"
+            )).scalar()
+        return float(val)
+    except Exception:
+        return float(_INITIAL_CASH)
+
+
+def get_deployed_cash(engine) -> float:
+    """Capital currently deployed = SUM(Entry_Price * Shares) for all open positions."""
+    from sqlalchemy import text as _text
+    try:
+        with engine.connect() as conn:
+            val = conn.execute(_text(
+                "SELECT COALESCE(SUM(Entry_Price * Shares), 0) "
+                "FROM portfolio_positions WHERE Status = 'open'"
+            )).scalar()
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def get_available_cash(engine) -> float:
+    """Available cash = total balance - deployed capital."""
+    return max(get_cash_balance(engine) - get_deployed_cash(engine), 0.0)
+
+
+def add_cash_transaction(engine, tx_type: str, amount: float,
+                         reference_id: int = None, notes: str = "") -> None:
+    """Write a single cash transaction row."""
+    from sqlalchemy import text as _text
+    with engine.connect() as conn:
+        conn.execute(_text("""
+            INSERT INTO portfolio_cash
+                (Transaction_Date, Transaction_Type, Amount, Reference_Id, Notes)
+            VALUES (:d, :tt, :amt, :ref, :notes)
+        """), {
+            "d":     date.today().isoformat(),
+            "tt":    tx_type,
+            "amt":   amount,
+            "ref":   reference_id,
+            "notes": notes,
+        })
+        conn.commit()
+
+
+def _compute_tax(pnl: float, holding_days: int) -> float:
+    """
+    Approximate Indian equity tax.
+    STCG 20% / LTCG 12.5% post-Budget 2024 (Jul 23 2024).
+    STCG 15% / LTCG 10% pre-Budget 2024.
+    Losses → 0 tax. ₹1L annual LTCG exemption not applied per-position.
+    """
+    if pnl <= 0:
+        return 0.0
+    # Use post-Budget 2024 rates as default (conservative)
+    rate = 0.20 if holding_days < 365 else 0.125
+    return round(pnl * rate, 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -495,10 +583,10 @@ def run_optimization(signals_today, sector_map, nav, regime_int):
     try:
         engine = get_engine()
         result = optimize_portfolio(
-            signals_df  = signals_today,
-            nav         = nav,
-            regime_int  = regime_int,
-            engine      = engine,
+            signals_df    = signals_today,
+            nav           = nav,
+            regime_int    = regime_int,
+            engine        = engine,
             sector_map_df = sector_map,
         )
         return result
@@ -523,6 +611,8 @@ def run_script(script_name: str, args: list[str] = None) -> tuple[bool, str]:
         return False, "Timed out after 60 minutes."
     except Exception as e:
         return False, str(e)
+
+
 def persist_portfolio(
     proposed_df: pd.DataFrame,
     signal_date,
@@ -532,19 +622,21 @@ def persist_portfolio(
     """
     Persist optimizer output to portfolio_positions.
 
-    - If signal_date already has open rows → skip (idempotent on refresh).
-    - New tickers not in the open book → INSERT as new open positions.
-    - Open tickers no longer in proposed_df → close them (EXIT_Date, Exit_Price, Exit_Reason).
-
-    Returns a status string for display.
+    Close logic for open positions NOT in new signals:
+      - Always close if stop loss breached.
+      - Close if underperforming (current_price < entry_price for longs, > for shorts).
+      - Close worst performers (by P&L%) if at MAX_POSITIONS capacity and new slots needed.
+    Positions in new signals AND already open → maintain (no close/reopen).
+    P&L from closes is credited to portfolio_cash net of tax.
     """
     from sqlalchemy import text as _text
-    import pandas as pd
 
     sig_date_str = pd.Timestamp(signal_date).strftime("%Y-%m-%d")
+    MAX_POS      = 45   # mirror optimizer constant
 
     try:
         with engine.connect() as conn:
+
             # ── Idempotency check ─────────────────────────────────────────
             already = conn.execute(_text(
                 "SELECT COUNT(*) FROM portfolio_positions "
@@ -553,65 +645,167 @@ def persist_portfolio(
             if already and already > 0:
                 return f"skipped — signal date {sig_date_str} already committed ({already} positions)"
 
-            # ── Current open positions ────────────────────────────────────
+            # ── Load all open positions with current prices ───────────────
             open_rows = pd.read_sql(
-                "SELECT id, Ticker, Direction FROM portfolio_positions "
-                "WHERE Status = 'open'",
+                """
+                SELECT p.id, p.Ticker, p.Direction, p.Entry_Price, p.Shares,
+                       p.Stop_Loss_Price, p.Entry_Date,
+                       COALESCE(o.Adj_Close, p.Entry_Price) AS Current_Price
+                FROM portfolio_positions p
+                LEFT JOIN (
+                    SELECT Ticker, Adj_Close FROM nifty500_ohlcv ov
+                    INNER JOIN (SELECT Ticker AS t, MAX(Date) AS d
+                                FROM nifty500_ohlcv GROUP BY Ticker) m
+                    ON ov.Ticker = m.t AND ov.Date = m.d
+                ) o ON o.Ticker = p.Ticker
+                WHERE p.Status = 'open'
+                """,
                 conn,
             )
-            open_tickers = set(open_rows["Ticker"].tolist()) if not open_rows.empty else set()
 
-            # ── Proposed tickers from optimizer ──────────────────────────
-            if proposed_df.empty:
-                new_tickers = set()
-                proposed_tickers = set()
-            else:
-                proposed_df = proposed_df.copy()
-                proposed_df["_Ticker_norm"] = proposed_df["Ticker"].str.replace(
-                    r"\.NS$", "", regex=True
+            proposed_tickers = set(proposed_df["Ticker"].tolist()) if not proposed_df.empty else set()
+
+            # Normalise open tickers to .NS for comparison
+            if not open_rows.empty:
+                open_rows["Ticker_ns"] = open_rows["Ticker"].apply(
+                    lambda t: t if t.endswith(".NS") else t + ".NS"
                 )
-                proposed_tickers = set(proposed_df["Ticker"].tolist())
+            else:
+                open_rows["Ticker_ns"] = pd.Series(dtype=str)
 
-            # Normalise open_tickers to .NS for comparison
-            open_tickers_ns = {
-                t if t.endswith(".NS") else t + ".NS" for t in open_tickers
-            }
+            open_tickers_ns = set(open_rows["Ticker_ns"].tolist()) if not open_rows.empty else set()
 
-            # ── 1. Close exits ────────────────────────────────────────────
-            exits = open_tickers_ns - proposed_tickers
+            # ── Classify open positions ───────────────────────────────────
+            to_keep_signal  = open_tickers_ns & proposed_tickers
+            non_signal_rows = open_rows[~open_rows["Ticker_ns"].isin(to_keep_signal)].copy()
+
+            to_close = []   # list of row dicts to close
+
+            if not non_signal_rows.empty:
+                non_signal_rows["Entry_Price"]    = pd.to_numeric(non_signal_rows["Entry_Price"],    errors="coerce")
+                non_signal_rows["Current_Price"]  = pd.to_numeric(non_signal_rows["Current_Price"],  errors="coerce")
+                non_signal_rows["Stop_Loss_Price"]= pd.to_numeric(non_signal_rows["Stop_Loss_Price"],errors="coerce")
+
+                for _, r in non_signal_rows.iterrows():
+                    ep  = float(r["Entry_Price"]    or 0)
+                    cp  = float(r["Current_Price"]  or ep)
+                    sl  = float(r["Stop_Loss_Price"]) if pd.notna(r["Stop_Loss_Price"]) else None
+                    direction = str(r["Direction"])
+
+                    stop_breached = (
+                        (direction == "long"  and sl is not None and cp <= sl) or
+                        (direction == "short" and sl is not None and cp >= sl)
+                    )
+                    underperforming = (
+                        (direction == "long"  and cp < ep) or
+                        (direction == "short" and cp > ep)
+                    )
+
+                    if stop_breached or underperforming:
+                        to_close.append(r.to_dict())
+
+                # Capacity check: if remaining open + new slots > MAX_POS,
+                # close worst performers among non-signal positions to make room
+                close_tickers = {r["Ticker_ns"] for r in to_close}
+                remaining_non_signal = non_signal_rows[
+                    ~non_signal_rows["Ticker_ns"].isin(close_tickers)
+                ].copy()
+
+                slots_used = len(open_tickers_ns) - len(to_close)
+                new_slots  = len(proposed_tickers - open_tickers_ns)
+
+                if slots_used + new_slots > MAX_POS and not remaining_non_signal.empty:
+                    overflow = (slots_used + new_slots) - MAX_POS
+                    remaining_non_signal["PnL_pct"] = (
+                        (remaining_non_signal["Current_Price"] - remaining_non_signal["Entry_Price"])
+                        / remaining_non_signal["Entry_Price"].replace(0, float("nan"))
+                    )
+                    short_mask = remaining_non_signal["Direction"] == "short"
+                    remaining_non_signal.loc[short_mask, "PnL_pct"] *= -1
+
+                    worst = remaining_non_signal.nsmallest(overflow, "PnL_pct")
+                    for _, r in worst.iterrows():
+                        to_close.append(r.to_dict())
+
+            # ── Close positions & credit P&L to cash ledger ───────────────
             n_closed = 0
-            for ticker in exits:
-                # Fetch latest price from ohlcv as exit price
-                price_row = conn.execute(_text(
-                    "SELECT Adj_Close FROM nifty500_ohlcv "
-                    "WHERE Ticker = :t AND Date <= :d "
-                    "ORDER BY Date DESC LIMIT 1"
-                ), {"t": ticker, "d": sig_date_str}).fetchone()
-                exit_price = float(price_row[0]) if price_row and price_row[0] else None
+            for r in to_close:
+                ticker     = r["Ticker_ns"]
+                pos_id     = int(r["id"])
+                direction  = str(r["Direction"])
+                ep         = float(r["Entry_Price"]   or 0)
+                cp         = float(r["Current_Price"] or ep)
+                shares     = int(r["Shares"] or 0)
+                entry_dt   = (
+                    pd.Timestamp(r["Entry_Date"]).date()
+                    if r["Entry_Date"] else date.today()
+                )
+                holding_days = (date.fromisoformat(sig_date_str) - entry_dt).days
 
-                conn.execute(_text(
-                    "UPDATE portfolio_positions SET "
-                    "Status = 'closed', "
-                    "Exit_Date = :ed, "
-                    "Exit_Price = :ep, "
-                    "Exit_Reason = :er "
-                    "WHERE Ticker = :t AND Status = 'open'"
-                ), {
-                    "ed": sig_date_str,
-                    "ep": exit_price,
-                    "er": "signal_dropped",
-                    "t":  ticker,
+                if direction == "long":
+                    pnl = round((cp - ep) * shares, 2)
+                else:
+                    pnl = round((ep - cp) * shares, 2)
+
+                tax     = _compute_tax(pnl, holding_days)
+                net_pnl = round(pnl - tax, 2)
+
+                sl_val = r.get("Stop_Loss_Price")
+                stop_breached = (
+                    (direction == "long"  and sl_val is not None and not pd.isna(sl_val) and cp <= float(sl_val)) or
+                    (direction == "short" and sl_val is not None and not pd.isna(sl_val) and cp >= float(sl_val))
+                )
+                exit_reason = (
+                    "stop_loss"      if stop_breached
+                    else "underperforming" if (
+                        (direction == "long" and cp < ep) or
+                        (direction == "short" and cp > ep)
+                    )
+                    else "capacity_trim"
+                )
+
+                conn.execute(_text("""
+                    UPDATE portfolio_positions SET
+                        Status        = 'closed',
+                        Exit_Date     = :ed,
+                        Exit_Price    = :ep,
+                        Exit_Reason   = :er,
+                        Realized_PnL  = :pnl,
+                        Tax_Amount    = :tax,
+                        Holding_Days  = :hd
+                    WHERE id = :pid
+                """), {
+                    "ed":  sig_date_str,
+                    "ep":  cp,
+                    "er":  exit_reason,
+                    "pnl": pnl,
+                    "tax": tax,
+                    "hd":  holding_days,
+                    "pid": pos_id,
                 })
+
+                # Credit net P&L to cash ledger (positive or negative)
+                if net_pnl != 0:
+                    conn.execute(_text("""
+                        INSERT INTO portfolio_cash
+                            (Transaction_Date, Transaction_Type, Amount, Reference_Id, Notes)
+                        VALUES (:d, 'pnl_credit', :amt, :ref, :notes)
+                    """), {
+                        "d":     sig_date_str,
+                        "amt":   net_pnl,
+                        "ref":   pos_id,
+                        "notes": f"{ticker} {direction} — PnL ₹{pnl:,.0f} tax ₹{tax:,.0f}",
+                    })
+
                 n_closed += 1
 
-            # ── 2. Insert new positions ───────────────────────────────────
+            # ── Insert new positions ──────────────────────────────────────
             new_tickers = proposed_tickers - open_tickers_ns
             n_inserted  = 0
 
-            if not proposed_df.empty:
-                # Load entry prices for new tickers
-                new_list = ", ".join(f"'{t}'" for t in new_tickers) if new_tickers else "''"
-                price_df = pd.read_sql(
+            if not proposed_df.empty and new_tickers:
+                new_list  = ", ".join(f"'{t}'" for t in new_tickers)
+                price_df  = pd.read_sql(
                     f"""
                     SELECT o.Ticker, o.Adj_Close
                     FROM nifty500_ohlcv o
@@ -623,7 +817,7 @@ def persist_portfolio(
                     ) m ON o.Ticker = m.Ticker AND o.Date = m.d
                     """,
                     conn,
-                ) if new_tickers else pd.DataFrame(columns=["Ticker", "Adj_Close"])
+                )
                 price_idx = price_df.set_index("Ticker")["Adj_Close"].to_dict()
 
                 for _, row in proposed_df.iterrows():
@@ -631,21 +825,21 @@ def persist_portfolio(
                     if ticker not in new_tickers:
                         continue
 
-                    direction  = row["Direction"].lower()
-                    size_pct   = float(row["Size_%NAV"]) / 100
-                    alloc_rs   = float(row["Alloc_Rs"])
-                    sector     = str(row.get("Sector", "Unknown") or "Unknown")
-                    is_midcap  = 1 if str(row.get("Tier", "A")) in ("B", "C") else 0
-                    entry_price= float(price_idx.get(ticker, 0))
-                    shares     = int(alloc_rs / entry_price) if entry_price > 0 else 0
-                    pos_class  = (
+                    direction   = row["Direction"].lower()
+                    size_pct    = float(row["Size_%NAV"]) / 100
+                    alloc_rs    = float(row["Alloc_Rs"])
+                    sector      = str(row.get("Sector", "Unknown") or "Unknown")
+                    is_midcap   = 1 if str(row.get("Tier", "A")) in ("B", "C") else 0
+                    entry_price = float(price_idx.get(ticker, 0))
+                    shares      = int(alloc_rs / entry_price) if entry_price > 0 else 0
+                    pos_class   = (
                         "short"      if direction == "short"
                         else "alpha_long" if is_midcap
                         else "core_long"
                     )
-                    stop_loss  = (
-                        round(entry_price * (1 - 0.15), 4) if direction == "long" and entry_price > 0
-                        else round(entry_price * (1 + 0.10), 4) if direction == "short" and entry_price > 0
+                    stop_loss   = (
+                        round(entry_price * 0.85, 4) if direction == "long"  and entry_price > 0
+                        else round(entry_price * 1.10, 4) if direction == "short" and entry_price > 0
                         else None
                     )
 
@@ -659,17 +853,17 @@ def persist_portfolio(
                          :pc, :sector, :imc, :sl,
                          :nav_w, :shares, 'open')
                     """), {
-                        "ticker":  ticker,
-                        "sd":      sig_date_str,
-                        "ed":      sig_date_str,
-                        "ep":      entry_price if entry_price > 0 else None,
-                        "dir":     direction,
-                        "pc":      pos_class,
-                        "sector":  sector,
-                        "imc":     is_midcap,
-                        "sl":      stop_loss,
-                        "nav_w":   round(size_pct, 6),
-                        "shares":  shares if shares > 0 else None,
+                        "ticker": ticker,
+                        "sd":     sig_date_str,
+                        "ed":     sig_date_str,
+                        "ep":     entry_price if entry_price > 0 else None,
+                        "dir":    direction,
+                        "pc":     pos_class,
+                        "sector": sector,
+                        "imc":    is_midcap,
+                        "sl":     stop_loss,
+                        "nav_w":  round(size_pct, 6),
+                        "shares": shares if shares > 0 else None,
                     })
                     n_inserted += 1
 
@@ -678,6 +872,7 @@ def persist_portfolio(
 
     except Exception as e:
         return f"error — {e}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -695,22 +890,46 @@ with st.sidebar:
 
     st.divider()
 
-    # NAV input
-    st.markdown('<p class="section-header">Simulation NAV</p>', unsafe_allow_html=True)
-    nav_input = st.number_input(
-        "Starting NAV (₹)",
-        min_value=100_000,
-        max_value=1_000_000_000,
-        value=10_000_000,
-        step=1_000_000,
-        format="%d",
-        help="Used for position sizing and allocation calculations. Does not affect signal generation.",
-        label_visibility="collapsed",
-    )
+    # ── Cash management ───────────────────────────────────────────────────────
+    st.markdown('<p class="section-header">Portfolio Cash</p>', unsafe_allow_html=True)
+    _engine_cash    = get_engine()
+    _ensure_cash_initialized(_engine_cash)
+    _total_balance  = get_cash_balance(_engine_cash)
+    _deployed       = get_deployed_cash(_engine_cash)
+    nav_input       = get_available_cash(_engine_cash)   # used downstream as nav
+
     st.markdown(
-        f"<div style='font-family:monospace;font-size:0.8rem;color:#58a6ff'>₹{nav_input:,.0f}</div>",
+        f"<div style='font-family:monospace;font-size:0.75rem;color:#8b949e'>Fund Capital</div>"
+        f"<div style='font-family:monospace;font-size:0.9rem;color:#58a6ff'>₹{_total_balance/1e7:.2f} Cr</div>",
         unsafe_allow_html=True
     )
+
+    with st.expander("＋ / − Cash", expanded=False):
+        _cash_amt = st.number_input(
+            "Amount (₹)", min_value=0, max_value=10_000_000_000,
+            value=1_000_000, step=500_000, format="%d",
+            label_visibility="collapsed"
+        )
+        _cash_note = st.text_input(
+            "Note (optional)", value="", label_visibility="collapsed",
+            placeholder="e.g. capital infusion Q2"
+        )
+        _c1, _c2 = st.columns(2)
+        if _c1.button("Deposit", use_container_width=True):
+            add_cash_transaction(
+                _engine_cash, "deposit", float(_cash_amt),
+                notes=_cash_note or "Manual deposit"
+            )
+            st.rerun()
+        if _c2.button("Withdraw", use_container_width=True):
+            if _cash_amt > nav_input:
+                st.warning("Withdrawal exceeds available cash.")
+            else:
+                add_cash_transaction(
+                    _engine_cash, "withdrawal", -float(_cash_amt),
+                    notes=_cash_note or "Manual withdrawal"
+                )
+                st.rerun()
 
     st.divider()
 
@@ -758,8 +977,6 @@ with st.sidebar:
                     st.error(f"Refresh error: {e}")
 
 
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def load_nav_series() -> pd.DataFrame:
     """Load backtested NAV series from ensemble output."""
@@ -782,7 +999,6 @@ def load_nifty_index(start_date: str, end_date: str) -> pd.DataFrame:
     """
     try:
         engine = get_engine()
-        # Try Nifty500 first, then Nifty50
         for col in ("Nifty500_Close", "Nifty50_Close", "Nifty_500", "Nifty_50",
                     "NIFTY500", "NIFTY50"):
             try:
@@ -801,7 +1017,6 @@ def load_nifty_index(start_date: str, end_date: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback: yfinance
     try:
         import yfinance as yf
         for sym in ("^CRSLDX", "^NSEI"):
@@ -845,7 +1060,6 @@ sector_map               = load_sectors()
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Determine signal date and regime
 if not signals_df.empty:
     signal_date  = signals_df["Date"].max()
     regime_int   = int(signals_df.loc[signals_df["Date"] == signal_date, "Regime_Int"].iloc[0])
@@ -875,7 +1089,6 @@ if opt_result is not None and not opt_result.positions.empty and RISK_AVAILABLE:
         nav         = nav_input,
         engine      = get_engine(),
     )
-    # Surface in sidebar so it's visible without taking up main area
     with st.sidebar:
         _color = "#3fb950" if "committed" in _persist_status else "#8b949e" if "skipped" in _persist_status else "#f85149"
         st.markdown(
@@ -887,10 +1100,10 @@ if opt_result is not None and not opt_result.positions.empty and RISK_AVAILABLE:
 
 if opt_result is not None:
     proposed_df = opt_result.positions
-    # Always re-merge sector + company from sector_map CSV (ground truth)
     if not proposed_df.empty and not sector_map.empty:
         proposed_df = proposed_df.drop(columns=["Sector","Company_Name"], errors="ignore")
-        merge_cols = ["Ticker","Sector","Company_Name"] if "Company_Name" in sector_map.columns                      else ["Ticker","Sector"]
+        merge_cols = ["Ticker","Sector","Company_Name"] if "Company_Name" in sector_map.columns \
+                     else ["Ticker","Sector"]
         proposed_df = proposed_df.merge(sector_map[merge_cols], on="Ticker", how="left")
         proposed_df["Sector"] = proposed_df["Sector"].fillna("Unknown")
         if "Company_Name" not in proposed_df.columns:
@@ -1028,12 +1241,12 @@ st.divider()
 
 # Top KPIs
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-_mk(k1, "Model BUY Signals",   str(n_buy),                                        "#3fb950")
-_mk(k2, "Model SELL Signals",  str(n_sell),                                       "#f85149")
+_mk(k1, "BUY Signals",   str(n_buy),                                        "#3fb950")
+_mk(k2, "SELL Signals",  str(n_sell),                                       "#f85149")
 _mk(k3, "Neutral Signals",     str(n_hold),                                       "#8b949e")
 _mk(k4, "Universe",            "500",                                             "#c9d1d9")
-_mk(k5, "Portfolio Positions", str(opt_stats.n_total) if opt_stats else "—",      "#58a6ff")
-_mk(k6, "Simulation NAV",      f"₹{nav_input/1e7:.2f} Cr",                        "#c9d1d9")
+_mk(k5, "Positions", str(opt_stats.n_total) if opt_stats else "—",      "#58a6ff")
+_mk(k6, "Fund Capital", f"₹{_total_balance/1e7:.2f} Cr",                          "#c9d1d9")
 
 st.divider()
 
@@ -1064,8 +1277,6 @@ with tab1:
             unsafe_allow_html=True
         )
 
-        # Merge sector + company name — always use sector_map CSV as ground truth
-        # Drop any Sector/Company_Name from signals CSV (may be Unknown from ensemble)
         df_view = signals_today.copy()
         df_view["Ticker_Display"] = df_view["Ticker"].str.replace(".NS","",regex=False)
         df_view = df_view.drop(columns=["Sector","Company_Name"], errors="ignore")
@@ -1076,7 +1287,6 @@ with tab1:
         df_view["Company_Name"] = df_view["Company_Name"].fillna(df_view["Ticker_Display"])
         df_view["Tier"] = df_view["Data_Tier"].map(TIER_LABEL).fillna("?")
 
-        # ── Filters: Signal selector + search bar (aligned) ─────────────
         fc1, fc2 = st.columns([2, 6])
         sig_filter = fc1.selectbox("Signal", ["ALL", "BUY", "SELL", "NEUTRAL"], index=0)
 
@@ -1087,7 +1297,6 @@ with tab1:
                 value="",
                 placeholder="Search ticker, company name or sector…",
             )
-            # SVG magnifying glass icon aligned with input bottom
             sc2.markdown(
                 """<div style='padding-top:32px;cursor:pointer;color:#8b949e' title='Search'>
                 <svg xmlns='http://www.w3.org/2000/svg' width='18' height='18'
@@ -1099,7 +1308,6 @@ with tab1:
                 unsafe_allow_html=True
             )
 
-        # Apply filters — each is optional, any combination works (issue 3)
         mask = pd.Series([True] * len(df_view), index=df_view.index)
         if sig_filter != "ALL":
             sig_map = {"BUY": 1, "SELL": -1, "NEUTRAL": 0}
@@ -1114,16 +1322,14 @@ with tab1:
 
         df_show = df_view[mask].sort_values("Final_Rank", ascending=False).reset_index(drop=True)
 
-        # ── Fetch Close + Volume for signal date ──────────────────────────
-        sig_tickers = tuple(df_show["Ticker"].tolist())
+        sig_tickers  = tuple(df_show["Ticker"].tolist())
         sig_date_str = pd.Timestamp(signal_date).strftime("%Y-%m-%d")
-        price_data = load_prices_on_date(sig_tickers, sig_date_str)
+        price_data   = load_prices_on_date(sig_tickers, sig_date_str)
         if not price_data.empty:
             price_idx = price_data.set_index("Ticker")[["Adj_Close","Volume"]]
         else:
             price_idx = pd.DataFrame(columns=["Adj_Close","Volume"])
 
-        # ── Build display table ────────────────────────────────────────────
         df_table = pd.DataFrame({
             "Ticker":       df_show["Ticker_Display"],
             "Company":      df_show["Company_Name"],
@@ -1160,7 +1366,6 @@ with tab1:
             unsafe_allow_html=True
         )
 
-        # ── BUY signal sector distribution — plotly with axis labels ──────
         st.markdown("<div class='section-header'>BUY Signal Sector Distribution</div>",
                     unsafe_allow_html=True)
         buys_sector = df_view[df_view["Signal"] == 1]["Sector"].value_counts().reset_index()
@@ -1209,7 +1414,6 @@ with tab1:
         else:
             st.info("No BUY signals to display.")
 
-        # ── SELL signal sector distribution ───────────────────────────────
         st.markdown("<div class='section-header'>SELL Signal Sector Distribution</div>",
                     unsafe_allow_html=True)
         sells_sector = df_view[df_view["Signal"] == -1]["Sector"].value_counts().reset_index()
@@ -1272,19 +1476,17 @@ with tab2:
         longs  = proposed_df[proposed_df["Direction"] == "LONG"]
         shorts = proposed_df[proposed_df["Direction"] == "SHORT"]
 
-        # ── Optimizer summary metrics ──────────────────────────────────────
         m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-        _mk(m1, "Total Positions", str(opt_stats.n_total),                    "#c9d1d9")
+        _mk(m1, "Total Positions", str(opt_stats.n_total),                    "#58a6ff")
         _mk(m2, "Longs",           str(opt_stats.n_longs),                    "#3fb950")
         _mk(m3, "Shorts",          str(opt_stats.n_shorts),                   "#f85149")
-        _mk(m4, "Gross Long",      f"{opt_stats.gross_long_pct:.1%}",         "#58a6ff")
-        _mk(m5, "Gross Short",     f"{opt_stats.gross_short_pct:.1%}",        "#58a6ff")
+        _mk(m4, "Gross Long",      f"{opt_stats.gross_long_pct:.1%}",         "#3fb950")
+        _mk(m5, "Gross Short",     f"{opt_stats.gross_short_pct:.1%}",        "#f85149")
         _mk(m6, "Net Exposure",    f"{opt_stats.net_exposure_pct:.1%}",       "#ffffff")
         _mk(m7, "Cash",            f"{opt_stats.cash_pct:.1%}",               "#ffffff")
 
         st.divider()
 
-        # ── Pie charts ────────────────────────────────────────────────────
         import plotly.graph_objects as go
 
         pc1, pc2 = st.columns(2)
@@ -1293,17 +1495,12 @@ with tab2:
             st.markdown("<div class='section-header'>Portfolio Distribution</div>",
                         unsafe_allow_html=True)
             if not proposed_df.empty:
-                # Use ticker as short label inside chart, full company name on hover
                 _ticker_short = proposed_df["Ticker"].str.replace(".NS","",regex=False)
                 _raw_name     = proposed_df.get("Company_Name", _ticker_short).fillna(_ticker_short)
-                # Company_Name sometimes contains "Name,Direction,Sector" from CSV — strip after first comma
                 _pie_name     = _raw_name.astype(str).str.split(",").str[0].str.strip()
-                # Sector: get directly from proposed_df (not from the fused Company_Name field)
                 _pie_sector   = proposed_df["Sector"].fillna("—") if "Sector" in proposed_df.columns else pd.Series(["—"]*len(proposed_df))
                 pie_values    = proposed_df["Size_%NAV"]
 
-                # High-contrast alternating greens for longs, reds for shorts
-                # Use shade variation so adjacent slices are distinguishable
                 _long_palette  = ["#2ea043","#3fb950","#56d364","#26a641","#1a7f37",
                                    "#4ac26b","#6fdd8b","#34d058","#28a745","#218838"]
                 _short_palette = ["#da3633","#f85149","#ff6b6b","#c0392b","#e74c3c",
@@ -1318,14 +1515,13 @@ with tab2:
                         pie_colors.append(_short_palette[_short_idx % len(_short_palette)])
                         _short_idx += 1
 
-                # Pre-format hover text as single string per slice (avoids Plotly customdata[n] issues)
                 _hover_texts = [
                     f"<b>{name}</b><br>{sector}<br>{val:.2f}% NAV"
                     for name, sector, val in zip(_pie_name, _pie_sector, pie_values)
                 ]
 
                 fig_pie1 = go.Figure(go.Pie(
-                    labels=_ticker_short,           # short ticker inside chart
+                    labels=_ticker_short,
                     values=pie_values,
                     customdata=_hover_texts,
                     marker=dict(
@@ -1333,7 +1529,6 @@ with tab2:
                         line=dict(color="#0a0e1a", width=2)
                     ),
                     hovertemplate="%{customdata}<extra></extra>",
-                    # Show only percent inside slice, ticker as pull-out label
                     textinfo="label+percent",
                     textposition="inside",
                     textfont=dict(size=9, color="#000000", family="JetBrains Mono, monospace"),
@@ -1358,7 +1553,6 @@ with tab2:
                 sec_nav    = proposed_df.groupby("Sector")["Size_%NAV"].sum().reset_index()
                 sec_counts = proposed_df.groupby("Sector").size().reindex(sec_nav["Sector"]).values
 
-                # Sector pie — use distinct color palette
                 _sec_palette = [
                     "#58a6ff","#3fb950","#e3b341","#f85149","#bc8cff",
                     "#ff9800","#00bcd4","#e91e63","#8bc34a","#ff5722",
@@ -1403,13 +1597,11 @@ with tab2:
 
         st.divider()
 
-        # ── Long book ─────────────────────────────────────────────────────
         if not longs.empty:
-            # Fetch prices for quantity calculation
-            long_tickers = tuple(longs["Ticker"].tolist())
+            long_tickers    = tuple(longs["Ticker"].tolist())
             sig_date_str_pb = pd.Timestamp(signal_date).strftime("%Y-%m-%d")
-            pb_prices = load_prices_on_date(long_tickers, sig_date_str_pb)
-            pb_price_idx = pb_prices.set_index("Ticker")["Adj_Close"] if not pb_prices.empty else pd.Series(dtype=float)
+            pb_prices       = load_prices_on_date(long_tickers, sig_date_str_pb)
+            pb_price_idx    = pb_prices.set_index("Ticker")["Adj_Close"] if not pb_prices.empty else pd.Series(dtype=float)
 
             def build_book_table(book_df, nav_val, price_series):
                 rows = []
@@ -1422,13 +1614,13 @@ with tab2:
                     price   = price_series.get(ticker, float("nan"))
                     qty     = int(alloc_rs / price) if price and price > 0 else "—"
                     rows.append({
-                        "Ticker":            ticker.replace(".NS",""),
-                        "Company":           company,
-                        "Sector":            sector,
-                        "Stock Price (₹)":   f"{price:.2f}" if isinstance(price, float) and price > 0 else "—",
-                        "Quantity":          qty,
-                        "Allocation %":      f"{size_pct:.2f}%",
-                        "Total Invested (₹)":f"₹{alloc_rs:,.0f}",
+                        "Ticker":             ticker.replace(".NS",""),
+                        "Company":            company,
+                        "Sector":             sector,
+                        "Stock Price (₹)":    f"{price:.2f}" if isinstance(price, float) and price > 0 else "—",
+                        "Quantity":           qty,
+                        "Allocation %":       f"{size_pct:.2f}%",
+                        "Total Invested (₹)": f"₹{alloc_rs:,.0f}",
                     })
                 return pd.DataFrame(rows)
 
@@ -1440,11 +1632,10 @@ with tab2:
             st.dataframe(long_table, use_container_width=True, hide_index=True,
                          height=min(50 + len(longs)*38, 500))
 
-        # ── Short book ────────────────────────────────────────────────────
         if not shorts.empty:
             short_tickers = tuple(shorts["Ticker"].tolist())
-            sp_prices = load_prices_on_date(short_tickers, sig_date_str_pb)
-            sp_price_idx = sp_prices.set_index("Ticker")["Adj_Close"] if not sp_prices.empty else pd.Series(dtype=float)
+            sp_prices     = load_prices_on_date(short_tickers, sig_date_str_pb)
+            sp_price_idx  = sp_prices.set_index("Ticker")["Adj_Close"] if not sp_prices.empty else pd.Series(dtype=float)
 
             st.markdown("<div class='section-header'>Short Book</div>", unsafe_allow_html=True)
             short_table = build_book_table(
@@ -1454,11 +1645,11 @@ with tab2:
             st.dataframe(short_table, use_container_width=True, hide_index=True,
                          height=min(50 + len(shorts)*38, 300))
 
-        # ── Rejected candidates ───────────────────────────────────────────
         if not rejected_df.empty:
             st.divider()
             with st.expander(f"Rejected candidates ({len(rejected_df)})", expanded=False):
                 st.dataframe(rejected_df, use_container_width=True, hide_index=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — GRAPHS
@@ -1478,7 +1669,6 @@ with tab4:
             "Google Drive and place it in `exports/model_output/`."
         )
     else:
-        # Identify date and NAV columns
         date_col = next((c for c in nav_df.columns if "date" in c.lower()), nav_df.columns[0])
         nav_col  = next((c for c in nav_df.columns
                          if c != date_col and any(k in c.lower() for k in ("nav","value","portfolio","return"))),
@@ -1488,11 +1678,9 @@ with tab4:
         start_str = nav_df[date_col].min().strftime("%Y-%m-%d")
         end_str   = nav_df[date_col].max().strftime("%Y-%m-%d")
 
-        # Normalise portfolio to base 100
         base          = nav_df[nav_col].iloc[0]
         nav_df["Portfolio_Idx"] = nav_df[nav_col] / base * 100
 
-        # Load Nifty benchmark
         with st.spinner("Fetching Nifty benchmark from yfinance…"):
             nifty_df = load_nifty_index(start_str, end_str)
 
@@ -1507,15 +1695,13 @@ with tab4:
 
         merged = merged.rename(columns={date_col: "Date"})
 
-        # ── Summary return metrics ────────────────────────────────────────
-        port_total_ret = (merged["Portfolio_Idx"].iloc[-1] / 100 - 1) * 100
+        port_total_ret  = (merged["Portfolio_Idx"].iloc[-1] / 100 - 1) * 100
         nifty_total_ret = (merged["Nifty_Idx"].iloc[-1] / 100 - 1) * 100 if merged["Nifty_Idx"].notna().any() else None
-        n_days = (merged["Date"].iloc[-1] - merged["Date"].iloc[0]).days
+        n_days  = (merged["Date"].iloc[-1] - merged["Date"].iloc[0]).days
         n_years = max(n_days / 365.25, 0.001)
-        port_cagr = ((merged["Portfolio_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100
+        port_cagr  = ((merged["Portfolio_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100
         nifty_cagr = ((merged["Nifty_Idx"].iloc[-1] / 100) ** (1 / n_years) - 1) * 100 if nifty_total_ret is not None else None
 
-        # ── Returns chart ─────────────────────────────────────────────────
         st.markdown("<div class='section-header'>Portfolio vs Nifty 500</div>",
                     unsafe_allow_html=True)
 
@@ -1565,7 +1751,6 @@ with tab4:
 
         st.divider()
 
-        # ── Drawdown chart ────────────────────────────────────────────────
         st.markdown("<div class='section-header'>Portfolio Drawdown</div>",
                     unsafe_allow_html=True)
 
@@ -1601,7 +1786,6 @@ with tab4:
 
         st.divider()
 
-        # ── Rolling Sharpe chart ──────────────────────────────────────────
         st.markdown("<div class='section-header'>Rolling Sharpe Ratio (63-Day)</div>",
                     unsafe_allow_html=True)
 
@@ -1613,9 +1797,8 @@ with tab4:
         ) * np.sqrt(252)
         rolling_sharpe  = rolling_sharpe.reindex(merged.index)
 
-        # Drop leading NaN so chart starts flush with first valid Sharpe value
-        _first_valid    = rolling_sharpe.first_valid_index()
-        _rs_dates       = merged["Date"]
+        _first_valid = rolling_sharpe.first_valid_index()
+        _rs_dates    = merged["Date"]
         if _first_valid is not None:
             _rs_mask    = merged.index >= _first_valid
             _rs_dates   = merged.loc[_rs_mask, "Date"]
@@ -1645,6 +1828,7 @@ with tab4:
         )
         st.plotly_chart(fig_rs, use_container_width=True)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — RETURNS & FEES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1659,7 +1843,6 @@ with tab6:
         stcg_rate, ltcg_rate = _tax_rates(signal_date)
         budget_label = "Post-Budget 2024" if pd.Timestamp(signal_date) >= _BUDGET_2024_CUTOFF else "Pre-Budget 2024"
 
-        # ── Capital deployment summary ────────────────────────────────────
         longs_rf  = proposed_df[proposed_df["Direction"] == "LONG"]
         shorts_rf = proposed_df[proposed_df["Direction"] == "SHORT"]
 
@@ -1668,32 +1851,26 @@ with tab6:
         short_deployed_rs  = shorts_rf["Alloc_Rs"].sum()
         cash_remaining_rs  = nav_input - total_deployed_rs
 
-        # Transaction costs on entry (buy-side for longs, sell-side for shorts)
-        cost_rate = _TOTAL_COST_BPS / 10000
+        cost_rate      = _TOTAL_COST_BPS / 10000
         entry_costs_rs = total_deployed_rs * cost_rate
-        # Exit costs assumed same rate on exit (round-trip = 2×)
         exit_costs_rs  = total_deployed_rs * cost_rate
         total_costs_rs = entry_costs_rs + exit_costs_rs
 
         st.markdown("<div class='section-header'>Capital Summary</div>", unsafe_allow_html=True)
         cs1, cs2, cs3, cs4, cs5 = st.columns(5)
-        _mk(cs1, "Total NAV",      f"₹{nav_input:,.0f}",         "#c9d1d9")
-        _mk(cs2, "Total Deployed", f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
-        _mk(cs3, "Long Book",      f"₹{long_deployed_rs:,.0f}",  "#3fb950")
-        _mk(cs4, "Short Book",     f"₹{short_deployed_rs:,.0f}", "#f85149")
-        _mk(cs5, "Cash Remaining", f"₹{cash_remaining_rs:,.0f}", "#ffffff")
+        _mk(cs1, "Available Cash",  f"₹{nav_input:,.0f}",         "#c9d1d9")
+        _mk(cs2, "Total Deployed",  f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
+        _mk(cs3, "Long Book",       f"₹{long_deployed_rs:,.0f}",  "#3fb950")
+        _mk(cs4, "Short Book",      f"₹{short_deployed_rs:,.0f}", "#f85149")
+        _mk(cs5, "Cash Remaining",  f"₹{cash_remaining_rs:,.0f}", "#ffffff")
 
         st.divider()
 
-        # ── Expected returns per position ─────────────────────────────────
-        # _has_calib must be defined before the description markdown references it
         _has_calib = "Projected_Return_21d" in signals_today.columns
 
         st.markdown("<div class='section-header'>Expected Returns & Tax per Position</div>",
                     unsafe_allow_html=True)
 
-        # Merge calibrated returns onto proposed_df via bare ticker (no .NS)
-        # Drop any stale calib columns first to prevent _x/_y suffix on re-renders
         _calib_data_cols = ["Projected_Return_21d", "Projected_Return_252d",
                             "Band_Low_21d", "Band_High_21d"]
         proposed_df = proposed_df.drop(
@@ -1705,7 +1882,6 @@ with tab6:
             _sig_latest_calib = signals_today[
                 signals_today["Date"] == signals_today["Date"].max()
             ][_calib_cols].copy()
-            # Normalise to bare ticker on both sides for reliable join
             _sig_latest_calib["_Ticker_bare"] = _sig_latest_calib["Ticker"].str.replace(
                 r"\.NS$", "", regex=True
             )
@@ -1720,25 +1896,18 @@ with tab6:
             proposed_df = proposed_df.merge(_sig_latest_calib, on="_Ticker_bare", how="left")
             proposed_df = proposed_df.drop(columns=["_Ticker_bare"], errors="ignore")
 
-        # Always (re-)merge Final_Rank from signals_today to ensure distinct per-ticker values.
-        # The optimizer may store rounded ranks; signals_today has the raw per-ticker values.
-        # NOTE: Ticker format must be normalised before merging (.NS suffix may differ between
-        #       proposed_df (always .NS) and signals_today (may or may not have .NS).
         if "Final_Rank" in signals_today.columns:
             _sig_latest = signals_today[signals_today["Date"] == signals_today["Date"].max()].copy()
-            # Normalise both sides to bare ticker (no .NS) for reliable join
             _sig_latest["_Ticker_bare"] = _sig_latest["Ticker"].str.replace(r"\.NS$", "", regex=True)
             _sig_latest_ranks = (
                 _sig_latest[["_Ticker_bare", "Final_Rank"]]
                 .drop_duplicates("_Ticker_bare")
             )
-            # Keep original Final_Rank from optimizer as fallback (already distinct per ticker)
             _orig_ranks = proposed_df[["Ticker", "Final_Rank"]].copy() if "Final_Rank" in proposed_df.columns else None
             proposed_df["_Ticker_bare"] = proposed_df["Ticker"].str.replace(r"\.NS$", "", regex=True)
             proposed_df = proposed_df.drop(columns=["Final_Rank"], errors="ignore")
             proposed_df = proposed_df.merge(_sig_latest_ranks, on="_Ticker_bare", how="left")
             proposed_df = proposed_df.drop(columns=["_Ticker_bare"], errors="ignore")
-            # If re-merge failed (all NaN), fall back to optimizer's own per-ticker ranks
             if proposed_df["Final_Rank"].isna().all() and _orig_ranks is not None:
                 proposed_df = proposed_df.merge(_orig_ranks, on="Ticker", how="left")
             proposed_df["Final_Rank"] = proposed_df["Final_Rank"].fillna(0.5)
@@ -1750,7 +1919,6 @@ with tab6:
             rank       = float(row.get("Final_Rank", 0.5))
             is_midcap  = bool(row.get("is_midcap", False))
 
-            # Hold period and tax classification
             if direction == "LONG":
                 hold_months  = 9 if is_midcap else 12
                 is_long_term = not is_midcap
@@ -1760,24 +1928,18 @@ with tab6:
                 is_long_term = False
                 hold_label   = "4 mo (STCG)"
 
-            # Use calibrated return if available, else fall back to formula
             proj_21d = row.get("Projected_Return_21d", float("nan"))
             if _has_calib and pd.notna(proj_21d):
-                # Calibrated: proj_21d is a 21-trading-day fractional return
-                # Annualise: 252 / 21 = 12 periods per year
                 ann_ret        = float(proj_21d) * (252 / 21) * 100
-                # Period return: scale annual down to hold period (months out of 12)
                 exp_ret_period = ann_ret * hold_months / 12
-                # Cap at reasonable bounds
                 ann_ret        = max(-50.0, min(ann_ret, 100.0))
                 exp_ret_period = max(-50.0, min(exp_ret_period, 100.0))
                 source_label   = "calibrated"
             else:
-                # Formula fallback (pre-calibration): Final_Rank × 30% max annual return proxy
                 if direction == "LONG":
-                    ann_ret = rank * 30.0   # rank 1.0 → 30%, rank 0.5 → 15%, rank 0.0 → 0%
+                    ann_ret = rank * 30.0
                 else:
-                    ann_ret = (1.0 - rank) * 30.0   # inverse for shorts
+                    ann_ret = (1.0 - rank) * 30.0
                 exp_ret_period = ann_ret / 12 * hold_months
                 source_label   = "formula"
 
@@ -1785,23 +1947,22 @@ with tab6:
             applicable_rate = ltcg_rate if is_long_term else stcg_rate
             taxable_gain    = max(0, gross_gain_rs - (_LTCG_EXEMPTION_INR if is_long_term else 0))
             tax_rs          = taxable_gain * applicable_rate
-            net_gain_rs     = gross_gain_rs - tax_rs   # Net = Gross - Tax
+            net_gain_rs     = gross_gain_rs - tax_rs
 
             ret_rows.append({
-                "Ticker":              row["Ticker"].replace(".NS",""),
-                "Direction":           direction,
-                "Sector":              row.get("Sector","—"),
-                "Hold Period":         hold_label,
-                "Deployed (₹)":       f"₹{alloc_rs:,.0f}",
+                "Ticker":                  row["Ticker"].replace(".NS",""),
+                "Direction":               direction,
+                "Sector":                  row.get("Sector","—"),
+                "Hold Period":             hold_label,
+                "Deployed (₹)":            f"₹{alloc_rs:,.0f}",
                 "Gross Expected Gain (₹)": f"₹{gross_gain_rs:,.0f}",
-                "Tax Rate":            f"{applicable_rate:.0%}",
-                "Tax (₹)":             f"₹{tax_rs:,.0f}",
-                "Net Gain (₹)":        f"₹{net_gain_rs:,.0f}",
+                "Tax Rate":                f"{applicable_rate:.0%}",
+                "Tax (₹)":                 f"₹{tax_rs:,.0f}",
+                "Net Gain (₹)":            f"₹{net_gain_rs:,.0f}",
             })
 
         ret_df = pd.DataFrame(ret_rows)
 
-        # ── Fill projected performance block (defined above capital summary) ──
         if total_deployed_rs > 0 and ret_rows:
             _gross_gain_sum = sum(
                 float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
@@ -1809,7 +1970,7 @@ with tab6:
             _tax_sum = sum(
                 float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
             )
-            _tc_sum = total_deployed_rs * 2 * (_TOTAL_COST_BPS / 10000)
+            _tc_sum      = total_deployed_rs * 2 * (_TOTAL_COST_BPS / 10000)
             _exp_ret_pct = (_gross_gain_sum / total_deployed_rs) * 100
             _abs_ret_pct = ((_gross_gain_sum - _tax_sum - _tc_sum) / total_deployed_rs) * 100
             _exp_color   = "#3fb950" if _exp_ret_pct >= 0 else "#f85149"
@@ -1836,8 +1997,6 @@ with tab6:
 
         st.divider()
 
-        # ── Portfolio-level summary ────────────────────────────────────────
-        # Compute total_fees_rs for summary and waterfall (no display section)
         total_fees_rs = sum([
             total_deployed_rs * 2 * (_STT_BPS / 10000),
             total_deployed_rs * 2 * (_BROKERAGE_BPS / 10000),
@@ -1851,52 +2010,43 @@ with tab6:
         total_gross_gain = sum(
             float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
-        total_tax        = sum(
+        total_tax = sum(
             float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
-        total_net        = sum(
+        total_net = sum(
             float(r["Net Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
 
-        def _cm(col, label, value, color):
-            _mk(col, label, value, color)
-
         ps1, ps2, ps3, ps4, ps5 = st.columns(5)
-        _mk(ps1, "Total Deployed",         f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
-        _mk(ps2, "Gross Expected Gain",    f"₹{total_gross_gain:,.0f}",  "#3fb950")
-        _mk(ps3, "Total Transaction Costs",f"₹{total_fees_rs:,.0f}",     "#f85149")
-        _mk(ps4, "Total Tax (Projected)",  f"₹{total_tax:,.0f}",         "#f85149")
-        _mk(ps5, "Net Expected Gain",      f"₹{total_net:,.0f}",         "#3fb950")
+        _mk(ps1, "Total Deployed",          f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
+        _mk(ps2, "Gross Expected Gain",     f"₹{total_gross_gain:,.0f}",  "#3fb950")
+        _mk(ps3, "Total Transaction Costs", f"₹{total_fees_rs:,.0f}",     "#f85149")
+        _mk(ps4, "Total Tax (Projected)",   f"₹{total_tax:,.0f}",         "#f85149")
+        _mk(ps5, "Net Expected Gain",       f"₹{total_net:,.0f}",         "#3fb950")
 
-        # ── Waterfall chart: NAV → Deployed → Costs → Tax → Net ──────────
         st.markdown("<div class='section-header'>Capital Waterfall</div>",
                     unsafe_allow_html=True)
 
-        # Waterfall: Starting NAV → Cash Held → Gross Gain → Costs → Tax → Final NAV
-        # cash_held = undeployed cash sitting aside (not put to work)
         cash_held = cash_remaining_rs
-        final_nav = nav_input - cash_held + total_gross_gain - total_fees_rs - total_tax + cash_held
-        # Simplified: final_nav = nav_input + net_gain
         final_nav = nav_input + total_net
 
-        wf_labels  = ["Starting NAV", "Cash Held", "Gross Gain",
-                      "Transaction Costs", "Tax", "Final NAV"]
-        wf_measures= ["absolute", "relative", "relative", "relative", "relative", "total"]
-        wf_values  = [
-            nav_input,           # absolute start
-            -cash_remaining_rs,  # cash held aside (reduces deployable)
-            total_gross_gain,    # expected gains from deployed capital
-            -total_fees_rs,      # transaction costs
-            -total_tax,          # projected tax
-            final_nav,           # total bar
-        ]
-
-        # Format y-axis tick labels in Cr/L for readability
         def _fmt_inr(v):
             a = abs(v)
             if a >= 1e7: return f"₹{v/1e7:.1f}Cr"
             if a >= 1e5: return f"₹{v/1e5:.1f}L"
             return f"₹{v:,.0f}"
+
+        wf_labels   = ["Available Cash", "Cash Held", "Gross Gain",
+                       "Transaction Costs", "Tax", "Final NAV"]
+        wf_measures = ["absolute", "relative", "relative", "relative", "relative", "total"]
+        wf_values   = [
+            nav_input,
+            -cash_remaining_rs,
+            total_gross_gain,
+            -total_fees_rs,
+            -total_tax,
+            final_nav,
+        ]
 
         fig_wf = go.Figure(go.Waterfall(
             name="Capital", orientation="v",
@@ -1930,7 +2080,6 @@ with tab6:
             ),
             showlegend=False,
         )
-        # Add zero baseline
         fig_wf.add_hline(y=0, line=dict(color="#30363d", width=1))
         st.plotly_chart(fig_wf, use_container_width=True)
 
