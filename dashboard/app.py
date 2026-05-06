@@ -84,7 +84,7 @@ except Exception as e:
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Hedge Fund Simulator v2",
+    page_title="AlphaEngine",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -642,7 +642,7 @@ def persist_portfolio(
                 "SELECT COUNT(*) FROM portfolio_positions "
                 "WHERE Signal_Date = :sd AND Status = 'open'"
             ), {"sd": sig_date_str}).scalar()
-            if already and already > 0:
+            if already and already >= len(proposed_df) * 0.8:
                 return f"skipped — signal date {sig_date_str} already committed ({already} positions)"
 
             # ── Load all open positions with current prices ───────────────
@@ -881,10 +881,11 @@ def persist_portfolio(
 with st.sidebar:
     st.markdown("""
     <div style='padding:16px 0 8px 0'>
-      <div style='font-family:monospace;font-size:1.1rem;color:#58a6ff;font-weight:700;
-                  letter-spacing:0.04em'>AI HEDGE FUND</div>
+      <div style='font-family:"Georgia","Times New Roman",serif;font-weight:700;letter-spacing:0.02em'>
+        <span style='font-size:1.4rem;color:#ffffff;font-weight:900'>A</span><span style='font-size:1.1rem;color:#ffffff;font-weight:700'>LPHA</span><span style='font-size:1.4rem;color:#c9d1d9;font-weight:900'>E</span><span style='font-size:1.1rem;color:#c9d1d9;font-weight:700'>NGINE</span>
+      </div>
       <div style='font-family:monospace;font-size:0.65rem;color:#8b949e;
-                  letter-spacing:0.14em;text-transform:uppercase'>Simulator v2 · NSE Nifty 500</div>
+                  letter-spacing:0.14em;text-transform:uppercase'>AI Hedge Fund Simulator</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -905,14 +906,20 @@ with st.sidebar:
     )
 
     with st.expander("＋ / − Cash", expanded=False):
-        _cash_amt = st.number_input(
-            "Amount (₹)", min_value=0, max_value=10_000_000_000,
-            value=1_000_000, step=500_000, format="%d",
+        # NEW
+        _cash_amt_raw = st.text_input(
+            "Amount (₹)", value="", placeholder="e.g. 10000000",
             label_visibility="collapsed"
         )
+        try:
+            _cash_amt = int(float(_cash_amt_raw.replace(",", "").strip())) if _cash_amt_raw.strip() else 0
+        except ValueError:
+            _cash_amt = 0
+            st.caption("Enter a valid number")
+       # NEW
         _cash_note = st.text_input(
             "Note (optional)", value="", label_visibility="collapsed",
-            placeholder="e.g. capital infusion Q2"
+            placeholder="e.g. Depositing Q2 Profits"
         )
         _c1, _c2 = st.columns(2)
         if _c1.button("Deposit", use_container_width=True):
@@ -1128,12 +1135,16 @@ with _h1:
     st.markdown(
         "<div style='display:flex;align-items:center;gap:20px;margin-top:28px'>"
         "<div style='display:flex;flex-direction:column;gap:2px'>"
-        "<h2 style='font-family:monospace;font-size:1.3rem;color:#c9d1d9;"
-        "margin:0;padding:0;font-weight:600;white-space:nowrap'>"
-        "AI HEDGE FUND SIMULATOR</h2>"
+        "<h2 style='font-family:\"Georgia\",\"Times New Roman\",serif;margin:0;padding:0;"
+        "white-space:nowrap;font-weight:700;letter-spacing:0.02em'>"
+        "<span style='font-size:1.8rem;color:#ffffff;font-weight:900'>A</span>"
+        "<span style='font-size:1.4rem;color:#ffffff;font-weight:700'>LPHA</span>"
+        "<span style='font-size:1.8rem;color:#c9d1d9;font-weight:900'>E</span>"
+        "<span style='font-size:1.4rem;color:#c9d1d9;font-weight:700'>NGINE</span>"
+        "</h2>"
         "<div style='font-family:monospace;font-size:0.68rem;color:#8b949e;"
         "text-transform:uppercase;letter-spacing:0.1em;margin:0;white-space:nowrap'>"
-        "NSE Nifty 500 · Long/Short Equity · v2</div>"
+        "AI-Powered Hedge Fund Simulator</div>"
         "</div>"
         "<div style='display:flex;flex-direction:column;align-items:center;gap:2px'>"
         "<span style='font-family:monospace;font-size:0.85rem;color:#8b949e;"
