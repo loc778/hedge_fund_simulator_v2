@@ -123,8 +123,8 @@ Raw Market Data → Feature Engineering → ML Models → Ensemble Signals → P
 │  market_regimes (Table)     │──▶│   features_master (Table)   |
 │  hmm_model.pkl              │    │   features_master.parquet   |
 └─────────────────────────────┘    └─────────────────────────────┘
-              │                             |
-              └──────────────┬──────────────┘
+                                            |
+                             ┬──────────────┘
                              │
               ┌──────────────┴──────────────────────────────┐
               │                                             │
