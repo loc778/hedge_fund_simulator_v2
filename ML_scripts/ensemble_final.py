@@ -83,18 +83,13 @@ MODELS_DIR   = os.path.join(BASE_DIR, 'ML_models')
 RESULTS_DIR  = os.path.join(BASE_DIR, 'exports', 'model_output')
 PARQUET_PATH = os.path.join(BASE_DIR, 'exports', 'features_master_latest.parquet')
 
-PRICES_CSV         = os.path.join(BASE_DIR, 'exports', 'backtest_prices.csv')
-MARKET_REGIMES_CSV = os.path.join(BASE_DIR, 'exports', 'market_regimes.csv')
-FO_LIST_CSV        = os.path.join(BASE_DIR, 'files', 'fo_list.csv')
-
 sys.path.insert(0, os.path.join(BASE_DIR, 'data'))
+from db import get_engine
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 DATE_STAMP = datetime.today().strftime('%Y%m%d')
 print(f"Date stamp     : {DATE_STAMP}")
 print(f"Parquet exists : {os.path.exists(PARQUET_PATH)}")
-print(f"Prices exists  : {os.path.exists(PRICES_CSV)}")
-print(f"Regimes exists : {os.path.exists(MARKET_REGIMES_CSV)}")
 
 
 # =============================================================================
@@ -293,8 +288,12 @@ print(f"Holdout rows : {len(df_full[df_full[DATE_COL] >= holdout_start_dt]):,}")
 print(f"Tickers      : {df_full[TICKER_COL].nunique()}")
 print(f"Date range   : {df_full[DATE_COL].min().date()} -> {df_full[DATE_COL].max().date()}")
 
-print("\nLoading market regimes from CSV ...")
-regimes_all = pd.read_csv(MARKET_REGIMES_CSV)
+print("\nLoading market regimes from DB ...")
+engine = get_engine()
+regimes_all = pd.read_sql(
+    "SELECT Date, Regime_Label FROM market_regimes ORDER BY Date",
+    engine
+)
 regimes_all['Date'] = pd.to_datetime(regimes_all['Date'])
 regimes_df  = regimes_all[regimes_all['Date'] >= holdout_start_dt].copy()
 regimes_df  = regimes_df.sort_values('Date').reset_index(drop=True)
@@ -520,7 +519,7 @@ print(f"Price range : {prices[DATE_COL].min().date()} -> {prices[DATE_COL].max()
 dr = prices['Daily_Ret'].dropna()
 print(f"Daily ret   : mean={dr.mean()*100:.3f}%  std={dr.std()*100:.3f}%")
 
-fo_df = pd.read_csv(FO_LIST_CSV)
+fo_df = pd.read_csv(os.path.join(BASE_DIR, 'files', 'fo_list.csv'))
 fo_df.columns   = fo_df.columns.str.strip()
 fo_df['SYMBOL'] = fo_df['SYMBOL'].str.strip()
 FO_TICKERS      = set(fo_df['SYMBOL'].dropna().str.strip())
