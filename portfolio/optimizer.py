@@ -183,7 +183,12 @@ def _compute_sizes(
         return pd.Series(dtype=float)
 
     # Rank-conviction-weighted inverse-vol sizing
-    inv_vol = 1.0 / candidates["ATR_pct"].clip(lower=0.005)
+    # Blend: 50% ATR-based vol, 50% LSTM vol (fall back to ATR if LSTM missing)
+    atr_vol = candidates["ATR_pct"]
+    lstm_vol = candidates["LSTM_Vol"].fillna(atr_vol)  # fallback to ATR if NaN
+
+    eff_vol = 0.5 * atr_vol + 0.5 * lstm_vol
+    inv_vol = 1.0 / eff_vol.clip(lower=0.005)
 
     if "Final_Rank" in candidates.columns:
         if direction == "long":
