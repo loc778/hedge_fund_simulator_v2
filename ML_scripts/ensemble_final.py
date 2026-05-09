@@ -1,5 +1,5 @@
 # =============================================================================
-# AI Hedge Fund Simulator — Ensemble 
+# AI Hedge Fund Simulator — Ensemble v3 (LSTM Head 1 integrated)
 # Local PC version — no Google Drive / Colab dependencies
 # =============================================================================
 
@@ -98,7 +98,7 @@ print(f"Parquet exists : {os.path.exists(PARQUET_PATH)}")
 
 HOLDOUT_START = '2024-01-01'
 TRAIN_END     = '2023-12-31'
-BACKTEST_END  = '2026-04-30'
+BACKTEST_END  = '2026-04-30'  # hard date — reproducible benchmark
 
 XGB_PATTERN          = 'xgboost_v*.pkl'
 LGB_PATTERN          = 'lightgbm_v*.pkl'
@@ -176,6 +176,7 @@ print(f"  Cash floor      : {CASH_FLOOR_ENH*100:.0f}%")
 print(f"  Position cap L  : {POS_CAP_LARGE*100:.0f}%")
 print(f"  Stop-loss       : {STOP_LOSS_ENH*100:.0f}%")
 print(f"  Bull deploy     : {REGIME_DEPLOY_ENH[0]*100:.0f}%")
+print(f"  Backtest end    : {BACKTEST_END}  (hard date)")
 
 
 # =============================================================================
@@ -554,16 +555,28 @@ def compute_metrics(nav_df, rf_rate=0.065):
     max_dd    = dd.min()
     calmar    = cagr / abs(max_dd) if max_dd != 0 else 0
     win_rate  = (rets > 0).mean()
+
+    # True intra-day max drawdown from position-level tracking (if available)
+    true_max_dd_str = "N/A"
+    if 'True_DD' in nav_df.columns:
+        true_max_dd = nav_df['True_DD'].min()
+        true_max_dd_str = f"{true_max_dd*100:.2f}%"
+        true_calmar = cagr / abs(true_max_dd) if true_max_dd != 0 else 0
+    else:
+        true_calmar = calmar
+
     return {
-        'Period'        : f"{nav_df.index[0].date()} -> {nav_df.index[-1].date()}",
-        'Total Return'  : f"{total_ret*100:.2f}%",
-        'CAGR'          : f"{cagr*100:.2f}%",
-        'Ann Volatility': f"{vol_ann*100:.2f}%",
-        'Sharpe Ratio'  : f"{sharpe:.3f}",
-        'Max Drawdown'  : f"{max_dd*100:.2f}%",
-        'Calmar Ratio'  : f"{calmar:.3f}",
-        'Win Rate'      : f"{win_rate*100:.2f}%",
-        'Trading Days'  : n,
+        'Period'           : f"{nav_df.index[0].date()} -> {nav_df.index[-1].date()}",
+        'Total Return'     : f"{total_ret*100:.2f}%",
+        'CAGR'             : f"{cagr*100:.2f}%",
+        'Ann Volatility'   : f"{vol_ann*100:.2f}%",
+        'Sharpe Ratio'     : f"{sharpe:.3f}",
+        'Max Drawdown (NAV)': f"{max_dd*100:.2f}%",
+        'Max Drawdown (True)': true_max_dd_str,
+        'Calmar (NAV)'     : f"{calmar:.3f}",
+        'Calmar (True)'    : f"{true_calmar:.3f}",
+        'Win Rate'         : f"{win_rate*100:.2f}%",
+        'Trading Days'     : n,
     }, rets, dd
 
 print("compute_metrics() defined.")
@@ -659,8 +672,9 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
     signals_df = df_signals_clean.copy().sort_values([DATE_COL, TICKER_COL]).reset_index(drop=True)
     signals_df[DATE_COL] = signals_df[DATE_COL].dt.normalize().dt.tz_localize(None)
 
+    # ── Hard date filter on both ends ────────────────────────────────────────
     holdout_dates = sorted([d for d in daily_ret_pivot.index
-                            if _ts(d) >= _ts(HOLDOUT_START)])
+                            if _ts(HOLDOUT_START) <= _ts(d) <= _ts(BACKTEST_END)])
 
     rank_pivot     = signals_df.pivot_table(
         index=DATE_COL, columns=TICKER_COL, values='Final_Rank', aggfunc='first')
@@ -722,6 +736,17 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
         nav_now  = cash + long_val + short_val
         peak_nav = max(peak_nav, nav_now)
         in_defence = (nav_now / peak_nav) - 1 < DD_DEFENCE_THRESHOLD
+
+        # ── Daily position-level drawdown (true intra-period DD) ─────────────
+        portfolio_dd_now = (nav_now / peak_nav) - 1
+        worst_pos_dd_now = 0.0
+        active_longs = [p for p in positions.values()
+                        if not p['stopped'] and p['direction'] == 'long' and p['high_water'] > 0]
+        if active_longs:
+            worst_pos_dd_now = min(
+                (p['alloc'] + p['pnl']) / p['high_water'] - 1
+                for p in active_longs
+            )
 
         if rebalance:
             last_rebalance_date = ts
@@ -862,7 +887,12 @@ def run_backtest(starting_nav: float, daily_ret_pivot: pd.DataFrame) -> pd.DataF
                         if not p['stopped'] and p['direction'] == 'long')
         short_val = sum(p['alloc'] - p['pnl'] for p in positions.values()
                         if not p['stopped'] and p['direction'] == 'short')
-        nav_series.append({'Date': dt, 'NAV': max(cash + long_val + short_val, 0)})
+        nav_series.append({
+            'Date':         dt,
+            'NAV':          max(cash + long_val + short_val, 0),
+            'True_DD':      portfolio_dd_now,
+            'Worst_Pos_DD': worst_pos_dd_now,
+        })
 
     rlog_df = pd.DataFrame(rebalance_log)
     print(f"\nRebalance log summary ({len(rlog_df)} rebalances):")
@@ -900,7 +930,7 @@ metrics, daily_rets, drawdown = compute_metrics(nav_df)
 print("\n" + "="*55)
 print("BACKTEST PERFORMANCE  (Ensemble v3 — LSTM H1 integrated)")
 print("="*55)
-for k, v in metrics.items(): print(f"  {k:<20} : {v}")
+for k, v in metrics.items(): print(f"  {k:<25} : {v}")
 print("="*55)
 
 nav_df['Year'] = nav_df.index.year
@@ -918,12 +948,68 @@ try:
 except ValueError:
     pass
 
+# ── Drawdown cross-validation ─────────────────────────────────────────────────
+
+print("\n" + "="*55)
+print("DRAWDOWN CROSS-VALIDATION")
+print("="*55)
+
+# 1. True portfolio DD (daily position-level tracking)
+true_max_dd  = nav_df['True_DD'].min()
+worst_pos_dd = nav_df['Worst_Pos_DD'].min()
+print(f"  NAV-series max DD (reported)   : {drawdown.min()*100:.2f}%")
+print(f"  True portfolio max DD (daily)  : {true_max_dd*100:.2f}%")
+print(f"  Worst single-position DD       : {worst_pos_dd*100:.2f}%")
+
+# 2. Nifty 500 benchmark drawdown (same window)
+try:
+    nifty_prices = pd.read_sql(
+        f"SELECT Date, Nifty500_Close FROM macro_indicators "
+        f"WHERE Date BETWEEN '{HOLDOUT_START}' AND '{BACKTEST_END}' "
+        f"AND Nifty500_Close IS NOT NULL ORDER BY Date",
+        engine
+    )
+    nifty_prices['Date']  = pd.to_datetime(nifty_prices['Date'])
+    nifty_nav             = nifty_prices.set_index('Date')['Nifty500_Close']
+    nifty_dd              = (nifty_nav / nifty_nav.cummax() - 1).min()
+    nifty_total_ret       = nifty_nav.iloc[-1] / nifty_nav.iloc[0] - 1
+    print(f"  Nifty 500 total return         : {nifty_total_ret*100:.2f}%")
+    print(f"  Nifty 500 max DD (same window) : {nifty_dd*100:.2f}%")
+except Exception as e:
+    print(f"  Nifty 500 benchmark DD         : skipped ({e})")
+
+# 3. Monte Carlo shuffle — drawdown distribution
+print("\n  Monte Carlo DD stress test (n=1000 shuffles) ...")
+daily_rets_arr   = nav_df['NAV'].pct_change().dropna().values
+simulated_dds    = []
+rng              = np.random.default_rng(seed=42)
+for _ in range(1000):
+    shuffled  = rng.permutation(daily_rets_arr)
+    nav_sim   = np.cumprod(1 + shuffled) * STARTING_NAV
+    dd_sim    = (nav_sim / np.maximum.accumulate(nav_sim) - 1).min()
+    simulated_dds.append(dd_sim)
+simulated_dds = np.array(simulated_dds)
+print(f"  Simulated DD  p5={np.percentile(simulated_dds,5)*100:.2f}%  "
+      f"median={np.median(simulated_dds)*100:.2f}%  "
+      f"p95={np.percentile(simulated_dds,95)*100:.2f}%")
+reported_pctile = (simulated_dds <= drawdown.min()).mean() * 100
+print(f"  Reported NAV DD sits at p{reported_pctile:.0f} of shuffle distribution "
+      f"({'path-dependent luck' if reported_pctile > 80 else 'structurally supported'})")
+print("="*55)
+
+# ── Save results ──────────────────────────────────────────────────────────────
 nav_df.reset_index().to_csv(
     os.path.join(RESULTS_DIR, f'nav_series_{DATE_STAMP}.csv'), index=False)
 with open(os.path.join(RESULTS_DIR, f'metrics_{DATE_STAMP}.txt'), 'w', encoding='utf-8') as f:
     f.write("AI Hedge Fund Simulator v3 — Ensemble (LSTM H1 integrated)\n")
     f.write("="*55 + "\n")
-    for k, v in metrics.items(): f.write(f"  {k:<20} : {v}\n")
+    for k, v in metrics.items(): f.write(f"  {k:<25} : {v}\n")
+    f.write("\nDRAWDOWN CROSS-VALIDATION\n")
+    f.write(f"  NAV-series max DD (reported)   : {drawdown.min()*100:.2f}%\n")
+    f.write(f"  True portfolio max DD (daily)  : {true_max_dd*100:.2f}%\n")
+    f.write(f"  Worst single-position DD       : {worst_pos_dd*100:.2f}%\n")
+    f.write(f"  Monte Carlo DD median          : {np.median(simulated_dds)*100:.2f}%\n")
+    f.write(f"  Reported DD percentile (shuffle): p{reported_pctile:.0f}\n")
 print(f"Saved results -> {RESULTS_DIR}")
 
 
@@ -970,4 +1056,4 @@ if ENABLE_TUNING:
     nav_best     = run_backtest(STARTING_NAV, daily_ret_pivot)
     m_best, _, _ = compute_metrics(nav_best)
     print("\n" + "="*55 + "\nTUNED BACKTEST PERFORMANCE\n" + "="*55)
-    for k, v in m_best.items(): print(f"  {k:<20} : {v}")
+    for k, v in m_best.items(): print(f"  {k:<25} : {v}")
