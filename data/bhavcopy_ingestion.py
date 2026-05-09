@@ -19,6 +19,8 @@ import yfinance as yf
 import time
 import bisect
 import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
 
@@ -41,9 +43,21 @@ HEADERS = {
     "Referer"         : "https://www.nseindia.com/",
 }
 
-# NSE Session (required — NSE uses cookies for bot detection)
-session = requests.Session()
-session.headers.update(HEADERS)
+# ── Thread-local sessions — each worker gets its own requests.Session ─
+# Avoids cookie/state collisions across concurrent threads
+_thread_local = threading.local()
+
+def _get_session() -> requests.Session:
+    if not hasattr(_thread_local, 'session'):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        try:
+            s.get("https://www.nseindia.com", timeout=15)
+            time.sleep(1)
+        except Exception:
+            pass
+        _thread_local.session = s
+    return _thread_local.session
 
 # ── Ticker Set for Fast Lookup ────────────────────────────────────────
 # Convert TICKERS list to set of base symbols (without .NS) for bhavcopy matching
@@ -170,11 +184,12 @@ def parse_bhavcopy_df(raw_df: pd.DataFrame, d: date) -> pd.DataFrame | None:
 
 def download_bhavcopy(d: date, retries: int = 3) -> pd.DataFrame | None:
     urls = build_bhavcopy_urls(d)
+    sess = _get_session()
 
     for url in urls:
         for attempt in range(1, retries + 1):
             try:
-                response = session.get(url, timeout=30)
+                response = sess.get(url, timeout=30)
 
                 if response.status_code == 404:
                     break   # This URL doesn't have this date — try next URL
@@ -413,7 +428,50 @@ def verify_ingestion(all_days: list):
 
 
 # ═══════════════════════════════════════════════════════════
-# SECTION 6 — MAIN INGESTION LOOP
+# SECTION 6 — VECTORIZED ROW BUILDER
+# ═══════════════════════════════════════════════════════════
+
+def build_rows_from_df(raw_df: pd.DataFrame, d: date, adj_factors: dict) -> list:
+    """
+    Vectorized replacement for the iterrows() row-building loop.
+    Operates on the already-filtered bhavcopy DataFrame for a single day.
+    """
+    df = raw_df.copy()
+
+    # Coerce numeric columns
+    for col in ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df = df.dropna(subset=['CLOSE'])
+
+    # Adj_Close via vectorized lookup
+    def _adj(row):
+        return get_adj_close(row['Ticker'], row['CLOSE'], d, adj_factors)
+
+    df['Adj_Close']     = df.apply(_adj, axis=1)
+    df['HIGH']          = df['HIGH'].fillna(df['CLOSE'])
+    df['LOW']           = df['LOW'].fillna(df['CLOSE'])
+    df['Typical_Price'] = ((df['HIGH'] + df['LOW'] + df['CLOSE']) / 3).round(4)
+
+    result = pd.DataFrame({
+        'Date'         : d,
+        'Ticker'       : df['Ticker'],
+        'Open'         : df['OPEN'].round(4) if 'OPEN' in df.columns else None,
+        'High'         : df['HIGH'].round(4),
+        'Low'          : df['LOW'].round(4),
+        'Close'        : df['CLOSE'].round(4),
+        'Adj_Close'    : df['Adj_Close'],
+        'Volume'       : df['VOLUME'].where(df['VOLUME'].notna(), other=None).astype('Int64') if 'VOLUME' in df.columns else None,
+        'Typical_Price': df['Typical_Price'],
+        'VWAP_Daily'   : df['Typical_Price'],
+    })
+
+    return result.to_dict('records')
+
+
+# ═══════════════════════════════════════════════════════════
+# SECTION 7 — MAIN INGESTION LOOP
 # ═══════════════════════════════════════════════════════════
 
 def main():
@@ -454,88 +512,59 @@ def main():
     # ── Step 3: Build adjustment factors from splits ──────────────────
     adj_factors = build_adjustment_factors_from_splits()
 
-    # ── Step 4: Download bhavcopy day by day ─────────────────────────
-    print(f"\n📥 Downloading {len(pending_days):,} bhavcopy files...\n")
+    # ── Step 4: Concurrent bhavcopy download ─────────────────────────
+    WORKERS    = 4      # Conservative — NSE archive handles this without blocking
+    SAVE_EVERY = 50     # Flush to DB every 50 days worth of rows
 
-    batch_buffer = []
-    SAVE_EVERY   = 50
+    print(f"\n📥 Downloading {len(pending_days):,} bhavcopy files "
+          f"({WORKERS} workers)...\n")
 
+    batch_buffer  = []
+    batch_lock    = threading.Lock()
+    counters_lock = threading.Lock()
     success_count = 0
     skip_count    = 0
     fail_count    = 0
+    completed     = 0
+    total         = len(pending_days)
 
-    # Refresh NSE session cookie upfront
-    try:
-        session.get("https://www.nseindia.com", timeout=15)
-        time.sleep(2)
-    except Exception:
-        pass
-
-    for idx, d in enumerate(pending_days, 1):
-        if idx % 100 == 0 or idx == 1:
-            pct = idx / len(pending_days) * 100
-            print(f"  Progress: {idx:,}/{len(pending_days):,} ({pct:.1f}%) "
-                  f"| ✅ {success_count} | ⏭️  {skip_count} | ❌ {fail_count}")
-
-        # Refresh NSE session cookie every 20 requests
-        # NSE cookies expire quickly — without this, requests return empty/blocked
-        if idx % 20 == 0:
-            try:
-                session.get("https://www.nseindia.com", timeout=15)
-                time.sleep(1)
-            except Exception:
-                pass
-
+    def process_day(d: date):
         raw_df = download_bhavcopy(d)
-
         if raw_df is None or raw_df.empty:
-            skip_count += 1
-            continue
+            return d, None
+        rows = build_rows_from_df(raw_df, d, adj_factors)
+        time.sleep(0.2)   # Reduced from 0.5 — sufficient for NSE archive
+        return d, rows
 
-        rows = []
-        for _, row in raw_df.iterrows():
-            ticker    = row['Ticker']
-            raw_close = float(row['CLOSE']) if pd.notna(row['CLOSE']) else None
-            if raw_close is None:
-                continue
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(process_day, d): d for d in pending_days}
 
-            adj_close     = get_adj_close(ticker, raw_close, d, adj_factors)
-            high          = float(row['HIGH']) if pd.notna(row.get('HIGH')) else raw_close
-            low           = float(row['LOW'])  if pd.notna(row.get('LOW'))  else raw_close
-            typical_price = round((high + low + raw_close) / 3, 4)
+        for future in as_completed(futures):
+            completed += 1
+            d, rows = future.result()
 
-            rows.append({
-                'Date'          : d,
-                'Ticker'        : ticker,
-                'Open'          : round(float(row['OPEN']), 4) if pd.notna(row.get('OPEN')) else None,
-                'High'          : round(high, 4),
-                'Low'           : round(low, 4),
-                'Close'         : round(raw_close, 4),
-                'Adj_Close'     : adj_close,
-                'Volume'        : int(row['VOLUME']) if pd.notna(row.get('VOLUME')) else None,
-                'Typical_Price' : typical_price,
-                'VWAP_Daily'    : typical_price,
-            })
+            with counters_lock:
+                if rows:
+                    success_count += 1
+                else:
+                    skip_count += 1
 
-        if rows:
-            batch_buffer.extend(rows)
-            success_count += 1
+            if completed % 100 == 0 or completed == 1:
+                pct = completed / total * 100
+                print(f"  Progress: {completed:,}/{total:,} ({pct:.1f}%) "
+                      f"| ✅ {success_count} | ⏭️  {skip_count} | ❌ {fail_count}")
 
-        if len(batch_buffer) >= SAVE_EVERY * len(TICKERS):
-            batch_df = pd.DataFrame(batch_buffer)
-            save_to_db(batch_df, TABLES['ohlcv'], engine)
-            batch_buffer = []
+            if rows:
+                with batch_lock:
+                    batch_buffer.extend(rows)
+                    if len(batch_buffer) >= SAVE_EVERY * len(TICKERS):
+                        batch_df = pd.DataFrame(batch_buffer)
+                        save_to_db(batch_df, TABLES['ohlcv'], engine)
+                        batch_buffer.clear()
 
-        time.sleep(0.5)
-
-        if idx % 200 == 0:
-            print(f"  ⏸️  Pausing 15s to avoid NSE rate limiting...")
-            time.sleep(15)
-
-    # Save any remaining rows after loop ends
+    # Save any remaining rows after pool closes
     if batch_buffer:
-        batch_df = pd.DataFrame(batch_buffer)
-        save_to_db(batch_df, TABLES['ohlcv'], engine)
+        save_to_db(pd.DataFrame(batch_buffer), TABLES['ohlcv'], engine)
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"""

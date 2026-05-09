@@ -1,5 +1,5 @@
 # =============================================================================
-# AI Hedge Fund Simulator — Ensemble v3 (LSTM Head 1 integrated)
+# AI Hedge Fund Simulator — Ensemble 
 # Local PC version — no Google Drive / Colab dependencies
 # =============================================================================
 
@@ -98,7 +98,7 @@ print(f"Parquet exists : {os.path.exists(PARQUET_PATH)}")
 
 HOLDOUT_START = '2024-01-01'
 TRAIN_END     = '2023-12-31'
-BACKTEST_END  = datetime.today().strftime('%Y-%m-%d')
+BACKTEST_END  = '2026-04-30'
 
 XGB_PATTERN          = 'xgboost_v*.pkl'
 LGB_PATTERN          = 'lightgbm_v*.pkl'
@@ -505,7 +505,7 @@ print(f"  Unique signal dates: {df_signals_clean[DATE_COL].nunique()}")
 print("\nLoading backtest prices from DB ...")
 engine = get_engine()
 prices = pd.read_sql(
-    "SELECT Ticker, Date, Adj_Close FROM nifty500_ohlcv ORDER BY Ticker, Date",
+    f"SELECT Ticker, Date, Adj_Close FROM nifty500_ohlcv WHERE Date <= '{BACKTEST_END}' ORDER BY Ticker, Date",
     engine
 )
 prices[DATE_COL]    = pd.to_datetime(prices[DATE_COL])
