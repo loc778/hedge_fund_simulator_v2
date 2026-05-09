@@ -1778,7 +1778,7 @@ with tab4:
 
         st.divider()
 
-        st.markdown("<div class='section-header'>Portfolio Drawdown</div>",
+        st.markdown("<div class='section-header'>Portfolio vs Nifty Drawdown</div>",
                     unsafe_allow_html=True)
 
         port_series = merged["Portfolio_Idx"]
@@ -1787,23 +1787,43 @@ with tab4:
         max_dd      = drawdown.min()
         max_dd_date = merged["Date"].iloc[drawdown.idxmin()]
 
-        _dd_l, dd_metric1, dd_metric2, _dd_r = st.columns([1, 1, 1, 1])
-        _mk(dd_metric1, "Max Drawdown", f"{max_dd:.2f}%", "#f85149")
-        _mk(dd_metric2, "Max DD Date",  max_dd_date.strftime("%d %b %Y"), "#c9d1d9")
+        _has_nifty_dd = merged["Nifty_Idx"].notna().any()
+        if _has_nifty_dd:
+            nifty_series     = merged["Nifty_Idx"].fillna(method="ffill")
+            nifty_rolling_max = nifty_series.cummax()
+            nifty_drawdown   = ((nifty_series - nifty_rolling_max) / nifty_rolling_max * 100).round(2)
+            nifty_max_dd     = nifty_drawdown.min()
+            nifty_max_dd_date = merged["Date"].iloc[nifty_drawdown.idxmin()]
+            dd_metric1, dd_metric2, dd_metric3, dd_metric4 = st.columns(4)
+            _mk(dd_metric1, "Portfolio Max DD",    f"{max_dd:.2f}%",                      "#f85149")
+            _mk(dd_metric2, "Portfolio Max DD Date", max_dd_date.strftime("%d %b %Y"),    "#c9d1d9")
+            _mk(dd_metric3, "Nifty 500 Max DD",   f"{nifty_max_dd:.2f}%",                "#e3b341")
+            _mk(dd_metric4, "Nifty 500 Max DD Date", nifty_max_dd_date.strftime("%d %b %Y"), "#c9d1d9")
+        else:
+            _dd_l, dd_metric1, dd_metric2, _dd_r = st.columns([1, 1, 1, 1])
+            _mk(dd_metric1, "Max Drawdown", f"{max_dd:.2f}%", "#f85149")
+            _mk(dd_metric2, "Max DD Date",  max_dd_date.strftime("%d %b %Y"), "#c9d1d9")
 
         fig_dd = go.Figure()
         fig_dd.add_trace(go.Scatter(
             x=merged["Date"], y=drawdown,
-            name="Drawdown", line=dict(color="#f85149", width=1.5),
+            name="Portfolio", line=dict(color="#f85149", width=1.5),
             fill="tozeroy", fillcolor="rgba(248,81,73,0.12)",
-            hovertemplate="Date: %{x|%d %b %Y}<br>Drawdown: %{y:.2f}%<extra></extra>",
+            hovertemplate="Date: %{x|%d %b %Y}<br>Portfolio DD: %{y:.2f}%<extra></extra>",
         ))
+        if _has_nifty_dd:
+            fig_dd.add_trace(go.Scatter(
+                x=merged["Date"], y=nifty_drawdown,
+                name="Nifty 500", line=dict(color="#e3b341", width=1.5, dash="dot"),
+                hovertemplate="Date: %{x|%d %b %Y}<br>Nifty 500 DD: %{y:.2f}%<extra></extra>",
+            ))
         fig_dd.add_hline(y=0, line=dict(color="#484f58", width=1))
         fig_dd.update_layout(
             height=280, margin=dict(l=10, r=10, t=10, b=40),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
             hovermode="x unified",
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
             xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
                        tickfont=dict(color="#8b949e")),
             yaxis=dict(title="Drawdown (%)", gridcolor="#1e2d40",
@@ -1813,7 +1833,7 @@ with tab4:
 
         st.divider()
 
-        st.markdown("<div class='section-header'>Rolling Sharpe Ratio (63-Day)</div>",
+        st.markdown("<div class='section-header'>Rolling Sharpe Ratio (63-Day) — Portfolio vs Nifty</div>",
                     unsafe_allow_html=True)
 
         port_daily_rets = merged["Portfolio_Idx"].pct_change().dropna()
@@ -1827,17 +1847,34 @@ with tab4:
         _first_valid = rolling_sharpe.first_valid_index()
         _rs_dates    = merged["Date"]
         if _first_valid is not None:
-            _rs_mask    = merged.index >= _first_valid
-            _rs_dates   = merged.loc[_rs_mask, "Date"]
+            _rs_mask       = merged.index >= _first_valid
+            _rs_dates      = merged.loc[_rs_mask, "Date"]
             rolling_sharpe = rolling_sharpe.loc[_rs_mask]
+
+        _has_nifty_rs = merged["Nifty_Idx"].notna().any()
+        if _has_nifty_rs:
+            nifty_daily_rets   = merged["Nifty_Idx"].fillna(method="ffill").pct_change().dropna()
+            nifty_roll_sharpe  = (
+                nifty_daily_rets.rolling(roll_window).mean() /
+                nifty_daily_rets.rolling(roll_window).std()
+            ) * np.sqrt(252)
+            nifty_roll_sharpe  = nifty_roll_sharpe.reindex(merged.index)
+            if _first_valid is not None:
+                nifty_roll_sharpe = nifty_roll_sharpe.loc[_rs_mask]
 
         fig_rs = go.Figure()
         fig_rs.add_trace(go.Scatter(
             x=_rs_dates, y=rolling_sharpe.round(3),
-            name="Rolling Sharpe", line=dict(color="#bc8cff", width=1.5),
-            hovertemplate="Date: %{x|%d %b %Y}<br>Sharpe: %{y:.3f}<extra></extra>",
+            name="Portfolio", line=dict(color="#bc8cff", width=1.5),
+            hovertemplate="Date: %{x|%d %b %Y}<br>Portfolio Sharpe: %{y:.3f}<extra></extra>",
             fill="tozeroy", fillcolor="rgba(188,140,255,0.08)",
         ))
+        if _has_nifty_rs:
+            fig_rs.add_trace(go.Scatter(
+                x=_rs_dates, y=nifty_roll_sharpe.round(3),
+                name="Nifty 500", line=dict(color="#e3b341", width=1.5, dash="dot"),
+                hovertemplate="Date: %{x|%d %b %Y}<br>Nifty 500 Sharpe: %{y:.3f}<extra></extra>",
+            ))
         fig_rs.add_hline(y=0,   line=dict(color="#484f58", width=1))
         fig_rs.add_hline(y=1.0, line=dict(color="#3fb950", width=1, dash="dot"),
                          annotation_text="Sharpe=1",
@@ -1847,6 +1884,7 @@ with tab4:
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(family="JetBrains Mono, monospace", color="#8b949e", size=11),
             hovermode="x unified",
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#c9d1d9")),
             xaxis=dict(gridcolor="#1e2d40", linecolor="#1e2d40",
                        tickfont=dict(color="#8b949e")),
             yaxis=dict(title="Sharpe Ratio", gridcolor="#1e2d40",
