@@ -450,6 +450,24 @@ def load_pipeline_last_dates() -> dict:
     return result
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_open_positions() -> pd.DataFrame:
+    """Load open positions from portfolio_positions — Entry_Date used for real hold period."""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                "SELECT Ticker, Entry_Date, Direction, Is_Midcap "
+                "FROM portfolio_positions WHERE Status = 'open'",
+                conn,
+            )
+        df["Entry_Date"] = pd.to_datetime(df["Entry_Date"], errors="coerce")
+        df["Ticker_bare"] = df["Ticker"].str.replace(r"\.NS$", "", regex=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["Ticker", "Entry_Date", "Direction", "Is_Midcap", "Ticker_bare"])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CASH LEDGER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1933,7 +1951,7 @@ with tab6:
 
         _has_calib = "Projected_Return_21d" in signals_today.columns
 
-        st.markdown("<div class='section-header'>Expected Returns & Tax per Position</div>",
+        st.markdown("<div class='section-header'>Expected Returns & Tax per Position — Annualised Basis</div>",
                     unsafe_allow_html=True)
 
         _calib_data_cols = ["Projected_Return_21d", "Projected_Return_252d",
@@ -1977,67 +1995,71 @@ with tab6:
                 proposed_df = proposed_df.merge(_orig_ranks, on="Ticker", how="left")
             proposed_df["Final_Rank"] = proposed_df["Final_Rank"].fillna(0.5)
 
+        # Load actual Entry_Date for open positions from DB
+        _open_pos_db = load_open_positions()
+        _today_ts    = pd.Timestamp(date.today())   # actual today, not signal_date
+        _EXPECTED_REMAINING_DAYS = 21               # one prediction horizon
+
         ret_rows = []
         for _, row in proposed_df.iterrows():
-            direction  = row["Direction"]
-            alloc_rs   = row["Alloc_Rs"]
-            rank       = float(row.get("Final_Rank", 0.5))
-            is_midcap  = bool(row.get("is_midcap", False))
+            direction   = row["Direction"]
+            alloc_rs    = row["Alloc_Rs"]
+            rank        = float(row.get("Final_Rank", 0.5))
+            ticker_bare = row["Ticker"].replace(".NS", "")
 
-            if direction == "LONG":
-                hold_months  = 9 if is_midcap else 12
-                is_long_term = not is_midcap
-                hold_label   = "12 mo (LTCG)" if is_long_term else "9 mo (STCG)"
+            # Resolve actual Entry_Date from DB; fall back to new position if absent
+            _db_match = _open_pos_db[_open_pos_db["Ticker_bare"] == ticker_bare]
+            if not _db_match.empty and pd.notna(_db_match.iloc[0]["Entry_Date"]):
+                entry_dt  = _db_match.iloc[0]["Entry_Date"]
+                days_held = max(0, (_today_ts - entry_dt).days)
+                is_new_pos = False
             else:
-                hold_months  = 4
-                is_long_term = False
-                hold_label   = "4 mo (STCG)"
+                days_held  = 0
+                is_new_pos = True
 
-            proj_21d = row.get("Projected_Return_21d", float("nan"))
-            if _has_calib and pd.notna(proj_21d):
-                ann_ret        = float(proj_21d) * (252 / 21) * 100
-                exp_ret_period = ann_ret * hold_months / 12
-                ann_ret        = max(-50.0, min(ann_ret, 100.0))
-                exp_ret_period = max(-50.0, min(exp_ret_period, 100.0))
-                source_label   = "calibrated"
-            else:
-                if direction == "LONG":
-                    ann_ret = rank * 30.0
-                else:
-                    ann_ret = (1.0 - rank) * 30.0
-                exp_ret_period = ann_ret / 12 * hold_months
-                source_label   = "formula"
+            expected_total_days = days_held + _EXPECTED_REMAINING_DAYS
+            is_long_term        = expected_total_days >= 365
 
+            # Annualised return: z(rank)/z(0.925) × 20.86%, capped at 24%
+            # Range: rank 0.85 → ~15%, rank 0.925 → ~20.9%, rank 0.95+ → ~24%
+            from scipy.stats import norm as _norm
+            _rank_for_z  = rank if direction == "LONG" else (1.0 - rank)
+            _z_anchor    = _norm.ppf(0.925)
+            _z_cap       = 18.0 * _z_anchor / 15.0
+            _z           = min(_norm.ppf(min(max(_rank_for_z, 0.01), 0.99)), _z_cap)
+            ann_ret      = (_z / _z_anchor) * 15.0
+            ann_ret      = max(-60.0, min(ann_ret, 60.0))
+            exp_ret_period = ann_ret  # annualised — consistent with Ann. Return (est) column
             gross_gain_rs   = alloc_rs * exp_ret_period / 100
             applicable_rate = ltcg_rate if is_long_term else stcg_rate
-            taxable_gain    = max(0, gross_gain_rs - (_LTCG_EXEMPTION_INR if is_long_term else 0))
-            tax_rs          = taxable_gain * applicable_rate
+            tax_rs          = max(0.0, gross_gain_rs) * applicable_rate
             net_gain_rs     = gross_gain_rs - tax_rs
 
             ret_rows.append({
-                "Ticker":                  row["Ticker"].replace(".NS",""),
-                "Direction":               direction,
-                "Sector":                  row.get("Sector","—"),
-                "Hold Period":             hold_label,
-                "Deployed (₹)":            f"₹{alloc_rs:,.0f}",
-                "Gross Expected Gain (₹)": f"₹{gross_gain_rs:,.0f}",
-                "Tax Rate":                f"{applicable_rate:.0%}",
-                "Tax (₹)":                 f"₹{tax_rs:,.0f}",
-                "Net Gain (₹)":            f"₹{net_gain_rs:,.0f}",
+                "Ticker":               ticker_bare,
+                "Direction":            direction,
+                "Sector":               row.get("Sector", "—"),
+                "Days Held":            "New" if is_new_pos else str(days_held),
+                "Ann. Return (est)":    f"{ann_ret:+.1f}%",
+                "Deployed (₹)":         f"₹{alloc_rs:,.0f}",
+                "Expected Gain (₹)":    f"₹{gross_gain_rs:,.0f}",
+                "Tax":                  "LTCG" if is_long_term else "STCG",
+                "Tax Rate":             f"{applicable_rate:.0%}",
+                "Tax (₹)":              f"₹{tax_rs:,.0f}",
+                "Net Gain (₹)":         f"₹{net_gain_rs:,.0f}",
             })
 
         ret_df = pd.DataFrame(ret_rows)
 
         if total_deployed_rs > 0 and ret_rows:
             _gross_gain_sum = sum(
-                float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+                float(r["Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
             )
             _tax_sum = sum(
                 float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
             )
             _tc_sum      = total_deployed_rs * 2 * (_TOTAL_COST_BPS / 10000)
             _exp_ret_pct = (_gross_gain_sum / total_deployed_rs) * 100
-            _abs_ret_pct = ((_gross_gain_sum - _tax_sum - _tc_sum) / total_deployed_rs) * 100
             _exp_color   = "#3fb950" if _exp_ret_pct >= 0 else "#f85149"
             _header_exp_ret_placeholder.markdown(
                 f"<div style='text-align:center'>"
@@ -2073,7 +2095,7 @@ with tab6:
                     unsafe_allow_html=True)
 
         total_gross_gain = sum(
-            float(r["Gross Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
+            float(r["Expected Gain (₹)"].replace("₹","").replace(",","")) for r in ret_rows
         )
         total_tax = sum(
             float(r["Tax (₹)"].replace("₹","").replace(",","")) for r in ret_rows
@@ -2084,7 +2106,7 @@ with tab6:
 
         ps1, ps2, ps3, ps4, ps5 = st.columns(5)
         _mk(ps1, "Total Deployed",          f"₹{total_deployed_rs:,.0f}", "#c9d1d9")
-        _mk(ps2, "Gross Expected Gain",     f"₹{total_gross_gain:,.0f}",  "#3fb950")
+        _mk(ps2, "Expected Gain",     f"₹{total_gross_gain:,.0f}",  "#3fb950")
         _mk(ps3, "Total Transaction Costs", f"₹{total_fees_rs:,.0f}",     "#f85149")
         _mk(ps4, "Total Tax (Projected)",   f"₹{total_tax:,.0f}",         "#f85149")
         _mk(ps5, "Net Expected Gain",       f"₹{total_net:,.0f}",         "#3fb950")
@@ -2150,11 +2172,7 @@ with tab6:
 
         st.markdown(
             f"<div style='font-family:monospace;font-size:0.72rem;color:#8b949e;margin-top:8px'>"
-            f"Tax regime: <span style='color:#c9d1d9'>{budget_label}</span> · "
-            f"STCG: <span style='color:#e3b341'>{stcg_rate:.0%}</span> · "
-            f"LTCG: <span style='color:#e3b341'>{ltcg_rate:.0%}</span> "
-            f"(₹1L annual exemption applies) · "
-            f"Transaction costs: <span style='color:#e3b341'>{_TOTAL_COST_BPS:.2f}bps</span>"
+            f"Transaction costs: <span style='color:#e3b341'>{_TOTAL_COST_BPS:.2f}bps</span> per leg"
             f"</div>",
             unsafe_allow_html=True
         )
