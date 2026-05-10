@@ -1807,7 +1807,7 @@ with tab4:
 
         _has_nifty_dd = merged["Nifty_Idx"].notna().any()
         if _has_nifty_dd:
-            nifty_series     = merged["Nifty_Idx"].fillna(method="ffill")
+            nifty_series     = merged["Nifty_Idx"].ffill()
             nifty_rolling_max = nifty_series.cummax()
             nifty_drawdown   = ((nifty_series - nifty_rolling_max) / nifty_rolling_max * 100).round(2)
             nifty_max_dd     = nifty_drawdown.min()
@@ -1871,7 +1871,7 @@ with tab4:
 
         _has_nifty_rs = merged["Nifty_Idx"].notna().any()
         if _has_nifty_rs:
-            nifty_daily_rets   = merged["Nifty_Idx"].fillna(method="ffill").pct_change().dropna()
+            nifty_daily_rets   = merged["Nifty_Idx"].ffill().pct_change().dropna()
             nifty_roll_sharpe  = (
                 nifty_daily_rets.rolling(roll_window).mean() /
                 nifty_daily_rets.rolling(roll_window).std()
